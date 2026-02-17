@@ -304,27 +304,38 @@ class JobConfig:
             help="Skip batch updates when NaN or INF gradients are encountered during training",
         )
         self.parser.add_argument(
+            "--training.tokenized_dataset_dir",
+            type=str,
+            default=None,
+            help="tokenized_dataset_dir"
+        )
+        self.parser.add_argument(
             "--training.dataset",
-            default="HuggingFaceFW/fineweb-edu",
+            type=str,
+            default=None, #"DDHuggingFaceFW/fineweb-edu",
             help="Dataset to use, with comma separated values",
         )
         self.parser.add_argument(
             "--training.dataset_name",
+            type=str,
             default=None,
             help="The name of the dataset config, with comma separated values if provided",
         )
         self.parser.add_argument(
             "--training.dataset_split",
+            type=str,
             default=None,
             help="Dataset split to use, with comma separated values if provided",
         )
         self.parser.add_argument(
             "--training.data_dir",
+            type=str,
             default=None,
             help="Data dirs to use, with comma separated values if provided",
         )
         self.parser.add_argument(
             "--training.data_files",
+            type=str,
             default=None,
             help="Data files to use, with comma separated values if provided",
         )

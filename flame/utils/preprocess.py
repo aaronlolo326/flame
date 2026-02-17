@@ -30,17 +30,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Preprocess the dataset.')
     parser.add_argument(
         '--dataset',
-        default='HuggingFaceFW/fineweb-edu',
+        default=None, #'HuggingFaceFW/fineweb-edu',
         help='Dataset to use, with comma separated values',
     )
     parser.add_argument(
         '--dataset_name',
-        default='sample-100BT',
+        default=None,
         help='The name of the dataset config, with comma separated values if provided',
     )
     parser.add_argument(
         '--dataset_split',
-        default='train',
+        default=None, #'train',
         help='Dataset split to use, with comma separated values if provided',
     )
     parser.add_argument(

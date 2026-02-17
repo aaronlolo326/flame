@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
+import logging
 import os
 import time
 from datetime import timedelta
@@ -57,10 +58,12 @@ register_train_spec(
     )
 )
 
-
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
 @record
 def main(job_config: JobConfig):
+
+    # torch.cuda.memory._record_memory_history(max_entries=100000)
+
     logger.info(f"Starting job: {job_config.job.description}")
 
     if job_config.experimental.custom_model_path:
@@ -120,6 +123,7 @@ def main(job_config: JobConfig):
     else:
         dp_degree, dp_rank = 1, 0
 
+
     if parallel_dims.pp_enabled:
         raise NotImplementedError(
             "Pipeline parallelism is not supported in this version"
@@ -139,6 +143,7 @@ def main(job_config: JobConfig):
     )
     train_spec = get_train_spec(job_config.model.name)
 
+    tokenizer = None
     logger.info("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
         job_config.model.tokenizer_path,
@@ -146,14 +151,19 @@ def main(job_config: JobConfig):
         model_max_length=int(1e10),
     )
     logger.info(f"{tokenizer}")
+
+    is_tokenized = False if job_config.training.tokenized_dataset_dir is None else True
+
     logger.info(
         f"Loading dataset {job_config.training.dataset}"
         f":{job_config.training.dataset_name}"
-        if job_config.training.dataset_name is not None
-        else ""
+        if job_config.training.dataset is not None
+        else f"Loading pre-tokenized dataset {job_config.training.tokenized_dataset_dir}"
     )
+    # breakpoint()
     dataset = build_dataset(
-        dataset=job_config.training.dataset,
+        dataset=job_config.training.dataset if job_config.training.tokenized_dataset_dir is None else None,
+        tokenized_dataset_dir=job_config.training.tokenized_dataset_dir,
         dataset_name=job_config.training.dataset_name,
         dataset_split=job_config.training.dataset_split,
         data_dir=job_config.training.data_dir,
@@ -169,6 +179,7 @@ def main(job_config: JobConfig):
     dataloader = build_dataloader(
         dataset=dataset,
         tokenizer=tokenizer,
+        is_tokenized=is_tokenized,
         rank=dp_rank,
         world_size=dp_degree,
         batch_size=job_config.training.batch_size,
@@ -180,6 +191,8 @@ def main(job_config: JobConfig):
         persistent_workers=job_config.training.persistent_workers,
         snapshot_every_n_steps=job_config.checkpoint.interval,
     )
+    # breakpoint()
+    # data_iterator = iter(dataloader)
 
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
@@ -401,8 +414,10 @@ def main(job_config: JobConfig):
             job_config, global_step=train_state.step
         ) as memory_profiler,
     ):
+
         while train_state.step < job_config.training.steps:
             train_state.step += 1
+
             gc_handler.run(train_state.step)
 
             optimizers.zero_grad()
@@ -412,7 +427,9 @@ def main(job_config: JobConfig):
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
                 data_load_start = time.perf_counter()
-                batch = next(data_iterator)
+
+                batch = next(data_iterator) 
+
                 input_ids, labels = batch["input_ids"], batch["labels"]
 
                 # Update metrics processor state before forward/backward
@@ -449,8 +466,10 @@ def main(job_config: JobConfig):
                         .repeat(input_ids.shape[0], 1)
                         .to(torch.int32)
                     )
+                
                 # apply context parallelism if cp is enabled
-                # ensure CP handles the separate freqs_cis buffer for each pp stage
+                # ensure CP handles the separate freqs_cis buffer for each pp stage                logger.info(f"{ parallel_dims=}")
+                # logger.info(f"{ parallel_dims=}")
                 optional_context_parallel_ctx = (
                     dist_utils.create_context_parallel_ctx(
                         cp_mesh=world_mesh["cp"],
@@ -503,6 +522,7 @@ def main(job_config: JobConfig):
                         loss.backward()
 
                 losses.append(loss)
+                # logger.info(1)
             loss = sum(losses)
 
             # clip gradients
@@ -514,6 +534,7 @@ def main(job_config: JobConfig):
             )
 
             # optimizer step
+            # logger.info(1)
             checkpoint.maybe_wait_for_staging()
             if job_config.training.skip_nan_inf and (
                 grad_norm.isnan() or grad_norm.isinf()
@@ -616,6 +637,13 @@ def main(job_config: JobConfig):
 
 if __name__ == "__main__":
     init_logger()
+    # Configure logger format to include filename and line number
+    formatter = logging.Formatter(
+        "[titan] %(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+    )
+    for handler in logger.handlers:
+        handler.setFormatter(formatter)
+
     config = JobConfig()
     config.parse_args()
     main(config)
