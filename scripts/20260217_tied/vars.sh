@@ -19,4 +19,5 @@ base_model_name="Qwen3-1.7B-Base"
 TOKENIZER_PATH="${base_model_hfac}/${base_model_name}"
 
 lm_eval_output_path="results/${RUN_NAME}"
-dump_folder=/storage/backup/hei/ttt/flame/exp/${RUN_NAME}
+# dump_folder=/storage/backup/hei/ttt/flame/exp/${RUN_NAME}
+dump_folder=/work/yufei/tmp/ttt/flame/exp/${RUN_NAME}

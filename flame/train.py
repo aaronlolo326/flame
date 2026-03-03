@@ -241,7 +241,7 @@ def main(job_config: JobConfig):
     model_converters.convert(model)
 
     # calculate model size and flops per token
-    model_param_count, num_flops_per_token = get_nparams_and_flops(
+    model_param_count, _, num_flops_per_token = get_nparams_and_flops(
         model, model_config, job_config.training.context_len
     )
 
