@@ -175,7 +175,7 @@ class LaCTSWIGLULayer(nn.Module):
         self.use_muon = use_muon
         self.lact_chunk_size = lact_chunk_size
         self.num_fw_heads = num_lact_heads
-        self.fw_head_dim = self.hidden_size // self.num_fw_heads
+        self.fw_head_dim = self.hidden_size // self.num_fw_heads if self.num_fw_heads != 0 else 0
         self.qkv_silu = qkv_silu
         self.no_v_silu = no_v_silu
         self.ttt_prenorm = ttt_prenorm
@@ -193,7 +193,7 @@ class LaCTSWIGLULayer(nn.Module):
         # Low Rank parameterization of the fast weights.
         # This is a compromise to keep the number of parameters low when comparing against baselines.
         # Idealy, low-rank parameterization always hurts the performance.
-        if self.w0_w2_low_rank > 0:
+        if self.w0_w2_low_rank > 0 and self.num_fw_heads > 0:
             self.w0 = LowRankFastWeight(
                 self.num_fw_heads,
                 d_h,

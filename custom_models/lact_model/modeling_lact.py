@@ -185,18 +185,19 @@ class LaCTPreTrainedModel(PreTrainedModel):
                 f"in PreTrainedModel initialize fast weights for LaCTSWIGLULayer"
             )
             # init w0, w1, w2
-            if module.w0_w2_low_rank > 0:
-                module.w0._init_weights()
-                module.w2._init_weights()
-            else:
-                nn.init.normal_(
-                    module.w0, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
-                )
-                nn.init.normal_(
-                    module.w2, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
-                )
+            if module.num_fw_heads > 0:
+                if module.w0_w2_low_rank > 0:
+                    module.w0._init_weights()
+                    module.w2._init_weights()
+                else:
+                    nn.init.normal_(
+                        module.w0, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
+                    )
+                    nn.init.normal_(
+                        module.w2, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
+                    )
 
-            nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
+                nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
 
 
 class LaCTModel(LaCTPreTrainedModel):
