@@ -1,6 +1,6 @@
 # LaCT Throughput Benchmark Scaffold
 
-This folder is a draft benchmark framework for comparing LaCT against three baselines on either one GPU or a single node with 8 GPUs such as `8 x H100`.
+This folder is a draft benchmark framework for comparing LaCT against three user-requested baselines on either one GPU or a single node with 8 GPUs such as `8 x H100`.
 
 - `lact`: LaCT layer + sliding-window flash attention from `flame/custom_models/lact_model`
 - `full_attention`: full-attention Qwen3 with `flash_attention_2`
@@ -19,6 +19,12 @@ Paper-grounded notes from `Test-Time Training Done Right`:
 - For token-level causality without gaps, the paper requires `window_size >= chunk_size`; the implementation notes use `window_size == chunk_size` in practice.
 - The LM architecture shares `Q/K/V` between the SWA branch and the LaCT branch.
 - The paper’s throughput table is reported as tokens/s per GPU at `32K` sequence length; the distributed benchmark here also reports a global node-level tokens/s number.
+
+The benchmark targets in this folder are not identical to the paper’s LM baseline table. The paper compares LaCT against full attention, `GLA + SWA`, and `DeltaNet + SWA`, while this scaffold follows your requested comparison set:
+
+- full attention
+- `75% SWA + 25% FA`
+- `75% GatedDeltaNet + 25% FA`
 
 ## Layout
 
@@ -130,6 +136,8 @@ If you want to mirror the language-model paper setting more closely, start with:
 - `torch_dtype=bfloat16`
 - multi-GPU launch via `torchrun`
 
+That still will not exactly reproduce the paper table, because the benchmarked baseline set here is your requested hybrid set rather than the paper’s `GLA + SWA` and `DeltaNet + SWA` baselines.
+
 ## Additional Comparisons Worth Running
 
 These are likely useful for improving the LaCT work beyond the two core throughput plots:
@@ -150,4 +158,5 @@ These are likely useful for improving the LaCT work beyond the two core throughp
 - Whole-model multi-GPU mode uses DDP, so it measures train-step throughput including gradient synchronization.
 - Single-kernel multi-GPU mode is aggregated per-GPU execution, not a communication benchmark.
 - The layer benchmark is really a layer-level train-step benchmark, not a raw Triton microkernel profiler.
-- The LaCT paper PDF at `/work/yufei/projects/paper_list/tttdr.pdf` was not parsed in this environment, so the implementation choices here are grounded in the local code rather than paper text extraction.
+- The LaCT paper PDF at `/work/yufei/projects/paper_list/tttdr.pdf` is now parseable in this environment, and the chunk/window guidance in this README has been updated from it.
+- The current scaffold still does not encode every paper ablation or exact paper baseline; it mainly uses the paper to set correct LaCT benchmarking assumptions while preserving your requested model comparisons.
