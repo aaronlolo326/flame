@@ -1,0 +1,36 @@
+import logging
+from flame.config_manager import JobConfig
+from flame.tools.utils import get_nparams_and_flops
+import torch
+from transformers import AutoModelForCausalLM, AutoConfig
+import custom_models
+from torchtitan.tools.logging import logger, init_logger
+
+def main(job_config: JobConfig):
+    print(f"Loading model config from {job_config.model.config}")
+    model_config = AutoConfig.from_pretrained(job_config.model.config)
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(model_config)
+    # calculate model size and flops per token
+    model_param_count, nparams_embedding, num_flops_per_token = get_nparams_and_flops(
+        model, model_config, job_config.training.context_len
+    )
+    print(f"Number of parameters = {model_param_count:,}")
+    print(f"Number of embedding parameters = {nparams_embedding:,}")
+    print(f"Number of parameters w/o embedding parameters = {model_param_count - nparams_embedding:,}")
+    print(f"Number of flops per token = {num_flops_per_token:,}")
+
+if __name__ == '__main__':
+
+    init_logger()
+    # Configure logger format to include filename and line number
+    formatter = logging.Formatter(
+        "[titan] %(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+    )
+    for handler in logger.handlers:
+        handler.setFormatter(formatter)
+
+    config = JobConfig()
+    config.parse_args()
+    main(config)
