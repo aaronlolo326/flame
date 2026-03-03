@@ -5,20 +5,13 @@ from pathlib import Path
 
 from .adapters import DEFAULT_LACT_CONFIG, MODEL_SPECS, build_whole_model
 from .common import (
+    append_row_jsonl,
     BenchmarkRow,
     DEFAULT_SEQ_LENS,
-    barrier,
     benchmark_timer,
-    destroy_distributed,
-    get_local_rank,
-    get_world_size,
-    init_distributed,
-    is_distributed,
-    is_main_process,
+    log,
     now_timestamp,
-    reduce_scalar,
     write_rows_csv,
-    write_rows_jsonl,
 )
 
 
@@ -42,7 +35,6 @@ def parse_args() -> argparse.Namespace:
         help="Apply paper-aligned LM defaults: treat sliding-window size as at least the LaCT chunk size.",
     )
     parser.add_argument("--use-fused-lact-kernel", action="store_true")
-    parser.add_argument("--ddp", action="store_true", help="Wrap the model in DistributedDataParallel when launched via torchrun.")
     parser.add_argument(
         "--output-prefix",
         type=Path,
@@ -53,16 +45,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     import torch
-    from torch.nn.parallel import DistributedDataParallel
 
     args = parse_args()
     rows: list[BenchmarkRow] = []
-    rank, local_rank, world_size = init_distributed(torch)
-    device = f"cuda:{local_rank}" if args.device == "cuda" else args.device
+    device = args.device
+    output_csv = args.output_prefix.with_suffix(".csv")
+    output_jsonl = args.output_prefix.with_suffix(".jsonl")
+
+    log(
+        "Starting whole-model throughput benchmark "
+        f"device={device} dtype={args.dtype} "
+        f"models={args.models} seq_lens={args.seq_lens}"
+    )
+    if args.use_fused_lact_kernel:
+        log(
+            "LaCT fused Triton kernel enabled. First warmup steps may include Triton compilation/autotune "
+            "before steady-state timing."
+        )
 
     try:
         for model_key in args.models:
             for seq_len in args.seq_lens:
+                log(
+                    f"[build] model={model_key} seq_len={seq_len} local_batch={args.batch_size} "
+                    f"chunk={args.lact_chunk_size or 'config'} window={args.sliding_window or 'config'}"
+                )
                 try:
                     model, base_cfg = build_whole_model(
                         model_key=model_key,
@@ -75,22 +82,18 @@ def main() -> None:
                         use_fused_kernel=args.use_fused_lact_kernel,
                         paper_lm_defaults=args.paper_lm_defaults,
                     )
-                    if args.ddp and is_distributed():
-                        model = DistributedDataParallel(
-                            model,
-                            device_ids=[local_rank],
-                            output_device=local_rank,
-                            broadcast_buffers=False,
-                        )
                     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
                     vocab_size = int(base_cfg["vocab_size"])
                     input_ids = torch.randint(vocab_size, (args.batch_size, seq_len), device=device)
                     labels = input_ids.clone()
+                    log(
+                        f"[warmup] model={model_key} seq_len={seq_len} "
+                        f"warmup_steps={args.warmup_steps} timed_steps={args.steps}"
+                    )
 
                     def sync() -> None:
                         if "cuda" in device:
                             torch.cuda.synchronize(device=device)
-                        barrier(torch)
 
                     def step_fn() -> tuple[float, float, float]:
                         optimizer.zero_grad(set_to_none=True)
@@ -122,7 +125,6 @@ def main() -> None:
                             )
                         raise RuntimeError("CPU timing is not implemented in this scaffold; run on CUDA.")
 
-                    barrier(torch)
                     forward_ms, backward_ms, optimizer_ms, step_ms = benchmark_timer(
                         warmup_steps=args.warmup_steps,
                         measured_steps=args.steps,
@@ -134,73 +136,68 @@ def main() -> None:
                         if "cuda" in device
                         else 0.0
                     )
-                    global_forward_ms = reduce_scalar(torch, forward_ms, "max")
-                    global_backward_ms = reduce_scalar(torch, backward_ms, "max")
-                    global_optimizer_ms = reduce_scalar(torch, optimizer_ms, "max")
-                    global_step_ms = reduce_scalar(torch, step_ms, "max")
-                    global_peak_gb = reduce_scalar(torch, peak_gb, "max")
-                    if is_main_process():
-                        rows.append(
-                            BenchmarkRow(
-                                benchmark="whole_model_train_ddp" if args.ddp and world_size > 1 else "whole_model_train",
-                                model=model_key,
-                                seq_len=seq_len,
-                                batch_size=args.batch_size,
-                                world_size=world_size,
-                                warmup_steps=args.warmup_steps,
-                                measured_steps=args.steps,
-                                forward_ms=global_forward_ms,
-                                backward_ms=global_backward_ms,
-                                optimizer_ms=global_optimizer_ms,
-                                step_ms=global_step_ms,
-                                steps_per_second=1000.0 / global_step_ms,
-                                tokens_per_second=(args.batch_size * seq_len * world_size) / (global_step_ms / 1000.0),
-                                peak_memory_gb=global_peak_gb,
-                                status="ok",
-                                notes=(
-                                    f"ddp={args.ddp and world_size > 1}; "
-                                    f"local_batch_size={args.batch_size}; "
-                                    f"lact_chunk_size={args.lact_chunk_size or 'config'}; "
-                                    f"sliding_window={args.sliding_window or 'config'}; "
-                                    f"paper_lm_defaults={args.paper_lm_defaults}; rank0={rank}"
-                                ),
-                            )
-                        )
+                    row = BenchmarkRow(
+                        benchmark="whole_model_train",
+                        model=model_key,
+                        seq_len=seq_len,
+                        batch_size=args.batch_size,
+                        warmup_steps=args.warmup_steps,
+                        measured_steps=args.steps,
+                        forward_ms=forward_ms,
+                        backward_ms=backward_ms,
+                        optimizer_ms=optimizer_ms,
+                        step_ms=step_ms,
+                        steps_per_second=1000.0 / step_ms,
+                        tokens_per_second=(args.batch_size * seq_len) / (step_ms / 1000.0),
+                        peak_memory_gb=peak_gb,
+                        status="ok",
+                        notes=(
+                            f"local_batch_size={args.batch_size}; "
+                            f"lact_chunk_size={args.lact_chunk_size or 'config'}; "
+                            f"sliding_window={args.sliding_window or 'config'}; "
+                            f"paper_lm_defaults={args.paper_lm_defaults}"
+                        ),
+                    )
+                    rows.append(row)
+                    append_row_jsonl(output_jsonl, row)
+                    write_rows_csv(output_csv, rows)
+                    log(
+                        f"[done] model={model_key} seq_len={seq_len} status=ok "
+                        f"step_ms={step_ms:.2f} tokens/s={row.tokens_per_second:.2f} "
+                        f"peak_gb={peak_gb:.2f}"
+                    )
                     del model
                     del optimizer
                     if "cuda" in device:
                         torch.cuda.empty_cache()
                 except RuntimeError as exc:
                     status = "oom" if "out of memory" in str(exc).lower() else "error"
-                    if is_main_process():
-                        rows.append(
-                            BenchmarkRow(
-                                benchmark="whole_model_train_ddp" if args.ddp and world_size > 1 else "whole_model_train",
-                                model=model_key,
-                                seq_len=seq_len,
-                                batch_size=args.batch_size,
-                                world_size=world_size,
-                                warmup_steps=args.warmup_steps,
-                                measured_steps=args.steps,
-                                forward_ms=0.0,
-                                backward_ms=0.0,
-                                optimizer_ms=0.0,
-                                step_ms=0.0,
-                                steps_per_second=0.0,
-                                tokens_per_second=0.0,
-                                peak_memory_gb=0.0,
-                                status=status,
-                                notes=str(exc),
-                            )
-                        )
+                    row = BenchmarkRow(
+                        benchmark="whole_model_train",
+                        model=model_key,
+                        seq_len=seq_len,
+                        batch_size=args.batch_size,
+                        warmup_steps=args.warmup_steps,
+                        measured_steps=args.steps,
+                        forward_ms=0.0,
+                        backward_ms=0.0,
+                        optimizer_ms=0.0,
+                        step_ms=0.0,
+                        steps_per_second=0.0,
+                        tokens_per_second=0.0,
+                        peak_memory_gb=0.0,
+                        status=status,
+                        notes=str(exc),
+                    )
+                    rows.append(row)
+                    append_row_jsonl(output_jsonl, row)
+                    write_rows_csv(output_csv, rows)
+                    log(f"[done] model={model_key} seq_len={seq_len} status={status} error={exc}")
                     if "cuda" in device:
                         torch.cuda.empty_cache()
-                barrier(torch)
     finally:
-        if is_main_process():
-            write_rows_csv(args.output_prefix.with_suffix(".csv"), rows)
-            write_rows_jsonl(args.output_prefix.with_suffix(".jsonl"), rows)
-        destroy_distributed(torch)
+        write_rows_csv(output_csv, rows)
+        log(f"Finished whole-model benchmark. Results written to {output_csv} and {output_jsonl}")
 
 
 if __name__ == "__main__":

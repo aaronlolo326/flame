@@ -1,6 +1,6 @@
 # LaCT Throughput Benchmark Scaffold
 
-This folder is a draft benchmark framework for comparing LaCT against three user-requested baselines on either one GPU or a single node with 8 GPUs such as `8 x H100`.
+This folder is a draft benchmark framework for comparing LaCT against three user-requested baselines on a single GPU.
 
 - `lact`: LaCT layer + sliding-window flash attention from `flame/custom_models/lact_model`
 - `full_attention`: full-attention Qwen3 with `flash_attention_2`
@@ -18,7 +18,7 @@ Paper-grounded notes from `Test-Time Training Done Right`:
 - In the language-model setup, LaCT combines a shifted block-causal TTT mask with causal sliding-window attention.
 - For token-level causality without gaps, the paper requires `window_size >= chunk_size`; the implementation notes use `window_size == chunk_size` in practice.
 - The LM architecture shares `Q/K/V` between the SWA branch and the LaCT branch.
-- The paper’s throughput table is reported as tokens/s per GPU at `32K` sequence length; the distributed benchmark here also reports a global node-level tokens/s number.
+- The paper’s throughput table is reported as tokens/s per GPU at `32K` sequence length.
 
 The benchmark targets in this folder are not identical to the paper’s LM baseline table. The paper compares LaCT against full attention, `GLA + SWA`, and `DeltaNet + SWA`, while this scaffold follows your requested comparison set:
 
@@ -28,12 +28,10 @@ The benchmark targets in this folder are not identical to the paper’s LM basel
 
 ## Layout
 
-- `whole_model.py`: synthetic end-to-end train-step throughput, with optional DDP under `torchrun`
-- `single_kernel.py`: isolated layer forward/backward throughput, with optional multi-process aggregation under `torchrun`
+- `whole_model.py`: synthetic end-to-end single-GPU train-step throughput
+- `single_kernel.py`: isolated single-GPU layer forward/backward throughput
 - `adapters.py`: model/layer builders and config translation
 - `common.py`: timing and result export helpers
-- `run_whole_model_8xh100.sh`: example launcher for single-node 8-GPU whole-model runs
-- `run_single_kernel_8xh100.sh`: example launcher for single-node 8-GPU layer runs
 
 ## Assumptions
 
@@ -41,9 +39,8 @@ The benchmark targets in this folder are not identical to the paper’s LM basel
 - `hybrid_swa` uses the local implementation in `/work/yufei/projects/hybrid_models/qwen3_swa`.
 - `hybrid_gdn` uses the local implementation in `/work/yufei/projects/hybrid_models/qwen3_gdn`.
 - The benchmark is intended for a CUDA machine with `torch`, `transformers`, `flash-attn`, and the FLA dependencies installed.
-- For multi-GPU whole-model throughput, launch with `torchrun`; `whole_model.py` will use DDP if `--ddp` is set.
-- For multi-GPU single-kernel throughput, launch with `torchrun`; each rank runs the same layer benchmark on one GPU and rank 0 reports node-level aggregate throughput.
 - The benchmark now exposes `--lact-chunk-size` and `--sliding-window` explicitly. With `--paper-lm-defaults` enabled, the harness enforces the paper’s LM condition `window_size >= chunk_size`.
+- No context parallel, tensor parallel, or DDP path is implemented in this scaffold. Cases that do not fit on one GPU will be recorded as `oom`.
 
 ## Usage
 
@@ -55,22 +52,6 @@ python -m benchmarks.throughput.whole_model \
   --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
   --lact-chunk-size 2048 \
   --sliding-window 2048 \
-  --batch-size 1 \
-  --steps 10 \
-  --warmup-steps 3 \
-  --dtype bfloat16 \
-  --device cuda \
-  --use-fused-lact-kernel
-```
-
-```bash
-torchrun --standalone --nnodes=1 --nproc_per_node=8 \
-  -m benchmarks.throughput.whole_model \
-  --ddp \
-  --models lact full_attention hybrid_swa hybrid_gdn \
-  --seq-lens 32768 \
-  --lact-chunk-size 4096 \
-  --sliding-window 4096 \
   --batch-size 1 \
   --steps 10 \
   --warmup-steps 3 \
@@ -93,21 +74,6 @@ python -m benchmarks.throughput.single_kernel \
   --use-fused-lact-kernel
 ```
 
-```bash
-torchrun --standalone --nnodes=1 --nproc_per_node=8 \
-  -m benchmarks.throughput.single_kernel \
-  --models lact full_attention hybrid_swa hybrid_gdn \
-  --seq-lens 32768 \
-  --lact-chunk-size 4096 \
-  --sliding-window 4096 \
-  --batch-size 1 \
-  --steps 20 \
-  --warmup-steps 5 \
-  --dtype bfloat16 \
-  --device cuda \
-  --use-fused-lact-kernel
-```
-
 Outputs are written as both `.csv` and `.jsonl` under `benchmarks/throughput/results/`.
 
 ## What The Metrics Mean
@@ -116,17 +82,10 @@ Outputs are written as both `.csv` and `.jsonl` under `benchmarks/throughput/res
 - `backward_ms`: average backward-pass time
 - `optimizer_ms`: optimizer step time, only for whole-model runs
 - `step_ms`: wall-clock average for one measured step
-- `batch_size`: local per-GPU batch size
-- `world_size`: number of GPUs/processes participating in the run
-- `tokens_per_second`: global throughput, `batch_size * world_size * seq_len / step_time`
+- `batch_size`: single-GPU batch size
+- `tokens_per_second`: single-GPU throughput, `batch_size * seq_len / step_time`
 - `peak_memory_gb`: `torch.cuda.max_memory_allocated()`
 - `status`: `ok`, `oom`, or `error`
-
-For multi-GPU runs, rank 0 reports:
-
-- the max per-rank `forward_ms`, `backward_ms`, `optimizer_ms`, and `step_ms`
-- the max per-rank `peak_memory_gb`
-- global tokens/s based on all GPUs
 
 If you want to mirror the language-model paper setting more closely, start with:
 
@@ -134,7 +93,6 @@ If you want to mirror the language-model paper setting more closely, start with:
 - `lact_chunk_size=4096`
 - `sliding_window=4096`
 - `torch_dtype=bfloat16`
-- multi-GPU launch via `torchrun`
 
 That still will not exactly reproduce the paper table, because the benchmarked baseline set here is your requested hybrid set rather than the paper’s `GLA + SWA` and `DeltaNet + SWA` baselines.
 
@@ -155,8 +113,7 @@ These are likely useful for improving the LaCT work beyond the two core throughp
 
 - It uses synthetic token inputs, not dataloader throughput.
 - CPU timing is not implemented; this scaffold is meant for CUDA benchmarking.
-- Whole-model multi-GPU mode uses DDP, so it measures train-step throughput including gradient synchronization.
-- Single-kernel multi-GPU mode is aggregated per-GPU execution, not a communication benchmark.
+- It is single-GPU only. It does not implement context parallel, tensor parallel, or DDP.
 - The layer benchmark is really a layer-level train-step benchmark, not a raw Triton microkernel profiler.
 - The LaCT paper PDF at `/work/yufei/projects/paper_list/tttdr.pdf` is now parseable in this environment, and the chunk/window guidance in this README has been updated from it.
 - The current scaffold still does not encode every paper ablation or exact paper baseline; it mainly uses the paper to set correct LaCT benchmarking assumptions while preserving your requested model comparisons.

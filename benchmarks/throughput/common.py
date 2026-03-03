@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -28,7 +27,6 @@ class BenchmarkRow:
     model: str
     seq_len: int
     batch_size: int
-    world_size: int
     warmup_steps: int
     measured_steps: int
     forward_ms: float
@@ -68,6 +66,12 @@ def write_rows_jsonl(path: Path, rows: Iterable[BenchmarkRow]) -> None:
             handle.write(json.dumps(asdict(row), sort_keys=True) + "\n")
 
 
+def append_row_jsonl(path: Path, row: BenchmarkRow) -> None:
+    ensure_parent_dir(path)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(asdict(row), sort_keys=True) + "\n")
+
+
 def benchmark_timer(
     *,
     warmup_steps: int,
@@ -96,52 +100,5 @@ def benchmark_timer(
         optimizer_total / measured_steps,
         elapsed_ms / measured_steps,
     )
-
-
-def get_rank() -> int:
-    return int(os.environ.get("RANK", "0"))
-
-
-def get_local_rank() -> int:
-    return int(os.environ.get("LOCAL_RANK", "0"))
-
-
-def get_world_size() -> int:
-    return int(os.environ.get("WORLD_SIZE", "1"))
-
-
-def is_distributed() -> bool:
-    return get_world_size() > 1
-
-
-def is_main_process() -> bool:
-    return get_rank() == 0
-
-
-def init_distributed(torch_module: object, backend: str = "nccl") -> tuple[int, int, int]:
-    if not is_distributed():
-        return get_rank(), get_local_rank(), get_world_size()
-    if not torch_module.distributed.is_initialized():
-        torch_module.distributed.init_process_group(backend=backend)
-    if torch_module.cuda.is_available():
-        torch_module.cuda.set_device(get_local_rank())
-    return get_rank(), get_local_rank(), get_world_size()
-
-
-def barrier(torch_module: object) -> None:
-    if is_distributed() and torch_module.distributed.is_initialized():
-        torch_module.distributed.barrier()
-
-
-def destroy_distributed(torch_module: object) -> None:
-    if is_distributed() and torch_module.distributed.is_initialized():
-        torch_module.distributed.destroy_process_group()
-
-
-def reduce_scalar(torch_module: object, value: float, op_name: str) -> float:
-    if not is_distributed():
-        return float(value)
-    tensor = torch_module.tensor([value], device=f"cuda:{get_local_rank()}" if torch_module.cuda.is_available() else "cpu")
-    op = getattr(torch_module.distributed.ReduceOp, op_name.upper())
-    torch_module.distributed.all_reduce(tensor, op=op)
-    return float(tensor.item())
+def log(message: str) -> None:
+    print(message, flush=True)

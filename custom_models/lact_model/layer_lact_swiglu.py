@@ -86,7 +86,7 @@ class LowRankFastWeight(nn.Module):
         self.w_right = nn.Parameter(torch.randn(num_heads, rank, in_features))
         self.init_gain = init_gain
 
-        print("init low rank fast weight", num_heads, out_features, in_features, rank)
+        # print("init low rank fast weight", num_heads, out_features, in_features, rank)
 
     def _init_weights(self):
 
