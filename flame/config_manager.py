@@ -144,6 +144,7 @@ class JobConfig:
         self.parser.add_argument(
             "--profiling.enable_profiling",
             action="store_true",
+            default=False,
             help="Whether to enable pytorch profiler",
         )
         self.parser.add_argument(

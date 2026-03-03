@@ -107,7 +107,8 @@ if $train; then
   PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
   torchrun --nnodes=${NNODE} \
     --nproc_per_node=${NGPU} \
-    --rdzv_backend c10d \
+    --node-rank ${LOG_RANK} \
+    --rdzv_backend static \
     --rdzv_endpoint "${MASTER_ADDR}:${MASTER_PORT}" \
     --local-ranks-filter ${LOG_RANK} \
     --role rank \
@@ -119,7 +120,7 @@ if $train; then
   echo "TRAINING DONE!"
 fi
 
-if $convert; then
+if $convert && [ ${LOG_RANK} -eq 0 ]; then
   echo "Converting the DCP checkpoints to HF format..."
   python -m flame.utils.convert_dcp_to_hf \
     --path $path \
