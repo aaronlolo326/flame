@@ -45,9 +45,6 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=[
             "lact_full_layer",
-            "fa_layer",
-            "swa_layer",
-            "gdn_layer",
             "lact_ttt_branch_only",
             "fa_branch_only",
             "swa_branch_only",

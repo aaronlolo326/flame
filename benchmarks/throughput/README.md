@@ -10,7 +10,7 @@ This folder is a draft benchmark framework for comparing LaCT against three user
 The scaffold is aimed at two benchmark modes:
 
 - Whole-network training throughput across sequence lengths: `4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1M`
-- Single-layer throughput across the same sequence lengths for full-layer and branch-only variants
+- Single-layer throughput across the same sequence lengths for the five meaningful layer/branch subjects listed below
 
 Paper-grounded notes from `Test-Time Training Done Right`:
 
@@ -64,8 +64,8 @@ python -m benchmarks.throughput.whole_model \
 
 ```bash
 python -m benchmarks.throughput.single_kernel \
-  --models lact_full_layer fa_layer swa_layer gdn_layer \
-           lact_ttt_branch_only fa_branch_only swa_branch_only gdn_branch_only \
+  --models lact_full_layer lact_ttt_branch_only \
+           fa_branch_only swa_branch_only gdn_branch_only \
   --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
   --lact-chunk-size 2048 \
   --sliding-window 2048 \
@@ -80,20 +80,18 @@ python -m benchmarks.throughput.single_kernel \
 The current single-layer benchmark subjects are:
 
 - `lact_full_layer`
-- `fa_layer`
-- `swa_layer`
-- `gdn_layer`
 - `lact_ttt_branch_only`
 - `fa_branch_only`
 - `swa_branch_only`
 - `gdn_branch_only`
 
-Backward-compatible aliases still exist for the older four names:
+Interpretation:
 
-- `lact -> lact_full_layer`
-- `full_attention -> fa_layer`
-- `hybrid_swa -> swa_layer`
-- `hybrid_gdn -> gdn_layer`
+- `lact_full_layer`: the full LaCT token-mixing layer, including both SWA and TTT paths
+- `lact_ttt_branch_only`: the LaCT TTT path in isolation
+- `fa_branch_only`: the full-attention token-mixing layer
+- `swa_branch_only`: the sliding-window attention token-mixing layer
+- `gdn_branch_only`: the GatedDeltaNet token-mixing layer
 
 Outputs are written as both `.csv` and `.jsonl` under `benchmarks/throughput/results/`.
 

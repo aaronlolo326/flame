@@ -17,18 +17,10 @@ from .common import (
 
 KERNEL_MODEL_KEYS = [
     "lact_full_layer",
-    "fa_layer",
-    "swa_layer",
-    "gdn_layer",
     "lact_ttt_branch_only",
     "fa_branch_only",
     "swa_branch_only",
     "gdn_branch_only",
-    # Backward-compatible aliases.
-    "lact",
-    "full_attention",
-    "hybrid_swa",
-    "hybrid_gdn",
 ]
 
 

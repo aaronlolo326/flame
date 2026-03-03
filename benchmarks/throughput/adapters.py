@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import sys
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,25 +34,10 @@ MODEL_SPECS = {
 
 KERNEL_MODEL_LABELS = {
     "lact_full_layer": "LaCT Full Layer",
-    "fa_layer": "Full Attention Layer",
-    "swa_layer": "Sliding-Window Attention Layer",
-    "gdn_layer": "GatedDeltaNet Layer",
     "lact_ttt_branch_only": "LaCT TTT Branch Only",
     "fa_branch_only": "Full Attention Branch Only",
     "swa_branch_only": "Sliding-Window Attention Branch Only",
     "gdn_branch_only": "GatedDeltaNet Branch Only",
-    # Backward-compatible aliases.
-    "lact": "LaCT Full Layer",
-    "full_attention": "Full Attention Layer",
-    "hybrid_swa": "Sliding-Window Attention Layer",
-    "hybrid_gdn": "GatedDeltaNet Layer",
-}
-
-KERNEL_MODEL_ALIASES = {
-    "lact": "lact_full_layer",
-    "full_attention": "fa_layer",
-    "hybrid_swa": "swa_layer",
-    "hybrid_gdn": "gdn_layer",
 }
 
 QWEN35_2B_BASE_GDN = {
@@ -219,7 +205,7 @@ def resolve_dtype(torch_module: Any, dtype_name: str):
 
 
 def canonical_kernel_key(model_key: str) -> str:
-    return KERNEL_MODEL_ALIASES.get(model_key, model_key)
+    return model_key
 
 
 def build_whole_model(
@@ -497,14 +483,14 @@ def build_kernel_module(
         ttt_only.train()
         return ttt_only, hidden_size
 
-    if model_key in {"fa_layer", "fa_branch_only", "swa_layer", "swa_branch_only"}:
+    if model_key in {"fa_branch_only", "swa_branch_only"}:
         config_cls, _, qwen_model_cls, _ = load_qwen3_variant("qwen3_swa")
-        layer_types = ["full_attention"] if model_key in {"fa_layer", "fa_branch_only"} else ["sliding_attention"]
+        layer_types = ["full_attention"] if model_key == "fa_branch_only" else ["sliding_attention"]
         config_kwargs = lact_config_to_qwen3_dict(
             base_cfg,
             seq_len=seq_len,
             layer_types=layer_types,
-            sliding_window=window_size if model_key in {"swa_layer", "swa_branch_only"} else None,
+            sliding_window=window_size if model_key == "swa_branch_only" else None,
             attn_implementation="flash_attention_2",
         )
         config_kwargs["num_hidden_layers"] = 1
@@ -512,10 +498,12 @@ def build_kernel_module(
         support_model = qwen_model_cls(config).to(device=device, dtype=dtype)
         support_model.train()
         attn = support_model.layers[0].self_attn
-        setattr(attn, "_benchmark_support_model", support_model)
+        # Keep an external reference for runtime helpers without registering the full support model
+        # as a child module of the attention layer, which would pollute parameter counts.
+        object.__setattr__(attn, "_benchmark_support_model_ref", weakref.ref(support_model))
         return attn, hidden_size
 
-    if model_key in {"gdn_layer", "gdn_branch_only"}:
+    if model_key == "gdn_branch_only":
         config_cls, _, _, gdn_cls = load_qwen3_variant("qwen3_gdn")
         if gdn_cls is None:
             raise RuntimeError("Unable to locate GatedDeltaNet class for qwen3_gdn")
@@ -582,10 +570,11 @@ def build_kernel_subject(
     )
     canonical_key = canonical_kernel_key(model_key)
 
-    if canonical_key in {"fa_layer", "fa_branch_only", "swa_layer", "swa_branch_only"}:
+    if canonical_key in {"fa_branch_only", "swa_branch_only"}:
         def runner(hidden_states: Any) -> Any:
             position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
-            support_model = getattr(module, "_benchmark_support_model", None)
+            support_model_ref = getattr(module, "_benchmark_support_model_ref", None)
+            support_model = support_model_ref() if support_model_ref is not None else None
             if support_model is None:
                 raise RuntimeError("Missing support model for attention benchmark subject")
             position_embeddings = support_model.rotary_emb(hidden_states, position_ids)
@@ -599,9 +588,9 @@ def build_kernel_subject(
         return runner, hidden_size
 
     def runner(hidden_states: Any) -> Any:
-        if canonical_key in {"lact_full_layer"}:
+        if canonical_key == "lact_full_layer":
             return module(hidden_states=hidden_states, attention_mask=None, use_cache=False)[0]
-        if canonical_key in {"gdn_layer", "gdn_branch_only"}:
+        if canonical_key == "gdn_branch_only":
             return module(
                 hidden_states=hidden_states,
                 attention_mask=None,
