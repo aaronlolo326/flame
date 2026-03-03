@@ -31,6 +31,43 @@ MODEL_SPECS = {
     "hybrid_gdn": ModelSpec("hybrid_gdn", "75% GatedDeltaNet + 25% FA", "qwen3_gdn"),
 }
 
+KERNEL_MODEL_LABELS = {
+    "lact_full_layer": "LaCT Full Layer",
+    "fa_layer": "Full Attention Layer",
+    "swa_layer": "Sliding-Window Attention Layer",
+    "gdn_layer": "GatedDeltaNet Layer",
+    "lact_ttt_branch_only": "LaCT TTT Branch Only",
+    "fa_branch_only": "Full Attention Branch Only",
+    "swa_branch_only": "Sliding-Window Attention Branch Only",
+    "gdn_branch_only": "GatedDeltaNet Branch Only",
+    # Backward-compatible aliases.
+    "lact": "LaCT Full Layer",
+    "full_attention": "Full Attention Layer",
+    "hybrid_swa": "Sliding-Window Attention Layer",
+    "hybrid_gdn": "GatedDeltaNet Layer",
+}
+
+KERNEL_MODEL_ALIASES = {
+    "lact": "lact_full_layer",
+    "full_attention": "fa_layer",
+    "hybrid_swa": "swa_layer",
+    "hybrid_gdn": "gdn_layer",
+}
+
+QWEN35_2B_BASE_GDN = {
+    "num_attention_heads": 16,
+    "head_dim": 128,
+    "expand_v": 1,
+    "mode": "chunk",
+    "use_gate": True,
+    "use_short_conv": True,
+    "conv_size": 4,
+    "conv_bias": False,
+    "pad_value": 0,
+    "selection_window_size": 100,
+    "use_qk_norm": True,
+}
+
 
 def load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
@@ -181,6 +218,10 @@ def resolve_dtype(torch_module: Any, dtype_name: str):
     return mapping[normalized]
 
 
+def canonical_kernel_key(model_key: str) -> str:
+    return KERNEL_MODEL_ALIASES.get(model_key, model_key)
+
+
 def build_whole_model(
     *,
     model_key: str,
@@ -261,7 +302,7 @@ def build_whole_model(
     return model, base_cfg
 
 
-def build_kernel_subject(
+def build_kernel_module(
     *,
     model_key: str,
     seq_len: int,
@@ -273,9 +314,13 @@ def build_kernel_subject(
     lact_chunk_size: int | None = None,
     use_fused_kernel: bool | None = None,
     paper_lm_defaults: bool = True,
-) -> tuple[Callable[[Any], Any], int]:
+) -> tuple[Any, int]:
     import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from einops import rearrange
 
+    model_key = canonical_kernel_key(model_key)
     base_cfg = load_json(base_config_path)
     dtype = resolve_dtype(torch, dtype_name)
     hidden_size = base_cfg["hidden_size"]
@@ -287,8 +332,19 @@ def build_kernel_subject(
         paper_lm_defaults=paper_lm_defaults,
     )
 
-    if model_key == "lact":
+    if model_key in {"lact_full_layer", "lact_ttt_branch_only"}:
         config_cls, _, layer_cls = import_lact_modules()
+        with prepend_sys_path(FLAME_ROOT):
+            from custom_models.lact_model.layer_lact_swiglu import l2_norm
+            from custom_models.lact_model.ttt_operation import (
+                block_causal_lact_swiglu,
+                prenorm_block_causal_lact_swiglu,
+            )
+            from custom_models.lact_model.ttt_operation_fused_kernel import (
+                postnorm_block_causal_lact_swiglu_fused_kernel_triton,
+                prenorm_block_causal_lact_swiglu_fused_kernel_triton,
+            )
+
         config_kwargs = dict(base_cfg)
         config_kwargs["max_position_embeddings"] = max(seq_len, config_kwargs.get("max_position_embeddings", seq_len))
         config_kwargs["lact_chunk_size"] = chunk_size
@@ -296,7 +352,7 @@ def build_kernel_subject(
         if use_fused_kernel is not None:
             config_kwargs["use_fused_kernel"] = use_fused_kernel
         config = config_cls(**config_kwargs)
-        layer = layer_cls(
+        full_layer = layer_cls(
             hidden_size=config.hidden_size,
             num_attn_heads=config.num_attn_heads,
             num_lact_heads=config.num_lact_heads,
@@ -323,21 +379,132 @@ def build_kernel_subject(
             use_fused_kernel=config.use_fused_kernel,
             fp32_states=config.fp32_states,
         ).to(device=device, dtype=dtype)
-        layer.train()
+        full_layer.train()
+        if model_key == "lact_full_layer":
+            return full_layer, hidden_size
 
-        def runner(hidden_states: Any) -> Any:
-            return layer(hidden_states=hidden_states, attention_mask=None, use_cache=False)[0]
+        class LaCTTTTBranchOnly(nn.Module):
+            def __init__(self, layer: Any):
+                super().__init__()
+                self.layer = layer
 
-        return runner, hidden_size
+            def forward(self, hidden_states: Any) -> Any:
+                layer = self.layer
+                batch_size_local, q_len, _ = hidden_states.size()
+                q, k, v = layer.qkv(hidden_states).chunk(3, dim=-1)
+                if layer.attn_qk_norm:
+                    q, k = layer.q_norm(q), layer.k_norm(k)
 
-    if model_key in {"full_attention", "hybrid_swa"}:
+                fast_q, fast_k = layer._rescale_qk(q, k)
+                fast_v = v
+
+                fast_q = rearrange(fast_q, "b s (n_h d) -> (b n_h) s d", n_h=layer.num_fw_heads)
+                fast_k = rearrange(fast_k, "b s (n_h d) -> (b n_h) s d", n_h=layer.num_fw_heads)
+                fast_v = rearrange(fast_v, "b s (n_h d) -> (b n_h) s d", n_h=layer.num_fw_heads)
+
+                if layer.qkv_silu:
+                    if layer.no_v_silu:
+                        fast_q = F.silu(fast_q)
+                        fast_k = F.silu(fast_k)
+                    else:
+                        fast_q = F.silu(fast_q)
+                        fast_k = F.silu(fast_k)
+                        fast_v = F.silu(fast_v)
+
+                fast_q = l2_norm(fast_q)
+                fast_k = l2_norm(fast_k)
+
+                seqlen_offset = 0
+                max_seqlen = max(q_len, layer.max_position_embeddings)
+                if not layer.ttt_nope:
+                    fast_q = rearrange(fast_q, "(b n_h) s d -> b s (n_h d)", n_h=layer.num_fw_heads)
+                    fast_k = rearrange(fast_k, "(b n_h) s d -> b s (n_h d)", n_h=layer.num_fw_heads)
+                    fast_q = rearrange(fast_q, "b s (n_h d) -> b s n_h d", n_h=layer.num_heads)
+                    fast_k = rearrange(fast_k, "b s (n_h d) -> b s n_h d", n_h=layer.num_heads)
+                    fast_q, fast_k = layer.rotary(
+                        fast_q,
+                        fast_k,
+                        seqlen_offset=seqlen_offset,
+                        max_seqlen=max_seqlen,
+                        cu_seqlens=None,
+                    )
+                    fast_q = rearrange(fast_q, "b s n_h d -> b s (n_h d)", n_h=layer.num_heads)
+                    fast_k = rearrange(fast_k, "b s n_h d -> b s (n_h d)", n_h=layer.num_heads)
+                    fast_q = rearrange(fast_q, "b s (n_h d) -> (b n_h) s d", n_h=layer.num_fw_heads)
+                    fast_k = rearrange(fast_k, "b s (n_h d) -> (b n_h) s d", n_h=layer.num_fw_heads)
+
+                if layer.w0_w2_low_rank > 0:
+                    fw_w0 = layer.w0().repeat(batch_size_local, 1, 1)
+                    fw_w2 = layer.w2().repeat(batch_size_local, 1, 1)
+                else:
+                    fw_w0 = layer.w0.repeat(batch_size_local, 1, 1)
+                    fw_w2 = layer.w2.repeat(batch_size_local, 1, 1)
+                fw_w1 = layer.w1.repeat(batch_size_local, 1, 1)
+
+                lr = layer.lr_proj(hidden_states)
+                if layer.lr_parameterization == "mamba":
+                    lr = torch.nn.functional.softplus(lr.float() + layer.base_lr_inv)
+                else:
+                    raise NotImplementedError(
+                        f"LR parameterization {layer.lr_parameterization} not implemented"
+                    )
+                fw_lr = rearrange(lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=layer.num_fw_heads)
+                fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
+
+                if layer.use_momentum:
+                    momentum = layer.momentum_proj(hidden_states).float()
+                    momentum = rearrange(momentum, "b s (n_h d) -> (b n_h) s d", n_h=layer.num_fw_heads)
+                else:
+                    momentum = None
+
+                if layer.fp32_states:
+                    fw_w0 = fw_w0.to(torch.float32)
+                    fw_w1 = fw_w1.to(torch.float32)
+                    fw_w2 = fw_w2.to(torch.float32)
+
+                if layer.ttt_prenorm:
+                    if layer.use_fused_kernel:
+                        fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
+                            fw_w0, fw_w1, fw_w2, fast_q, fast_k, fast_v, fw_lr1, fw_lr2, fw_lr3,
+                            chunk_size=layer.lact_chunk_size, use_muon=layer.use_muon, momentum=momentum
+                        )
+                    else:
+                        fw_x = prenorm_block_causal_lact_swiglu(
+                            fw_w0, fw_w1, fw_w2, fast_q, fast_k, fast_v, fw_lr1, fw_lr2, fw_lr3,
+                            chunk_size=layer.lact_chunk_size, use_muon=layer.use_muon, momentum=momentum
+                        )
+                else:
+                    if layer.use_fused_kernel:
+                        fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
+                            fw_w0, fw_w1, fw_w2, fast_q, fast_k, fast_v, fw_lr1, fw_lr2, fw_lr3,
+                            chunk_size=layer.lact_chunk_size, use_muon=layer.use_muon, momentum=momentum
+                        )
+                    else:
+                        fw_x = block_causal_lact_swiglu(
+                            fw_w0, fw_w1, fw_w2, fast_q, fast_k, fast_v, fw_lr1, fw_lr2, fw_lr3,
+                            chunk_size=layer.lact_chunk_size, use_muon=layer.use_muon, momentum=momentum
+                        )
+
+                ttt_x_normed = layer.ttt_norm(fw_x)
+                if layer.learnable_ttt_scale:
+                    ttt_scale = F.silu(layer.ttt_scale_proj(hidden_states), inplace=False)
+                    ttt_scale = rearrange(ttt_scale, "b s (n_h d) -> (b n_h) s d", n_h=layer.num_fw_heads)
+                    ttt_x_normed = ttt_x_normed * ttt_scale
+                ttt_x_normed = rearrange(ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=layer.num_fw_heads)
+                return layer.o_proj(ttt_x_normed)
+
+        ttt_only = LaCTTTTBranchOnly(full_layer).to(device=device, dtype=dtype)
+        ttt_only.train()
+        return ttt_only, hidden_size
+
+    if model_key in {"fa_layer", "fa_branch_only", "swa_layer", "swa_branch_only"}:
         config_cls, _, qwen_model_cls, _ = load_qwen3_variant("qwen3_swa")
-        layer_types = ["full_attention"] if model_key == "full_attention" else ["sliding_attention"]
+        layer_types = ["full_attention"] if model_key in {"fa_layer", "fa_branch_only"} else ["sliding_attention"]
         config_kwargs = lact_config_to_qwen3_dict(
             base_cfg,
             seq_len=seq_len,
             layer_types=layer_types,
-            sliding_window=window_size if model_key == "hybrid_swa" else None,
+            sliding_window=window_size if model_key in {"swa_layer", "swa_branch_only"} else None,
             attn_implementation="flash_attention_2",
         )
         config_kwargs["num_hidden_layers"] = 1
@@ -345,56 +512,103 @@ def build_kernel_subject(
         support_model = qwen_model_cls(config).to(device=device, dtype=dtype)
         support_model.train()
         attn = support_model.layers[0].self_attn
+        setattr(attn, "_benchmark_support_model", support_model)
+        return attn, hidden_size
 
+    if model_key in {"gdn_layer", "gdn_branch_only"}:
+        config_cls, _, _, gdn_cls = load_qwen3_variant("qwen3_gdn")
+        if gdn_cls is None:
+            raise RuntimeError("Unable to locate GatedDeltaNet class for qwen3_gdn")
+        num_heads = QWEN35_2B_BASE_GDN["num_attention_heads"]
+        head_dim = QWEN35_2B_BASE_GDN["head_dim"]
+        config_kwargs = {
+            "vocab_size": base_cfg["vocab_size"],
+            "hidden_size": base_cfg["hidden_size"],
+            "intermediate_size": base_cfg.get("intermediate_size", base_cfg["hidden_size"] * 4),
+            "num_hidden_layers": 1,
+            "num_attention_heads": num_heads,
+            "num_key_value_heads": num_heads,
+            "head_dim": head_dim,
+            "hidden_act": base_cfg.get("hidden_act", "silu"),
+            "max_position_embeddings": max(seq_len, base_cfg.get("max_position_embeddings", seq_len)),
+            "initializer_range": base_cfg.get("initializer_range", 0.02),
+            "rms_norm_eps": base_cfg.get("norm_eps", 1e-6),
+            "use_cache": False,
+            "tie_word_embeddings": base_cfg.get("tie_word_embeddings", False),
+            "rope_theta": base_cfg.get("rope_theta", 1_000_000.0),
+            "rope_scaling": base_cfg.get("rope_scaling"),
+            "attention_bias": base_cfg.get("attention_bias", base_cfg.get("qkv_bias", False)),
+            "use_sliding_window": False,
+            "sliding_window": None,
+            "max_window_layers": 1,
+            "layer_types": ["linear_attention"],
+            "attention_dropout": base_cfg.get("attention_dropout", 0.0),
+            **QWEN35_2B_BASE_GDN,
+        }
+        config = config_cls(**config_kwargs)
+        layer = gdn_cls(config=config, layer_idx=0).to(device=device, dtype=dtype)
+        layer.train()
+        return layer, hidden_size
+
+    raise ValueError(f"Unknown kernel benchmark key: {model_key}")
+
+
+def build_kernel_subject(
+    *,
+    model_key: str,
+    seq_len: int,
+    device: str,
+    dtype_name: str,
+    batch_size: int,
+    base_config_path: Path = DEFAULT_LACT_CONFIG,
+    sliding_window: int | None = None,
+    lact_chunk_size: int | None = None,
+    use_fused_kernel: bool | None = None,
+    paper_lm_defaults: bool = True,
+) -> tuple[Callable[[Any], Any], int]:
+    import torch
+
+    module, hidden_size = build_kernel_module(
+        model_key=model_key,
+        seq_len=seq_len,
+        device=device,
+        dtype_name=dtype_name,
+        batch_size=batch_size,
+        base_config_path=base_config_path,
+        sliding_window=sliding_window,
+        lact_chunk_size=lact_chunk_size,
+        use_fused_kernel=use_fused_kernel,
+        paper_lm_defaults=paper_lm_defaults,
+    )
+    canonical_key = canonical_kernel_key(model_key)
+
+    if canonical_key in {"fa_layer", "fa_branch_only", "swa_layer", "swa_branch_only"}:
         def runner(hidden_states: Any) -> Any:
             position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
+            support_model = getattr(module, "_benchmark_support_model", None)
+            if support_model is None:
+                raise RuntimeError("Missing support model for attention benchmark subject")
             position_embeddings = support_model.rotary_emb(hidden_states, position_ids)
-            return attn(
+            return module(
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=None,
                 past_key_value=None,
                 cache_position=None,
             )[0]
-
         return runner, hidden_size
 
-    if model_key == "hybrid_gdn":
-        config_cls, _, _, gdn_cls = load_qwen3_variant("qwen3_gdn")
-        if gdn_cls is None:
-            raise RuntimeError("Unable to locate GatedDeltaNet class for qwen3_gdn")
-        config_kwargs = lact_config_to_qwen3_dict(
-            base_cfg,
-            seq_len=seq_len,
-            layer_types=["linear_attention"],
-            sliding_window=None,
-            attn_implementation="flash_attention_2",
-            gdn_overrides={
-                "expand_v": 1,
-                "mode": "chunk",
-                "use_gate": True,
-                "use_short_conv": True,
-                "conv_size": 4,
-                "conv_bias": False,
-                "pad_value": 0,
-                "selection_window_size": 100,
-                "use_qk_norm": True,
-            },
-        )
-        config_kwargs["num_hidden_layers"] = 1
-        config = config_cls(**config_kwargs)
-        layer = gdn_cls(config=config, layer_idx=0).to(device=device, dtype=dtype)
-        layer.train()
-
-        def runner(hidden_states: Any) -> Any:
-            return layer(
+    def runner(hidden_states: Any) -> Any:
+        if canonical_key in {"lact_full_layer"}:
+            return module(hidden_states=hidden_states, attention_mask=None, use_cache=False)[0]
+        if canonical_key in {"gdn_layer", "gdn_branch_only"}:
+            return module(
                 hidden_states=hidden_states,
                 attention_mask=None,
                 past_key_values=None,
                 use_cache=False,
                 output_attentions=False,
             )[0]
+        return module(hidden_states)
 
-        return runner, hidden_size
-
-    raise ValueError(f"Unknown kernel benchmark key: {model_key}")
+    return runner, hidden_size

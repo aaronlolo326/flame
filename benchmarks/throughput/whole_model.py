@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--use-fused-lact-kernel", action="store_true")
     parser.add_argument(
+        "--stop-after-oom",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If a model OOMs at one seq_len, skip larger seq_lens for that model in this sweep.",
+    )
+    parser.add_argument(
         "--output-prefix",
         type=Path,
         default=Path(__file__).resolve().parent / "results" / f"whole-model-{now_timestamp()}",
@@ -65,7 +71,31 @@ def main() -> None:
 
     try:
         for model_key in args.models:
+            stop_model = False
             for seq_len in args.seq_lens:
+                if stop_model:
+                    row = BenchmarkRow(
+                        benchmark="whole_model_train",
+                        model=model_key,
+                        seq_len=seq_len,
+                        batch_size=args.batch_size,
+                        warmup_steps=args.warmup_steps,
+                        measured_steps=args.steps,
+                        forward_ms=0.0,
+                        backward_ms=0.0,
+                        optimizer_ms=0.0,
+                        step_ms=0.0,
+                        steps_per_second=0.0,
+                        tokens_per_second=0.0,
+                        peak_memory_gb=0.0,
+                        status="skipped_after_oom",
+                        notes="Skipped because a smaller seq_len for this model already OOMed.",
+                    )
+                    rows.append(row)
+                    append_row_jsonl(output_jsonl, row)
+                    write_rows_csv(output_csv, rows)
+                    log(f"[skip] model={model_key} seq_len={seq_len} reason=previous_oom")
+                    continue
                 log(
                     f"[build] model={model_key} seq_len={seq_len} local_batch={args.batch_size} "
                     f"chunk={args.lact_chunk_size or 'config'} window={args.sliding_window or 'config'}"
@@ -193,6 +223,8 @@ def main() -> None:
                     append_row_jsonl(output_jsonl, row)
                     write_rows_csv(output_csv, rows)
                     log(f"[done] model={model_key} seq_len={seq_len} status={status} error={exc}")
+                    if status == "oom" and args.stop_after_oom:
+                        stop_model = True
                     if "cuda" in device:
                         torch.cuda.empty_cache()
     finally:

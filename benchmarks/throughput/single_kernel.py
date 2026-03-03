@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .adapters import DEFAULT_LACT_CONFIG, MODEL_SPECS, build_kernel_subject
+from .adapters import DEFAULT_LACT_CONFIG, KERNEL_MODEL_LABELS, build_kernel_subject, canonical_kernel_key
 from .common import (
     append_row_jsonl,
     BenchmarkRow,
@@ -15,7 +15,21 @@ from .common import (
 )
 
 
-KERNEL_MODEL_KEYS = ["lact", "full_attention", "hybrid_swa", "hybrid_gdn"]
+KERNEL_MODEL_KEYS = [
+    "lact_full_layer",
+    "fa_layer",
+    "swa_layer",
+    "gdn_layer",
+    "lact_ttt_branch_only",
+    "fa_branch_only",
+    "swa_branch_only",
+    "gdn_branch_only",
+    # Backward-compatible aliases.
+    "lact",
+    "full_attention",
+    "hybrid_swa",
+    "hybrid_gdn",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         help="Apply paper-aligned LM defaults: treat sliding-window size as at least the LaCT chunk size.",
     )
     parser.add_argument("--use-fused-lact-kernel", action="store_true")
+    parser.add_argument(
+        "--stop-after-oom",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If a model OOMs at one seq_len, skip larger seq_lens for that model in this sweep.",
+    )
     parser.add_argument(
         "--output-prefix",
         type=Path,
@@ -67,7 +87,31 @@ def main() -> None:
 
     try:
         for model_key in args.models:
+            stop_model = False
             for seq_len in args.seq_lens:
+                if stop_model:
+                    row = BenchmarkRow(
+                        benchmark="single_kernel_train",
+                        model=model_key,
+                        seq_len=seq_len,
+                        batch_size=args.batch_size,
+                        warmup_steps=args.warmup_steps,
+                        measured_steps=args.steps,
+                        forward_ms=0.0,
+                        backward_ms=0.0,
+                        optimizer_ms=0.0,
+                        step_ms=0.0,
+                        steps_per_second=0.0,
+                        tokens_per_second=0.0,
+                        peak_memory_gb=0.0,
+                        status="skipped_after_oom",
+                        notes="Skipped because a smaller seq_len for this model already OOMed.",
+                    )
+                    rows.append(row)
+                    append_row_jsonl(output_jsonl, row)
+                    write_rows_csv(output_csv, rows)
+                    log(f"[skip] model={model_key} seq_len={seq_len} reason=previous_oom")
+                    continue
                 log(
                     f"[build] model={model_key} seq_len={seq_len} local_batch={args.batch_size} "
                     f"chunk={args.lact_chunk_size or 'config'} window={args.sliding_window or 'config'}"
@@ -156,7 +200,7 @@ def main() -> None:
                         peak_memory_gb=peak_gb,
                         status="ok",
                         notes=(
-                            f"{MODEL_SPECS[model_key].label}; "
+                            f"{KERNEL_MODEL_LABELS[canonical_kernel_key(model_key)]}; "
                             f"lact_chunk_size={args.lact_chunk_size or 'config'}; "
                             f"sliding_window={args.sliding_window or 'config'}; "
                             f"paper_lm_defaults={args.paper_lm_defaults}"
@@ -196,6 +240,8 @@ def main() -> None:
                     append_row_jsonl(output_jsonl, row)
                     write_rows_csv(output_csv, rows)
                     log(f"[done] model={model_key} seq_len={seq_len} status={status} error={exc}")
+                    if status == "oom" and args.stop_after_oom:
+                        stop_model = True
                     if "cuda" in device:
                         torch.cuda.empty_cache()
     finally:

@@ -10,7 +10,7 @@ This folder is a draft benchmark framework for comparing LaCT against three user
 The scaffold is aimed at two benchmark modes:
 
 - Whole-network training throughput across sequence lengths: `4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1M`
-- Single-layer throughput across the same sequence lengths for LaCT, full attention, SWA, and GDN
+- Single-layer throughput across the same sequence lengths for full-layer and branch-only variants
 
 Paper-grounded notes from `Test-Time Training Done Right`:
 
@@ -30,6 +30,7 @@ The benchmark targets in this folder are not identical to the paper’s LM basel
 
 - `whole_model.py`: synthetic end-to-end single-GPU train-step throughput
 - `single_kernel.py`: isolated single-GPU layer forward/backward throughput
+- `count_single_kernel_params.py`: parameter counter for the single-layer benchmark subjects
 - `adapters.py`: model/layer builders and config translation
 - `common.py`: timing and result export helpers
 
@@ -41,6 +42,7 @@ The benchmark targets in this folder are not identical to the paper’s LM basel
 - The benchmark is intended for a CUDA machine with `torch`, `transformers`, `flash-attn`, and the FLA dependencies installed.
 - The benchmark now exposes `--lact-chunk-size` and `--sliding-window` explicitly. With `--paper-lm-defaults` enabled, the harness enforces the paper’s LM condition `window_size >= chunk_size`.
 - No context parallel, tensor parallel, or DDP path is implemented in this scaffold. Cases that do not fit on one GPU will be recorded as `oom`.
+- By default, if one model OOMs at a given `seq_len`, the harness skips larger `seq_len` values for that same model in the current sweep.
 
 ## Usage
 
@@ -62,7 +64,8 @@ python -m benchmarks.throughput.whole_model \
 
 ```bash
 python -m benchmarks.throughput.single_kernel \
-  --models lact full_attention hybrid_swa hybrid_gdn \
+  --models lact_full_layer fa_layer swa_layer gdn_layer \
+           lact_ttt_branch_only fa_branch_only swa_branch_only gdn_branch_only \
   --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
   --lact-chunk-size 2048 \
   --sliding-window 2048 \
@@ -73,6 +76,24 @@ python -m benchmarks.throughput.single_kernel \
   --device cuda \
   --use-fused-lact-kernel
 ```
+
+The current single-layer benchmark subjects are:
+
+- `lact_full_layer`
+- `fa_layer`
+- `swa_layer`
+- `gdn_layer`
+- `lact_ttt_branch_only`
+- `fa_branch_only`
+- `swa_branch_only`
+- `gdn_branch_only`
+
+Backward-compatible aliases still exist for the older four names:
+
+- `lact -> lact_full_layer`
+- `full_attention -> fa_layer`
+- `hybrid_swa -> swa_layer`
+- `hybrid_gdn -> gdn_layer`
 
 Outputs are written as both `.csv` and `.jsonl` under `benchmarks/throughput/results/`.
 
