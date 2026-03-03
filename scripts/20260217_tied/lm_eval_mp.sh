@@ -23,13 +23,13 @@ checkpoints=()
 
 # tasks=gsm8k,mmlu,lambada_openai,hellaswag
 
-# tasks=gsm8k,winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,mathqa,race
+tasks=gsm8k,winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,race
 
 
 eval_hf_path=${dump_folder}
 
 
-tasks=winogrande,arc_easy,piqa,arc_challenge,mmlu,gsm8k,race #mathqa
+# tasks=winogrande,arc_easy,piqa,arc_challenge,mmlu,race #mathqa
 accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
    --model hf-custom \
    --model_args pretrained=${eval_hf_path},trust_remote_code=True,dtype=bfloat16,torch_dtype=bfloat16,max_length=32768 \
