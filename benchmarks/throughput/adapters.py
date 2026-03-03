@@ -47,6 +47,22 @@ def build_layer_types(num_layers: int, recurrent_label: str, recurrent_ratio: fl
     return ["full_attention"] * full_layers + [recurrent_label] * recurrent_layers
 
 
+def resolve_chunk_and_window(
+    *,
+    seq_len: int,
+    base_cfg: dict[str, Any],
+    lact_chunk_size: int | None,
+    window_size: int | None,
+    paper_lm_defaults: bool,
+) -> tuple[int, int]:
+    chunk = lact_chunk_size or int(base_cfg.get("lact_chunk_size", 2048))
+    window = window_size or int(base_cfg.get("window_size", chunk))
+    if paper_lm_defaults:
+        chunk = min(seq_len, chunk)
+        window = max(window, chunk)
+    return chunk, window
+
+
 def lact_config_to_qwen3_dict(
     lact_cfg: dict[str, Any],
     *,
@@ -173,18 +189,29 @@ def build_whole_model(
     dtype_name: str,
     base_config_path: Path = DEFAULT_LACT_CONFIG,
     sliding_window: int | None = None,
+    lact_chunk_size: int | None = None,
     use_fused_kernel: bool | None = None,
+    paper_lm_defaults: bool = True,
 ) -> tuple[Any, dict[str, Any]]:
     import torch
 
     base_cfg = load_json(base_config_path)
     dtype = resolve_dtype(torch, dtype_name)
+    chunk_size, window_size = resolve_chunk_and_window(
+        seq_len=seq_len,
+        base_cfg=base_cfg,
+        lact_chunk_size=lact_chunk_size,
+        window_size=sliding_window,
+        paper_lm_defaults=paper_lm_defaults,
+    )
 
     if model_key == "lact":
         config_cls, model_cls, _ = import_lact_modules()
         config_kwargs = dict(base_cfg)
         config_kwargs["max_position_embeddings"] = max(seq_len, config_kwargs.get("max_position_embeddings", seq_len))
         config_kwargs["use_cache"] = False
+        config_kwargs["lact_chunk_size"] = chunk_size
+        config_kwargs["window_size"] = window_size
         if use_fused_kernel is not None:
             config_kwargs["use_fused_kernel"] = use_fused_kernel
         config = config_cls(**config_kwargs)
@@ -197,7 +224,7 @@ def build_whole_model(
             window = None
         elif model_key == "hybrid_swa":
             layer_types = build_layer_types(base_cfg["num_hidden_layers"], "sliding_attention")
-            window = sliding_window or base_cfg.get("window_size", base_cfg.get("lact_chunk_size", 2048))
+            window = window_size
         else:
             layer_types = build_layer_types(base_cfg["num_hidden_layers"], "linear_attention")
             window = None
@@ -243,18 +270,29 @@ def build_kernel_subject(
     batch_size: int,
     base_config_path: Path = DEFAULT_LACT_CONFIG,
     sliding_window: int | None = None,
+    lact_chunk_size: int | None = None,
     use_fused_kernel: bool | None = None,
+    paper_lm_defaults: bool = True,
 ) -> tuple[Callable[[Any], Any], int]:
     import torch
 
     base_cfg = load_json(base_config_path)
     dtype = resolve_dtype(torch, dtype_name)
     hidden_size = base_cfg["hidden_size"]
+    chunk_size, window_size = resolve_chunk_and_window(
+        seq_len=seq_len,
+        base_cfg=base_cfg,
+        lact_chunk_size=lact_chunk_size,
+        window_size=sliding_window,
+        paper_lm_defaults=paper_lm_defaults,
+    )
 
     if model_key == "lact":
         config_cls, _, layer_cls = import_lact_modules()
         config_kwargs = dict(base_cfg)
         config_kwargs["max_position_embeddings"] = max(seq_len, config_kwargs.get("max_position_embeddings", seq_len))
+        config_kwargs["lact_chunk_size"] = chunk_size
+        config_kwargs["window_size"] = window_size
         if use_fused_kernel is not None:
             config_kwargs["use_fused_kernel"] = use_fused_kernel
         config = config_cls(**config_kwargs)
@@ -299,7 +337,7 @@ def build_kernel_subject(
             base_cfg,
             seq_len=seq_len,
             layer_types=layer_types,
-            sliding_window=(sliding_window or base_cfg.get("window_size", 2048)) if model_key == "hybrid_swa" else None,
+            sliding_window=window_size if model_key == "hybrid_swa" else None,
             attn_implementation="flash_attention_2",
         )
         config_kwargs["num_hidden_layers"] = 1
@@ -360,4 +398,3 @@ def build_kernel_subject(
         return runner, hidden_size
 
     raise ValueError(f"Unknown kernel benchmark key: {model_key}")
-
