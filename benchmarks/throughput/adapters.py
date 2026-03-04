@@ -4,17 +4,17 @@ import importlib.util
 import json
 import math
 import sys
-import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FLAME_ROOT = REPO_ROOT / "flame"
 HYBRID_ROOT = REPO_ROOT / "hybrid_models"
+FLASH_LINEAR_ATTENTION_ROOT = REPO_ROOT / "flash-linear-attention"
 DEFAULT_LACT_CONFIG = FLAME_ROOT / "configs" / "qwen3_lact_1B4.json"
 
 
@@ -158,7 +158,50 @@ def load_module_from_path(module_name: str, file_path: Path, aliases: list[str] 
     return module
 
 
+def ensure_transformers_utils_compat() -> None:
+    try:
+        import transformers.utils as transformers_utils
+    except ImportError:
+        return
+
+    if not hasattr(transformers_utils, "LossKwargs"):
+        class LossKwargs(TypedDict, total=False):  # noqa: N801
+            pass
+
+        transformers_utils.LossKwargs = LossKwargs
+
+    if not hasattr(transformers_utils, "auto_docstring"):
+        def auto_docstring(*decorator_args, **decorator_kwargs):
+            if decorator_args and callable(decorator_args[0]) and len(decorator_args) == 1 and not decorator_kwargs:
+                return decorator_args[0]
+
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+        transformers_utils.auto_docstring = auto_docstring
+
+    if not hasattr(transformers_utils, "can_return_tuple"):
+        def can_return_tuple(fn):
+            return fn
+
+        transformers_utils.can_return_tuple = can_return_tuple
+
+
+def ensure_transformers_cache_compat() -> None:
+    try:
+        import transformers.cache_utils as cache_utils
+    except ImportError:
+        return
+
+    if not hasattr(cache_utils, "SlidingWindowCache") and hasattr(cache_utils, "DynamicCache"):
+        cache_utils.SlidingWindowCache = cache_utils.DynamicCache
+
+
 def load_qwen3_variant(variant: str) -> tuple[type, type, type, type | None]:
+    import torch
+
     if variant not in {"qwen3_swa", "qwen3_gdn"}:
         raise ValueError(f"Unknown Qwen3 variant: {variant}")
     model_root = HYBRID_ROOT / ("qwen3_swa" if variant == "qwen3_swa" else "qwen3_gdn")
@@ -168,11 +211,25 @@ def load_qwen3_variant(variant: str) -> tuple[type, type, type, type | None]:
             model_root / "configuration_qwen3.py",
             aliases=["configuration_qwen3"],
         )
-        modeling_mod = load_module_from_path(
-            f"{variant}_modeling_qwen3",
-            model_root / "modeling_qwen3.py",
-            aliases=["modeling_qwen3"],
-        )
+        if variant == "qwen3_gdn":
+            ensure_transformers_utils_compat()
+            ensure_transformers_cache_compat()
+            original_compile = torch.compile
+            try:
+                torch.compile = lambda fn=None, *args, **kwargs: (lambda inner: inner) if fn is None else fn
+                modeling_mod = load_module_from_path(
+                    f"{variant}_modeling_qwen3",
+                    model_root / "modeling_qwen3.py",
+                    aliases=["modeling_qwen3"],
+                )
+            finally:
+                torch.compile = original_compile
+        else:
+            modeling_mod = load_module_from_path(
+                f"{variant}_modeling_qwen3",
+                model_root / "modeling_qwen3.py",
+                aliases=["modeling_qwen3"],
+            )
     gdn_cls = getattr(modeling_mod, "GatedDeltaNet", None)
     return (
         config_mod.Qwen3Config,
@@ -498,43 +555,78 @@ def build_kernel_module(
         support_model = qwen_model_cls(config).to(device=device, dtype=dtype)
         support_model.train()
         attn = support_model.layers[0].self_attn
-        # Keep an external reference for runtime helpers without registering the full support model
-        # as a child module of the attention layer, which would pollute parameter counts.
-        object.__setattr__(attn, "_benchmark_support_model_ref", weakref.ref(support_model))
+        # Keep a strong non-module reference for runtime helpers without registering the full support
+        # model as a child module of the attention layer, which would pollute parameter counts.
+        object.__setattr__(attn, "_benchmark_support_model_holder", [support_model])
         return attn, hidden_size
 
     if model_key == "gdn_branch_only":
-        config_cls, _, _, gdn_cls = load_qwen3_variant("qwen3_gdn")
-        if gdn_cls is None:
-            raise RuntimeError("Unable to locate GatedDeltaNet class for qwen3_gdn")
-        num_heads = QWEN35_2B_BASE_GDN["num_attention_heads"]
-        head_dim = QWEN35_2B_BASE_GDN["head_dim"]
-        config_kwargs = {
-            "vocab_size": base_cfg["vocab_size"],
-            "hidden_size": base_cfg["hidden_size"],
-            "intermediate_size": base_cfg.get("intermediate_size", base_cfg["hidden_size"] * 4),
-            "num_hidden_layers": 1,
-            "num_attention_heads": num_heads,
-            "num_key_value_heads": num_heads,
-            "head_dim": head_dim,
-            "hidden_act": base_cfg.get("hidden_act", "silu"),
-            "max_position_embeddings": max(seq_len, base_cfg.get("max_position_embeddings", seq_len)),
-            "initializer_range": base_cfg.get("initializer_range", 0.02),
-            "rms_norm_eps": base_cfg.get("norm_eps", 1e-6),
-            "use_cache": False,
-            "tie_word_embeddings": base_cfg.get("tie_word_embeddings", False),
-            "rope_theta": base_cfg.get("rope_theta", 1_000_000.0),
-            "rope_scaling": base_cfg.get("rope_scaling"),
-            "attention_bias": base_cfg.get("attention_bias", base_cfg.get("qkv_bias", False)),
-            "use_sliding_window": False,
-            "sliding_window": None,
-            "max_window_layers": 1,
-            "layer_types": ["linear_attention"],
-            "attention_dropout": base_cfg.get("attention_dropout", 0.0),
-            **QWEN35_2B_BASE_GDN,
-        }
-        config = config_cls(**config_kwargs)
-        layer = gdn_cls(config=config, layer_idx=0).to(device=device, dtype=dtype)
+        try:
+            config_cls, _, _, gdn_cls = load_qwen3_variant("qwen3_gdn")
+            if gdn_cls is None:
+                raise RuntimeError("Unable to locate GatedDeltaNet class for qwen3_gdn")
+            num_heads = QWEN35_2B_BASE_GDN["num_attention_heads"]
+            head_dim = QWEN35_2B_BASE_GDN["head_dim"]
+            config_kwargs = {
+                "vocab_size": base_cfg["vocab_size"],
+                "hidden_size": base_cfg["hidden_size"],
+                "intermediate_size": base_cfg.get("intermediate_size", base_cfg["hidden_size"] * 4),
+                "num_hidden_layers": 1,
+                "num_attention_heads": num_heads,
+                "num_key_value_heads": num_heads,
+                "head_dim": head_dim,
+                "hidden_act": base_cfg.get("hidden_act", "silu"),
+                "max_position_embeddings": max(seq_len, base_cfg.get("max_position_embeddings", seq_len)),
+                "initializer_range": base_cfg.get("initializer_range", 0.02),
+                "rms_norm_eps": base_cfg.get("norm_eps", 1e-6),
+                "use_cache": False,
+                "tie_word_embeddings": base_cfg.get("tie_word_embeddings", False),
+                "rope_theta": base_cfg.get("rope_theta", 1_000_000.0),
+                "rope_scaling": base_cfg.get("rope_scaling"),
+                "attention_bias": base_cfg.get("attention_bias", base_cfg.get("qkv_bias", False)),
+                "use_sliding_window": False,
+                "sliding_window": None,
+                "max_window_layers": 1,
+                "layer_types": ["linear_attention"],
+                "attention_dropout": base_cfg.get("attention_dropout", 0.0),
+                **QWEN35_2B_BASE_GDN,
+            }
+            config = config_cls(**config_kwargs)
+            layer = gdn_cls(config=config, layer_idx=0).to(device=device, dtype=dtype)
+        except (ImportError, AttributeError) as exc:
+            qwen_import_error = repr(exc)
+            try:
+                with prepend_sys_path(FLASH_LINEAR_ATTENTION_ROOT):
+                    try:
+                        from fla.layers import GatedDeltaNet as FlaGatedDeltaNet
+                    except Exception as fla_exc:
+                        try:
+                            from fla.layers.gated_deltanet import GatedDeltaNet as FlaGatedDeltaNet
+                        except Exception as fla_direct_exc:
+                            raise RuntimeError(
+                                "Unable to import GatedDeltaNet from either qwen3_gdn or fla.layers. "
+                                f"qwen3_gdn_error={qwen_import_error}; "
+                                f"fla_layers_error={repr(fla_exc)}; "
+                                f"fla_direct_error={repr(fla_direct_exc)}; "
+                                f"flash_linear_attention_root={FLASH_LINEAR_ATTENTION_ROOT}"
+                            ) from fla_direct_exc
+            except RuntimeError:
+                raise
+
+            layer = FlaGatedDeltaNet(
+                hidden_size=base_cfg["hidden_size"],
+                expand_v=QWEN35_2B_BASE_GDN["expand_v"],
+                head_dim=QWEN35_2B_BASE_GDN["head_dim"],
+                num_heads=QWEN35_2B_BASE_GDN["num_attention_heads"],
+                mode=QWEN35_2B_BASE_GDN["mode"],
+                use_gate=QWEN35_2B_BASE_GDN["use_gate"],
+                use_short_conv=QWEN35_2B_BASE_GDN["use_short_conv"],
+                conv_size=QWEN35_2B_BASE_GDN["conv_size"],
+                conv_bias=QWEN35_2B_BASE_GDN["conv_bias"],
+                norm_eps=base_cfg.get("norm_eps", 1e-6),
+                layer_idx=0,
+            ).to(device=device, dtype=dtype)
+            object.__setattr__(layer, "_benchmark_gdn_backend", f"fla.layers fallback: {qwen_import_error}")
         layer.train()
         return layer, hidden_size
 
@@ -573,8 +665,8 @@ def build_kernel_subject(
     if canonical_key in {"fa_branch_only", "swa_branch_only"}:
         def runner(hidden_states: Any) -> Any:
             position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
-            support_model_ref = getattr(module, "_benchmark_support_model_ref", None)
-            support_model = support_model_ref() if support_model_ref is not None else None
+            support_model_holder = getattr(module, "_benchmark_support_model_holder", None)
+            support_model = support_model_holder[0] if support_model_holder else None
             if support_model is None:
                 raise RuntimeError("Missing support model for attention benchmark subject")
             position_embeddings = support_model.rotary_emb(hidden_states, position_ids)

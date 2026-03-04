@@ -42,7 +42,8 @@ The benchmark targets in this folder are not identical to the paper’s LM basel
 - The benchmark is intended for a CUDA machine with `torch`, `transformers`, `flash-attn`, and the FLA dependencies installed.
 - The benchmark now exposes `--lact-chunk-size` and `--sliding-window` explicitly. With `--paper-lm-defaults` enabled, the harness enforces the paper’s LM condition `window_size >= chunk_size`.
 - No context parallel, tensor parallel, or DDP path is implemented in this scaffold. Cases that do not fit on one GPU will be recorded as `oom`.
-- By default, if one model OOMs at a given `seq_len`, the harness skips larger `seq_len` values for that same model in the current sweep.
+- By default, if one model OOMs or hits a persistent backend error at a given `seq_len`, the harness skips larger `seq_len` values for that same model in the current sweep.
+- The result schema includes `runtime_env` so you can run different subjects in different Python environments and merge the outputs afterward.
 
 ## Usage
 
@@ -59,6 +60,7 @@ python -m benchmarks.throughput.whole_model \
   --warmup-steps 3 \
   --dtype bfloat16 \
   --device cuda \
+  --runtime-env nm-dev \
   --use-fused-lact-kernel
 ```
 
@@ -74,7 +76,83 @@ python -m benchmarks.throughput.single_kernel \
   --warmup-steps 5 \
   --dtype bfloat16 \
   --device cuda \
+  --runtime-env nm-dev \
   --use-fused-lact-kernel
+```
+
+If GDN only works in a separate environment, run the non-GDN subjects in `nm-dev` and the GDN subjects in `fla`, then merge the outputs:
+
+```bash
+python -m benchmarks.throughput.single_kernel \
+  --models lact_full_layer lact_ttt_branch_only fa_branch_only swa_branch_only \
+  --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
+  --lact-chunk-size 2048 \
+  --sliding-window 2048 \
+  --batch-size 1 \
+  --steps 20 \
+  --warmup-steps 5 \
+  --dtype bfloat16 \
+  --device cuda \
+  --runtime-env nm-dev \
+  --output-prefix benchmarks/throughput/results/single-kernel-main
+```
+
+```bash
+python -m benchmarks.throughput.single_kernel \
+  --models gdn_branch_only \
+  --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
+  --batch-size 1 \
+  --steps 20 \
+  --warmup-steps 5 \
+  --dtype bfloat16 \
+  --device cuda \
+  --runtime-env fla \
+  --output-prefix benchmarks/throughput/results/single-kernel-gdn
+```
+
+```bash
+python -m benchmarks.throughput.merge_results \
+  --inputs benchmarks/throughput/results/single-kernel-main.csv \
+           benchmarks/throughput/results/single-kernel-gdn.csv \
+  --output-prefix benchmarks/throughput/results/single-kernel-merged
+```
+
+The same split-env pattern works for whole-model throughput if `hybrid_gdn` needs to run in `fla`:
+
+```bash
+python -m benchmarks.throughput.whole_model \
+  --models lact full_attention hybrid_swa \
+  --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
+  --lact-chunk-size 2048 \
+  --sliding-window 2048 \
+  --batch-size 1 \
+  --steps 10 \
+  --warmup-steps 3 \
+  --dtype bfloat16 \
+  --device cuda \
+  --runtime-env nm-dev \
+  --use-fused-lact-kernel \
+  --output-prefix benchmarks/throughput/results/whole-model-main
+```
+
+```bash
+python -m benchmarks.throughput.whole_model \
+  --models hybrid_gdn \
+  --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
+  --batch-size 1 \
+  --steps 10 \
+  --warmup-steps 3 \
+  --dtype bfloat16 \
+  --device cuda \
+  --runtime-env fla \
+  --output-prefix benchmarks/throughput/results/whole-model-gdn
+```
+
+```bash
+python -m benchmarks.throughput.merge_results \
+  --inputs benchmarks/throughput/results/whole-model-main.csv \
+           benchmarks/throughput/results/whole-model-gdn.csv \
+  --output-prefix benchmarks/throughput/results/whole-model-merged
 ```
 
 The current single-layer benchmark subjects are:
@@ -104,7 +182,8 @@ Outputs are written as both `.csv` and `.jsonl` under `benchmarks/throughput/res
 - `batch_size`: single-GPU batch size
 - `tokens_per_second`: single-GPU throughput, `batch_size * seq_len / step_time`
 - `peak_memory_gb`: `torch.cuda.max_memory_allocated()`
-- `status`: `ok`, `oom`, or `error`
+- `runtime_env`: logical environment label like `nm-dev` or `fla`
+- `status`: `ok`, `oom`, `error`, `unsupported_backend`, or `skipped_after_failure`
 
 If you want to mirror the language-model paper setting more closely, start with:
 
@@ -136,3 +215,4 @@ These are likely useful for improving the LaCT work beyond the two core throughp
 - The layer benchmark is really a layer-level train-step benchmark, not a raw Triton microkernel profiler.
 - The LaCT paper PDF at `/work/yufei/projects/paper_list/tttdr.pdf` is now parseable in this environment, and the chunk/window guidance in this README has been updated from it.
 - The current scaffold still does not encode every paper ablation or exact paper baseline; it mainly uses the paper to set correct LaCT benchmarking assumptions while preserving your requested model comparisons.
+- If GDN requires a different Python environment from the other models, the resulting throughput comparison is still useful, but you should note that the software stack differed for that baseline.

@@ -25,6 +25,7 @@ DEFAULT_SEQ_LENS = [
 class BenchmarkRow:
     benchmark: str
     model: str
+    runtime_env: str
     seq_len: int
     batch_size: int
     warmup_steps: int

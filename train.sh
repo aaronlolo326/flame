@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 train=true
-convert=false
+convert=true
 
 params=""
 if [ $# -ne 0 ]; then

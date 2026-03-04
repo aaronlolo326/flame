@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--runtime-env",
+        default="unknown",
+        help="Logical environment label recorded in the result files, e.g. 'nm-dev' or 'fla'.",
+    )
     parser.add_argument("--base-config", type=Path, default=DEFAULT_LACT_CONFIG)
     parser.add_argument("--sliding-window", type=int, default=None)
     parser.add_argument("--lact-chunk-size", type=int, default=None)
@@ -48,6 +53,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="If a model OOMs at one seq_len, skip larger seq_lens for that model in this sweep.",
+    )
+    parser.add_argument(
+        "--stop-after-error",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If a model hits a persistent backend/runtime error at one seq_len, skip larger seq_lens for that model.",
     )
     parser.add_argument(
         "--output-prefix",
@@ -68,7 +79,7 @@ def main() -> None:
 
     log(
         "Starting single-kernel throughput benchmark "
-        f"device={device} dtype={args.dtype} "
+        f"device={device} dtype={args.dtype} runtime_env={args.runtime_env} "
         f"models={args.models} seq_lens={args.seq_lens}"
     )
     if args.use_fused_lact_kernel:
@@ -80,11 +91,13 @@ def main() -> None:
     try:
         for model_key in args.models:
             stop_model = False
+            stop_reason = "previous_oom"
             for seq_len in args.seq_lens:
                 if stop_model:
                     row = BenchmarkRow(
                         benchmark="single_kernel_train",
                         model=model_key,
+                        runtime_env=args.runtime_env,
                         seq_len=seq_len,
                         batch_size=args.batch_size,
                         warmup_steps=args.warmup_steps,
@@ -96,13 +109,13 @@ def main() -> None:
                         steps_per_second=0.0,
                         tokens_per_second=0.0,
                         peak_memory_gb=0.0,
-                        status="skipped_after_oom",
-                        notes="Skipped because a smaller seq_len for this model already OOMed.",
+                        status="skipped_after_failure",
+                        notes=f"Skipped because a smaller seq_len for this model already failed: {stop_reason}.",
                     )
                     rows.append(row)
                     append_row_jsonl(output_jsonl, row)
                     write_rows_csv(output_csv, rows)
-                    log(f"[skip] model={model_key} seq_len={seq_len} reason=previous_oom")
+                    log(f"[skip] model={model_key} seq_len={seq_len} reason={stop_reason}")
                     continue
                 log(
                     f"[build] model={model_key} seq_len={seq_len} local_batch={args.batch_size} "
@@ -179,6 +192,7 @@ def main() -> None:
                     row = BenchmarkRow(
                         benchmark="single_kernel_train",
                         model=model_key,
+                        runtime_env=args.runtime_env,
                         seq_len=seq_len,
                         batch_size=args.batch_size,
                         warmup_steps=args.warmup_steps,
@@ -211,9 +225,13 @@ def main() -> None:
                         torch.cuda.empty_cache()
                 except RuntimeError as exc:
                     status = "oom" if "out of memory" in str(exc).lower() else "error"
+                    notes = str(exc)
+                    if "PassManager::run failed" in notes:
+                        status = "unsupported_backend"
                     row = BenchmarkRow(
                         benchmark="single_kernel_train",
                         model=model_key,
+                        runtime_env=args.runtime_env,
                         seq_len=seq_len,
                         batch_size=args.batch_size,
                         warmup_steps=args.warmup_steps,
@@ -226,7 +244,7 @@ def main() -> None:
                         tokens_per_second=0.0,
                         peak_memory_gb=0.0,
                         status=status,
-                        notes=str(exc),
+                        notes=notes,
                     )
                     rows.append(row)
                     append_row_jsonl(output_jsonl, row)
@@ -234,6 +252,10 @@ def main() -> None:
                     log(f"[done] model={model_key} seq_len={seq_len} status={status} error={exc}")
                     if status == "oom" and args.stop_after_oom:
                         stop_model = True
+                        stop_reason = "previous_oom"
+                    elif status in {"error", "unsupported_backend"} and args.stop_after_error:
+                        stop_model = True
+                        stop_reason = status
                     if "cuda" in device:
                         torch.cuda.empty_cache()
     finally:

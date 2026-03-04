@@ -25,6 +25,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--runtime-env",
+        default="unknown",
+        help="Logical environment label recorded in the result files, e.g. 'nm-dev' or 'fla'.",
+    )
     parser.add_argument("--base-config", type=Path, default=DEFAULT_LACT_CONFIG)
     parser.add_argument("--sliding-window", type=int, default=None)
     parser.add_argument("--lact-chunk-size", type=int, default=None)
@@ -60,7 +65,7 @@ def main() -> None:
 
     log(
         "Starting whole-model throughput benchmark "
-        f"device={device} dtype={args.dtype} "
+        f"device={device} dtype={args.dtype} runtime_env={args.runtime_env} "
         f"models={args.models} seq_lens={args.seq_lens}"
     )
     if args.use_fused_lact_kernel:
@@ -77,6 +82,7 @@ def main() -> None:
                     row = BenchmarkRow(
                         benchmark="whole_model_train",
                         model=model_key,
+                        runtime_env=args.runtime_env,
                         seq_len=seq_len,
                         batch_size=args.batch_size,
                         warmup_steps=args.warmup_steps,
@@ -169,6 +175,7 @@ def main() -> None:
                     row = BenchmarkRow(
                         benchmark="whole_model_train",
                         model=model_key,
+                        runtime_env=args.runtime_env,
                         seq_len=seq_len,
                         batch_size=args.batch_size,
                         warmup_steps=args.warmup_steps,
@@ -205,6 +212,7 @@ def main() -> None:
                     row = BenchmarkRow(
                         benchmark="whole_model_train",
                         model=model_key,
+                        runtime_env=args.runtime_env,
                         seq_len=seq_len,
                         batch_size=args.batch_size,
                         warmup_steps=args.warmup_steps,
