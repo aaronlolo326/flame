@@ -374,6 +374,16 @@ class JobConfig:
             help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
         )
         self.parser.add_argument(
+            "--training.pin_memory",
+            action="store_true",
+            help="pin_memory",
+        )
+        self.parser.add_argument(
+            "--training.persistent_workers",
+            action="store_true",
+            help="persistent_workers",
+        )
+        self.parser.add_argument(
             "--training.prefetch_factor",
             type=int,
             default=2,

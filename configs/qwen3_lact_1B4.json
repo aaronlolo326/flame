@@ -31,6 +31,8 @@
 
     "fuse_cross_entropy": true,
     "fuse_norm": true,
+    "use_fused_kernel": true,
+    "last_layer_fuse_norm": false,
     "num_lact_heads": 4,
     "inter_multi": 1,
     "qkv_bias": false,
