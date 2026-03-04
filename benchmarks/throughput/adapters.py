@@ -274,16 +274,30 @@ def build_whole_model(
     base_config_path: Path = DEFAULT_LACT_CONFIG,
     sliding_window: int | None = None,
     lact_chunk_size: int | None = None,
+    num_attn_heads_override: int | None = None,
+    num_lact_heads_override: int | None = None,
     use_fused_kernel: bool | None = None,
     paper_lm_defaults: bool = True,
 ) -> tuple[Any, dict[str, Any]]:
     import torch
 
     base_cfg = load_json(base_config_path)
+    base_cfg_for_model = dict(base_cfg)
+    if num_attn_heads_override is not None:
+        base_cfg_for_model["num_attn_heads"] = int(num_attn_heads_override)
+        base_cfg_for_model["num_heads"] = int(num_attn_heads_override)
+        # Keep KV heads valid and not larger than attention heads when overriding.
+        base_cfg_for_model["num_key_value_heads"] = min(
+            int(base_cfg_for_model.get("num_key_value_heads", num_attn_heads_override)),
+            int(num_attn_heads_override),
+        )
+    if num_lact_heads_override is not None:
+        base_cfg_for_model["num_lact_heads"] = int(num_lact_heads_override)
+
     dtype = resolve_dtype(torch, dtype_name)
     chunk_size, window_size = resolve_chunk_and_window(
         seq_len=seq_len,
-        base_cfg=base_cfg,
+        base_cfg=base_cfg_for_model,
         lact_chunk_size=lact_chunk_size,
         window_size=sliding_window,
         paper_lm_defaults=paper_lm_defaults,
@@ -291,11 +305,21 @@ def build_whole_model(
 
     if model_key == "lact":
         config_cls, model_cls, _ = import_lact_modules()
-        config_kwargs = dict(base_cfg)
+        config_kwargs = dict(base_cfg_for_model)
         config_kwargs["max_position_embeddings"] = max(seq_len, config_kwargs.get("max_position_embeddings", seq_len))
         config_kwargs["use_cache"] = False
         config_kwargs["lact_chunk_size"] = chunk_size
         config_kwargs["window_size"] = window_size
+        if config_kwargs["hidden_size"] % int(config_kwargs["num_attn_heads"]) != 0:
+            raise ValueError(
+                f"Invalid num_attn_heads={config_kwargs['num_attn_heads']} for hidden_size={config_kwargs['hidden_size']}. "
+                "hidden_size must be divisible by num_attn_heads."
+            )
+        if config_kwargs["hidden_size"] % int(config_kwargs["num_lact_heads"]) != 0:
+            raise ValueError(
+                f"Invalid num_lact_heads={config_kwargs['num_lact_heads']} for hidden_size={config_kwargs['hidden_size']}. "
+                "hidden_size must be divisible by num_lact_heads."
+            )
         if use_fused_kernel is not None:
             config_kwargs["use_fused_kernel"] = use_fused_kernel
         config = config_cls(**config_kwargs)
@@ -304,13 +328,13 @@ def build_whole_model(
         spec = MODEL_SPECS[model_key]
         config_cls, model_cls, _, _ = load_qwen3_variant(spec.kind)
         if model_key == "full_attention":
-            layer_types = ["full_attention"] * base_cfg["num_hidden_layers"]
+            layer_types = ["full_attention"] * base_cfg_for_model["num_hidden_layers"]
             window = None
         elif model_key == "hybrid_swa":
-            layer_types = build_layer_types(base_cfg["num_hidden_layers"], "sliding_attention")
+            layer_types = build_layer_types(base_cfg_for_model["num_hidden_layers"], "sliding_attention")
             window = window_size
         else:
-            layer_types = build_layer_types(base_cfg["num_hidden_layers"], "linear_attention")
+            layer_types = build_layer_types(base_cfg_for_model["num_hidden_layers"], "linear_attention")
             window = None
 
         gdn_overrides = None
@@ -327,7 +351,7 @@ def build_whole_model(
                 "use_qk_norm": True,
             }
         config_kwargs = lact_config_to_qwen3_dict(
-            base_cfg,
+            base_cfg_for_model,
             seq_len=seq_len,
             layer_types=layer_types,
             sliding_window=window,
@@ -342,7 +366,7 @@ def build_whole_model(
 
     model.to(device=device, dtype=dtype)
     model.train()
-    return model, base_cfg
+    return model, base_cfg_for_model
 
 
 def build_kernel_module(
@@ -355,6 +379,8 @@ def build_kernel_module(
     base_config_path: Path = DEFAULT_LACT_CONFIG,
     sliding_window: int | None = None,
     lact_chunk_size: int | None = None,
+    lact_attn_heads_override: int | None = None,
+    lact_ttt_heads_override: int | None = None,
     use_fused_kernel: bool | None = None,
     paper_lm_defaults: bool = True,
 ) -> tuple[Any, int]:
@@ -392,6 +418,20 @@ def build_kernel_module(
         config_kwargs["max_position_embeddings"] = max(seq_len, config_kwargs.get("max_position_embeddings", seq_len))
         config_kwargs["lact_chunk_size"] = chunk_size
         config_kwargs["window_size"] = window_size
+        if lact_attn_heads_override is not None:
+            config_kwargs["num_attn_heads"] = int(lact_attn_heads_override)
+        if lact_ttt_heads_override is not None:
+            config_kwargs["num_lact_heads"] = int(lact_ttt_heads_override)
+        if hidden_size % int(config_kwargs["num_attn_heads"]) != 0:
+            raise ValueError(
+                f"Invalid num_attn_heads={config_kwargs['num_attn_heads']} for hidden_size={hidden_size}. "
+                "hidden_size must be divisible by num_attn_heads."
+            )
+        if hidden_size % int(config_kwargs["num_lact_heads"]) != 0:
+            raise ValueError(
+                f"Invalid num_lact_heads={config_kwargs['num_lact_heads']} for hidden_size={hidden_size}. "
+                "hidden_size must be divisible by num_lact_heads."
+            )
         if use_fused_kernel is not None:
             config_kwargs["use_fused_kernel"] = use_fused_kernel
         config = config_cls(**config_kwargs)
@@ -643,6 +683,8 @@ def build_kernel_subject(
     base_config_path: Path = DEFAULT_LACT_CONFIG,
     sliding_window: int | None = None,
     lact_chunk_size: int | None = None,
+    lact_attn_heads_override: int | None = None,
+    lact_ttt_heads_override: int | None = None,
     use_fused_kernel: bool | None = None,
     paper_lm_defaults: bool = True,
 ) -> tuple[Callable[[Any], Any], int]:
@@ -657,6 +699,8 @@ def build_kernel_subject(
         base_config_path=base_config_path,
         sliding_window=sliding_window,
         lact_chunk_size=lact_chunk_size,
+        lact_attn_heads_override=lact_attn_heads_override,
+        lact_ttt_heads_override=lact_ttt_heads_override,
         use_fused_kernel=use_fused_kernel,
         paper_lm_defaults=paper_lm_defaults,
     )

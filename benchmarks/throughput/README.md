@@ -55,6 +55,8 @@ python -m benchmarks.throughput.whole_model \
   --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
   --lact-chunk-size 2048 \
   --sliding-window 2048 \
+  --num-attn-heads 8 \
+  --num-lact-heads 8 \
   --batch-size 1 \
   --steps 10 \
   --warmup-steps 3 \
@@ -71,6 +73,8 @@ python -m benchmarks.throughput.single_kernel \
   --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
   --lact-chunk-size 2048 \
   --sliding-window 2048 \
+  --lact-attn-heads 8 \
+  --lact-ttt-heads 8 \
   --batch-size 1 \
   --steps 20 \
   --warmup-steps 5 \
@@ -184,6 +188,11 @@ Outputs are written as both `.csv` and `.jsonl` under `benchmarks/throughput/res
 - `peak_memory_gb`: `torch.cuda.max_memory_allocated()`
 - `runtime_env`: logical environment label like `nm-dev` or `fla`
 - `status`: `ok`, `oom`, `error`, `unsupported_backend`, or `skipped_after_failure`
+
+Head-setting note:
+
+- The benchmark now defaults to an `8` attention-head / `8` TTT-head LaCT setup for fairer comparison against other single-branch baselines.
+- You can override these with `--lact-attn-heads`, `--lact-ttt-heads` (single-kernel) and `--num-attn-heads`, `--num-lact-heads` (whole-model).
 
 If you want to mirror the language-model paper setting more closely, start with:
 

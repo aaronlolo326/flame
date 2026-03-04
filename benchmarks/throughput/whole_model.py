@@ -34,6 +34,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sliding-window", type=int, default=None)
     parser.add_argument("--lact-chunk-size", type=int, default=None)
     parser.add_argument(
+        "--num-attn-heads",
+        type=int,
+        default=8,
+        help=(
+            "Override attention head count for all whole-model baselines to keep head geometry aligned. "
+            "Default is 8 for fairer comparison with 8/8 LaCT split."
+        ),
+    )
+    parser.add_argument(
+        "--num-lact-heads",
+        type=int,
+        default=8,
+        help="Override LaCT TTT head count (num_lact_heads) for the lact model.",
+    )
+    parser.add_argument(
         "--paper-lm-defaults",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -66,6 +81,7 @@ def main() -> None:
     log(
         "Starting whole-model throughput benchmark "
         f"device={device} dtype={args.dtype} runtime_env={args.runtime_env} "
+        f"num_attn_heads={args.num_attn_heads} num_lact_heads={args.num_lact_heads} "
         f"models={args.models} seq_lens={args.seq_lens}"
     )
     if args.use_fused_lact_kernel:
@@ -115,6 +131,8 @@ def main() -> None:
                         base_config_path=args.base_config,
                         sliding_window=args.sliding_window,
                         lact_chunk_size=args.lact_chunk_size,
+                        num_attn_heads_override=args.num_attn_heads,
+                        num_lact_heads_override=args.num_lact_heads,
                         use_fused_kernel=args.use_fused_lact_kernel,
                         paper_lm_defaults=args.paper_lm_defaults,
                     )
@@ -190,6 +208,8 @@ def main() -> None:
                         status="ok",
                         notes=(
                             f"local_batch_size={args.batch_size}; "
+                            f"num_attn_heads={args.num_attn_heads}; "
+                            f"num_lact_heads={args.num_lact_heads}; "
                             f"lact_chunk_size={args.lact_chunk_size or 'config'}; "
                             f"sliding_window={args.sliding_window or 'config'}; "
                             f"paper_lm_defaults={args.paper_lm_defaults}"

@@ -42,6 +42,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sliding-window", type=int, default=None)
     parser.add_argument("--lact-chunk-size", type=int, default=None)
     parser.add_argument(
+        "--lact-attn-heads",
+        type=int,
+        default=8,
+        help="Override LaCT attention heads for lact_* single-kernel subjects.",
+    )
+    parser.add_argument(
+        "--lact-ttt-heads",
+        type=int,
+        default=8,
+        help="Override LaCT TTT heads (num_lact_heads) for lact_* single-kernel subjects.",
+    )
+    parser.add_argument(
         "--paper-lm-defaults",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -131,6 +143,8 @@ def main() -> None:
                         base_config_path=args.base_config,
                         sliding_window=args.sliding_window,
                         lact_chunk_size=args.lact_chunk_size,
+                        lact_attn_heads_override=args.lact_attn_heads,
+                        lact_ttt_heads_override=args.lact_ttt_heads,
                         use_fused_kernel=args.use_fused_lact_kernel,
                         paper_lm_defaults=args.paper_lm_defaults,
                     )
@@ -208,6 +222,8 @@ def main() -> None:
                         notes=(
                             f"{KERNEL_MODEL_LABELS[canonical_kernel_key(model_key)]}; "
                             f"lact_chunk_size={args.lact_chunk_size or 'config'}; "
+                            f"lact_attn_heads={args.lact_attn_heads or 'config'}; "
+                            f"lact_ttt_heads={args.lact_ttt_heads or 'config'}; "
                             f"sliding_window={args.sliding_window or 'config'}; "
                             f"paper_lm_defaults={args.paper_lm_defaults}"
                         ),

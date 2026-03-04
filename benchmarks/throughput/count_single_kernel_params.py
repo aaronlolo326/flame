@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-config", type=Path, default=DEFAULT_LACT_CONFIG)
     parser.add_argument("--lact-chunk-size", type=int, default=None)
     parser.add_argument("--sliding-window", type=int, default=None)
+    parser.add_argument("--lact-attn-heads", type=int, default=8)
+    parser.add_argument("--lact-ttt-heads", type=int, default=8)
     parser.add_argument("--use-fused-lact-kernel", action="store_true")
     parser.add_argument(
         "--paper-lm-defaults",
@@ -60,7 +62,8 @@ def main() -> None:
 
     print(
         f"Single-layer parameter counts for seq_len={args.seq_len}, dtype={args.dtype}, "
-        f"chunk={args.lact_chunk_size or 'config'}, window={args.sliding_window or 'config'}"
+        f"chunk={args.lact_chunk_size or 'config'}, window={args.sliding_window or 'config'}, "
+        f"lact_attn_heads={args.lact_attn_heads}, lact_ttt_heads={args.lact_ttt_heads}"
     )
     for name in args.models:
         module, _ = build_kernel_module(
@@ -72,6 +75,8 @@ def main() -> None:
             base_config_path=args.base_config,
             lact_chunk_size=args.lact_chunk_size,
             sliding_window=args.sliding_window,
+            lact_attn_heads_override=args.lact_attn_heads,
+            lact_ttt_heads_override=args.lact_ttt_heads,
             use_fused_kernel=args.use_fused_lact_kernel,
             paper_lm_defaults=args.paper_lm_defaults,
         )
