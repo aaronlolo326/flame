@@ -19,7 +19,8 @@ from transformers import PreTrainedTokenizer
 
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
-
+import os
+import glob
 
 class BufferShuffledIterableDataset(IterableDataset):
     def __init__(
@@ -586,6 +587,11 @@ def build_dataset(
 
         if tokenized_dataset_dir is not None:
             dataset = load_from_disk(path)
+            # dataset = Dataset.from_file("/work/mingze/data/data-00000-of-02786.arrow")
+                
+            # # 截取并打印
+            # dataset = dataset.select(range(min(1000, len(dataset))))
+            # print(f"First sample: {dataset[0]}")
             logger.info(f"Shuffling the dataset with seed {seed}")
             if seed is not None:
                 dataset = dataset.shuffle(seed=seed)

@@ -223,6 +223,25 @@ def main(job_config: JobConfig):
     logger.info(
         f"Building model from the config\n{color.green}{model_config}{color.reset}"
     )
+
+    # E2E-TTT performs inner-loop autograd.grad inside forward, then uses outer loss.backward.
+    # With torch.compile + donated buffers, AOT backward requires retain_graph=False/create_graph=False
+    # across all backward calls, which conflicts with this pattern. Disable donated buffers for stability.
+    if job_config.training.compile and bool(getattr(model_config, "use_e2e_ttt", False)):
+        try:
+            job_config.training.compile = False
+            if getattr(torch._functorch.config, "donated_buffer", False):
+                torch._functorch.config.donated_buffer = False
+
+                logger.info(
+                    "Disabled torch._functorch.config.donated_buffer for E2E-TTT inner-loop autograd compatibility."
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to set torch._functorch.config.donated_buffer=False ({e}). "
+                "If you hit donated buffer backward errors, disable it manually."
+            )
+
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(model_config)
         if (
