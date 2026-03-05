@@ -3,6 +3,7 @@
 This folder is a draft benchmark framework for comparing LaCT against three user-requested baselines on a single GPU.
 
 - `lact`: LaCT layer + sliding-window flash attention from `flame/custom_models/lact_model`
+- `hybrid_lact`: 75% LaCT blocks + 25% full-attention blocks (benchmark-only mixed stack)
 - `full_attention`: full-attention Qwen3 with `flash_attention_2`
 - `hybrid_swa`: 75% sliding-window attention + 25% full attention
 - `hybrid_gdn`: 75% GatedDeltaNet + 25% full attention
@@ -51,7 +52,7 @@ From `/work/yufei/projects/flame`:
 
 ```bash
 python -m benchmarks.throughput.whole_model \
-  --models lact full_attention hybrid_swa hybrid_gdn \
+  --models lact hybrid_lact full_attention hybrid_swa hybrid_gdn \
   --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
   --lact-chunk-size 2048 \
   --sliding-window 2048 \
@@ -176,6 +177,36 @@ Interpretation:
 - `gdn_branch_only`: the GatedDeltaNet token-mixing layer
 
 Outputs are written as both `.csv` and `.jsonl` under `benchmarks/throughput/results/`.
+
+To generate figures from merged single-kernel results:
+
+```bash
+python -m benchmarks.throughput.plot_single_kernel_results \
+  --input benchmarks/throughput/results/single-kernel-merged.csv \
+  --output-dir benchmarks/throughput/results/figures \
+  --title-suffix "(Merged)"
+```
+
+To generate figures from merged whole-model results:
+
+```bash
+python -m benchmarks.throughput.plot_whole_model_results \
+  --input benchmarks/throughput/results/whole-model-merged.csv \
+  --output-dir benchmarks/throughput/results/figures \
+  --title-suffix "(Merged)"
+```
+
+To export resolved JSON config snapshots for all whole-model benchmark variants:
+
+```bash
+python -m benchmarks.throughput.export_whole_model_configs \
+  --seq-len 32768 \
+  --lact-chunk-size 2048 \
+  --sliding-window 2048 \
+  --num-attn-heads 8 \
+  --num-lact-heads 8 \
+  --output-dir benchmarks/throughput/results/configs
+```
 
 ## What The Metrics Mean
 

@@ -27,6 +27,7 @@ class ModelSpec:
 
 MODEL_SPECS = {
     "lact": ModelSpec("lact", "LaCT", "lact"),
+    "hybrid_lact": ModelSpec("hybrid_lact", "75% LaCT + 25% FA", "hybrid_lact"),
     "full_attention": ModelSpec("full_attention", "Full Attention (FlashAttention)", "qwen3_swa"),
     "hybrid_swa": ModelSpec("hybrid_swa", "75% SWA + 25% FA", "qwen3_swa"),
     "hybrid_gdn": ModelSpec("hybrid_gdn", "75% GatedDeltaNet + 25% FA", "qwen3_gdn"),
@@ -199,6 +200,42 @@ def ensure_transformers_cache_compat() -> None:
         cache_utils.SlidingWindowCache = cache_utils.DynamicCache
 
 
+def ensure_transformers_rope_compat() -> None:
+    try:
+        import transformers.modeling_rope_utils as rope_utils
+    except ImportError:
+        return
+
+    if "default" in getattr(rope_utils, "ROPE_INIT_FUNCTIONS", {}):
+        return
+
+    def _legacy_default_rope_parameters(
+        config=None,
+        device=None,
+        seq_len=None,
+        layer_type=None,
+    ):
+        import torch
+
+        if config is None:
+            raise ValueError("config is required for legacy default rope initialization")
+        base = getattr(config, "rope_theta", 10_000.0)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = int(head_dim * partial_rotary_factor)
+        attention_factor = 1.0
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.int64, device=device).float()
+                / dim
+            )
+        )
+        return inv_freq, attention_factor
+
+    rope_utils.ROPE_INIT_FUNCTIONS["default"] = _legacy_default_rope_parameters
+
+
 def load_qwen3_variant(variant: str) -> tuple[type, type, type, type | None]:
     import torch
 
@@ -214,6 +251,7 @@ def load_qwen3_variant(variant: str) -> tuple[type, type, type, type | None]:
         if variant == "qwen3_gdn":
             ensure_transformers_utils_compat()
             ensure_transformers_cache_compat()
+            ensure_transformers_rope_compat()
             original_compile = torch.compile
             try:
                 torch.compile = lambda fn=None, *args, **kwargs: (lambda inner: inner) if fn is None else fn
@@ -280,6 +318,9 @@ def build_whole_model(
     paper_lm_defaults: bool = True,
 ) -> tuple[Any, dict[str, Any]]:
     import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from types import SimpleNamespace
 
     base_cfg = load_json(base_config_path)
     base_cfg_for_model = dict(base_cfg)
@@ -324,6 +365,112 @@ def build_whole_model(
             config_kwargs["use_fused_kernel"] = use_fused_kernel
         config = config_cls(**config_kwargs)
         model = model_cls(config)
+    elif model_key == "hybrid_lact":
+        # Benchmark-only mixed stack:
+        # first 25% layers = full-attention Qwen3 decoder layers
+        # remaining 75% layers = LaCT blocks
+        config_cls_lact, _, _ = import_lact_modules()
+        with prepend_sys_path(FLAME_ROOT):
+            from custom_models.lact_model.modeling_lact import LaCTBlock
+
+        qwen_config_cls, qwen_model_cls, qwen_backbone_cls, _ = load_qwen3_variant("qwen3_swa")
+
+        lact_config_kwargs = dict(base_cfg_for_model)
+        lact_config_kwargs["max_position_embeddings"] = max(
+            seq_len, lact_config_kwargs.get("max_position_embeddings", seq_len)
+        )
+        lact_config_kwargs["use_cache"] = False
+        lact_config_kwargs["lact_chunk_size"] = chunk_size
+        lact_config_kwargs["window_size"] = window_size
+        if lact_config_kwargs["hidden_size"] % int(lact_config_kwargs["num_attn_heads"]) != 0:
+            raise ValueError(
+                f"Invalid num_attn_heads={lact_config_kwargs['num_attn_heads']} for hidden_size={lact_config_kwargs['hidden_size']}. "
+                "hidden_size must be divisible by num_attn_heads."
+            )
+        if lact_config_kwargs["hidden_size"] % int(lact_config_kwargs["num_lact_heads"]) != 0:
+            raise ValueError(
+                f"Invalid num_lact_heads={lact_config_kwargs['num_lact_heads']} for hidden_size={lact_config_kwargs['hidden_size']}. "
+                "hidden_size must be divisible by num_lact_heads."
+            )
+        lact_config = config_cls_lact(**lact_config_kwargs)
+
+        num_layers = int(base_cfg_for_model["num_hidden_layers"])
+        num_lact_layers = ceil_ratio_count(num_layers, 0.75)
+        num_fa_layers = max(0, num_layers - num_lact_layers)
+        qwen_layer_types = ["full_attention"] * num_layers
+        qwen_cfg_kwargs = lact_config_to_qwen3_dict(
+            base_cfg_for_model,
+            seq_len=seq_len,
+            layer_types=qwen_layer_types,
+            sliding_window=None,
+            attn_implementation="flash_attention_2",
+        )
+        qwen_cfg = qwen_config_cls(**qwen_cfg_kwargs)
+        qwen_cfg.use_cache = False
+        qwen_backbone = qwen_backbone_cls(qwen_cfg)
+
+        class HybridLaCTForCausalLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = lact_config
+                self.num_fa_layers = num_fa_layers
+                self.num_lact_layers = num_lact_layers
+                self.embed_tokens = nn.Embedding(
+                    lact_config.vocab_size, lact_config.hidden_size, lact_config.pad_token_id
+                )
+                self.fa_layers = nn.ModuleList(
+                    [qwen_backbone.layers[i] for i in range(self.num_fa_layers)]
+                )
+                self.lact_layers = nn.ModuleList(
+                    [LaCTBlock(lact_config, layer_idx=self.num_fa_layers + i) for i in range(self.num_lact_layers)]
+                )
+                self.rotary_emb = qwen_backbone.rotary_emb
+                self.norm = qwen_backbone.norm
+                self.lm_head = nn.Linear(lact_config.hidden_size, lact_config.vocab_size, bias=False)
+
+            def forward(self, input_ids: Any, labels: Any = None, use_cache: bool = False):
+                del use_cache
+                hidden_states = self.embed_tokens(input_ids)
+                batch_size, seq_len_local, _ = hidden_states.shape
+                device_local = hidden_states.device
+                position_ids = torch.arange(seq_len_local, device=device_local).unsqueeze(0).expand(batch_size, -1)
+                position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+                for layer in self.fa_layers:
+                    hidden_states = layer(
+                        hidden_states=hidden_states,
+                        attention_mask=None,
+                        position_ids=position_ids,
+                        past_key_value=None,
+                        output_attentions=False,
+                        use_cache=False,
+                        cache_position=None,
+                        position_embeddings=position_embeddings,
+                    )[0]
+
+                for layer in self.lact_layers:
+                    hidden_states = layer(
+                        hidden_states=hidden_states,
+                        attention_mask=None,
+                        past_key_values=None,
+                        output_attentions=False,
+                        use_cache=False,
+                    )[0]
+
+                hidden_states = self.norm(hidden_states)
+                logits = self.lm_head(hidden_states)
+                loss = None
+                if labels is not None:
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_labels = labels[:, 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+                return SimpleNamespace(loss=loss, logits=logits)
+
+        model = HybridLaCTForCausalLM()
     elif model_key in {"full_attention", "hybrid_swa", "hybrid_gdn"}:
         spec = MODEL_SPECS[model_key]
         config_cls, model_cls, _, _ = load_qwen3_variant(spec.kind)

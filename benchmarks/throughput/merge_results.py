@@ -19,6 +19,15 @@ def parse_args() -> argparse.Namespace:
         default=["benchmark", "model", "seq_len", "runtime_env"],
         help="Row keys used for sorting the merged output.",
     )
+    parser.add_argument(
+        "--dedupe-by",
+        nargs="+",
+        default=[],
+        help=(
+            "Optional row keys for deduplication. If provided, rows with the same key tuple are de-duplicated "
+            "and later input files override earlier ones."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -69,8 +78,16 @@ def sort_value(row: dict[str, Any], key: str) -> tuple[int, Any]:
 def main() -> None:
     args = parse_args()
     all_rows: list[dict[str, Any]] = []
-    for input_path in args.inputs:
-        all_rows.extend(normalize_rows(read_rows(input_path)))
+    if args.dedupe_by:
+        deduped: dict[tuple[str, ...], dict[str, Any]] = {}
+        for input_path in args.inputs:
+            for row in normalize_rows(read_rows(input_path)):
+                key = tuple(str(row.get(k, "")) for k in args.dedupe_by)
+                deduped[key] = row
+        all_rows = list(deduped.values())
+    else:
+        for input_path in args.inputs:
+            all_rows.extend(normalize_rows(read_rows(input_path)))
 
     if not all_rows:
         raise RuntimeError("No rows found in the provided input files.")
@@ -99,7 +116,14 @@ def main() -> None:
         for row in all_rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
-    print(f"Merged {len(all_rows)} rows into {output_csv} and {output_jsonl}", flush=True)
+    if args.dedupe_by:
+        print(
+            f"Merged {len(all_rows)} deduplicated rows into {output_csv} and {output_jsonl} "
+            f"(dedupe_by={args.dedupe_by}, later inputs override earlier ones)",
+            flush=True,
+        )
+    else:
+        print(f"Merged {len(all_rows)} rows into {output_csv} and {output_jsonl}", flush=True)
 
 
 if __name__ == "__main__":
