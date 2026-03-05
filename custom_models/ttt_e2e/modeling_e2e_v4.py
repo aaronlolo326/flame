@@ -21,125 +21,12 @@ from .layer_e2e_swiglu import E2ESWIGLULayer
 from torch.nn import RMSNorm
 
 logger = logging.get_logger(__name__)
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributed.tensor import DTensor, Replicate
-from typing import List, Dict, Optional, Tuple
 
 def _silu(x):
     return F.silu(x)
 
-def _to_local_if_dtensor(x: torch.Tensor) -> torch.Tensor:
-    """
-    将 DTensor 收口为本地 Tensor，避免泄漏到普通 nn.Module 路径中。
-    """
-    if isinstance(x, DTensor):
-        x = _safe_sync_dtensor(x)
-        x = x.to_local()
-    return x
 
-def _to_replicated_local_if_dtensor(x: torch.Tensor) -> torch.Tensor:
-    """
-    将 DTensor 转成本地完整 Tensor：
-    - 先规约 Partial
-    - 再将所有 mesh 维度变为 Replicate
-    - 最后 to_local
-    用于 fast-weight 内环，避免 autograd.grad 路径混入 DTensor/local 混算。
-    """
-    if isinstance(x, DTensor):
-        x = _safe_sync_dtensor(x)
-        if any(not p.is_replicate() for p in x.placements):
-            x = x.redistribute(placements=[Replicate() for _ in x.placements])
-        x = x.to_local()
-    return x
-
-def _safe_linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """
-    安全的 Linear 包装器。自动处理本地 Tensor 和 DTensor 混合的情况。
-    """
-    if isinstance(weight, DTensor) and not isinstance(x, DTensor):
-        x = DTensor.from_local(
-            x, 
-            device_mesh=weight.device_mesh, 
-            placements=[Replicate() for _ in range(weight.device_mesh.ndim)]
-        )
-    elif isinstance(x, DTensor) and not isinstance(weight, DTensor):
-        weight = DTensor.from_local(
-            weight, 
-            device_mesh=x.device_mesh, 
-            placements=[Replicate() for _ in range(x.device_mesh.ndim)]
-        )
-    return F.linear(x, weight, bias)
-
-def _safe_sync_dtensor(x: torch.Tensor) -> torch.Tensor:
-    """
-    安全同步器：如果张量是 DTensor 且处于 Partial (部分和) 状态，则执行规约 (All-Reduce)
-    保证输出能够安全地参与 RMSNorm 和残差相加。
-    """
-    if isinstance(x, DTensor) and any(p.is_partial() for p in x.placements):
-        # 将 Partial 状态同步为各个卡都持有一份完整的拷贝
-        x = x.redistribute(placements=[Replicate() for _ in x.placements])
-    return x
-
-def _safe_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """
-    安全的残差相加包装器。
-    策略：尽量保持 DTensor，仅在需要时把本地 Tensor 抬升到 DTensor。
-    """
-    if isinstance(a, DTensor):
-        a = _safe_sync_dtensor(a)
-    if isinstance(b, DTensor):
-        b = _safe_sync_dtensor(b)
-
-    if isinstance(a, DTensor) and not isinstance(b, DTensor):
-        b = DTensor.from_local(
-            b,
-            device_mesh=a.device_mesh,
-            placements=[Replicate() for _ in range(a.device_mesh.ndim)],
-        )
-    elif isinstance(b, DTensor) and not isinstance(a, DTensor):
-        a = DTensor.from_local(
-            a,
-            device_mesh=b.device_mesh,
-            placements=[Replicate() for _ in range(b.device_mesh.ndim)],
-        )
-    return a + b
-
-def _safe_rmsnorm(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """
-    在 norm 边界尽量保持 DTensor。只有 fast-weight 内环显式调用时才回收到本地。
-    """
-    weight = norm_layer.weight
-    if isinstance(x, DTensor):
-        x = _safe_sync_dtensor(x)
-    if isinstance(weight, DTensor):
-        weight = _safe_sync_dtensor(weight)
-
-    if isinstance(weight, DTensor) and not isinstance(x, DTensor):
-        x = DTensor.from_local(
-            x,
-            device_mesh=weight.device_mesh,
-            placements=[Replicate() for _ in range(weight.device_mesh.ndim)],
-        )
-    elif isinstance(x, DTensor) and not isinstance(weight, DTensor):
-        weight = DTensor.from_local(
-            weight,
-            device_mesh=x.device_mesh,
-            placements=[Replicate() for _ in range(x.device_mesh.ndim)],
-        )
-
-    return F.rms_norm(x, norm_layer.normalized_shape, weight, norm_layer.eps)
-
-
-def _safe_lm_head_forward(lm_head: nn.Linear, hidden_states: torch.Tensor) -> torch.Tensor:
-    """
-    统一处理 lm_head 的 Tensor/DTensor 混用边界，并尽量保持 DTensor。
-    """
-    return _safe_linear(hidden_states, lm_head.weight, lm_head.bias)
-
-
-# === 2. 核心网络组件 ===
+# === 2. Core Network Components ===
 
 @dataclass
 class E2ETTTOutput:
@@ -168,20 +55,19 @@ class PrimeSwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor, fast: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
         if fast is None:
-            # 同样使用 safe wrappers 保护 baseline forward
-            h1 = _safe_linear(x, self.w0.weight)
-            h2 = _safe_linear(x, self.w2.weight)
-            out = _safe_linear(_silu(h1) * h2, self.w1.weight)
+            h1 = F.linear(x, self.w0.weight)
+            h2 = F.linear(x, self.w2.weight)
+            out = F.linear(_silu(h1) * h2, self.w1.weight)
             return self.dropout(out)
 
         w0 = fast.get(f"{self.name_prefix}.w0.weight", self.w0.weight)
         w1 = fast.get(f"{self.name_prefix}.w1.weight", self.w1.weight)
         w2 = fast.get(f"{self.name_prefix}.w2.weight", self.w2.weight)
         
-        h1 = _safe_linear(x, w0)
-        h2 = _safe_linear(x, w2)
+        h1 = F.linear(x, w0)
+        h2 = F.linear(x, w2)
         act = _silu(h1) * h2
-        out = _safe_linear(act, w1)
+        out = F.linear(act, w1)
 
         return self.dropout(out)
 
@@ -201,7 +87,7 @@ class E2ETTTBlock(nn.Module):
             mlp_hidden_act = "swish"
 
         self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # 假设 TransformerMLP 内部安全
+        # Assume TransformerMLP internals are safe.
         self.mlp = TransformerMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
@@ -235,7 +121,7 @@ class E2ETTTBlock(nn.Module):
         # Align block flow with a standard prenorm transformer:
         # attn_norm -> attn -> residual -> mlp_norm -> mlp -> residual
         residual = x
-        x_norm = _safe_rmsnorm(self.attn_norm, x)
+        x_norm = self.attn_norm(x)
         a, next_kv = self.attn(
             x_norm,
             position_ids=position_ids,
@@ -244,19 +130,22 @@ class E2ETTTBlock(nn.Module):
             use_e2e_ttt_context=use_e2e_ttt_context,
             attn_backend_override=attn_backend_override,
         )
-        x = _safe_add(residual, a)
+        x = residual + a
         residual = x
 
         if self.prime_mlp is not None:
-            p_in = _safe_rmsnorm(self.prime_mlp_norm, x) if self.prime_mlp_norm is not None else x
+            p_in = (
+                self.prime_mlp_norm(x)
+                if self.prime_mlp_norm is not None
+                else x
+            )
             p = self.prime_mlp(p_in, fast=fast)
-            x = _safe_add(x, p)
+            x = x + p
             residual = x
 
-        m_in = _safe_rmsnorm(self.mlp_norm, x)
+        m_in = self.mlp_norm(x)
         m = self.mlp(m_in)
-        m = _safe_sync_dtensor(m)
-        x = _safe_add(residual, m)
+        x = residual + m
 
         return x, next_kv
 
@@ -266,19 +155,6 @@ class E2ETTTPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["E2ETTTBlock"]
-
-    def _init_weights(self, module: nn.Module):
-        if isinstance(module, (nn.Linear, nn.Conv1d)):
-            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                with torch.no_grad():
-                    module.weight[module.padding_idx].zero_()
-        elif isinstance(module, RMSNorm):
-            nn.init.ones_(module.weight)
 
 
 class E2ETTTModel(E2ETTTPreTrainedModel):
@@ -331,7 +207,7 @@ class E2ETTTModel(E2ETTTPreTrainedModel):
         for name, p in self.named_parameters():
             canonical_name = self._canonical_param_name(name)
             if canonical_name in prime_names and canonical_name not in fast:
-                fast[canonical_name] = _to_replicated_local_if_dtensor(p)
+                fast[canonical_name] = p
         return fast
 
 
@@ -426,7 +302,7 @@ class E2ETTTModel(E2ETTTPreTrainedModel):
         use_e2e_ttt_context: bool = True,
     ) -> Tuple[torch.Tensor, Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
         if self.suffix_start >= len(self.layers):
-            return _safe_rmsnorm(self.norm, x), tuple()
+            return  self.norm(x), tuple()
 
         x, next_kvs = self._forward_layer_range(
             x,
@@ -439,7 +315,7 @@ class E2ETTTModel(E2ETTTPreTrainedModel):
             use_e2e_ttt_context=use_e2e_ttt_context,
             attn_backend_override="sdpa" if use_e2e_ttt_context else None,
         )
-        return _safe_rmsnorm(self.norm, x), next_kvs
+        return  self.norm(x), next_kvs
 
     def forward_blocks(
         self,
@@ -462,7 +338,7 @@ class E2ETTTModel(E2ETTTPreTrainedModel):
             use_e2e_ttt_context=use_e2e_ttt_context,
             attn_backend_override=attn_backend_override,
         )
-        return _safe_rmsnorm(self.norm, x), next_kvs
+        return self.norm(x), next_kvs
 
     def forward(
         self,
@@ -527,7 +403,7 @@ class E2ETTTModel(E2ETTTPreTrainedModel):
                     next_cache = []
                 next_cache.append(kv)
 
-        x = _safe_rmsnorm(self.norm, x)
+        x = self.norm(x)
 
         if output_hidden_states:
             all_hidden_states += (x,)
@@ -665,9 +541,6 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
 
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
-        # Keep DTensor in the main path, but localize at CE boundary for stability.
-        shift_logits = _to_local_if_dtensor(shift_logits)
-        shift_labels = _to_local_if_dtensor(shift_labels)
         return self.loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
@@ -762,7 +635,7 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
             if not use_cache:
                 next_past_key_values = None
 
-            logits_full = _safe_lm_head_forward(self.lm_head, h)
+            logits_full = F.linear(h, self.lm_head.weight, self.lm_head.bias)
             if labels is None and logits_to_keep is not None:
                 logits = logits_full[:, -logits_to_keep:]
             else:
@@ -823,7 +696,7 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
         total_loss_sum = x.new_zeros(())
         total_valid_tokens = x.new_zeros(()) # Initialize as a Tensor instead of int 0
         
-        # 这个初始化的 logits 后面会被我们覆盖，但为了防止 steps == 0 的极端情况，先保留
+        # This initial logits tensor is overwritten later, but keeps a safe fallback when steps == 0.
         logits = x.new_zeros((bsz, 1, self.lm_head.out_features))
 
         steps = math.ceil(seqlen / chunk)
@@ -848,7 +721,7 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
                     "[TTT-DEBUG] prime_keys is empty. Inner-loop updates for prime MLP are skipped."
                 )
                 
-        # 1. 初始化收集列表
+        # 1. Initialize the logits collection list.
         all_logits_list = []
         
         for i in range(steps):
@@ -870,25 +743,19 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
                 use_e2e_ttt_context=True,
             )
 
-            chunk_logits = _safe_lm_head_forward(self.lm_head, h_chunk)
+            chunk_logits = F.linear(h_chunk, self.lm_head.weight, self.lm_head.bias)
             
-            # 2. 将当前 chunk 的 logits 存入列表
             all_logits_list.append(chunk_logits)
 
             valid_mask = y_chunk.ne(-100)
-            valid_count = valid_mask.sum() # 保持为 Tensor
+            valid_count = valid_mask.sum() 
             total_valid_tokens = total_valid_tokens + valid_count
 
-            # 安全地避免除零错误，且不打断计算图
             safe_valid_count = valid_count.clamp(min=1).float()
 
             flat_logits = chunk_logits.reshape(-1, chunk_logits.size(-1))
             flat_labels = y_chunk.reshape(-1)
-            # Keep DTensor in the model path, localize only on CE boundary.
-            flat_logits = _to_local_if_dtensor(flat_logits)
-            flat_labels = _to_local_if_dtensor(flat_labels)
             
-            # 强制 FP32 计算 Loss
             chunk_loss_sum = F.cross_entropy(
                 flat_logits,
                 flat_labels,
@@ -898,10 +765,8 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
 
             total_loss_sum = total_loss_sum + chunk_loss_sum
 
-            # 纯 Tensor 运算，不触发 Graph Break
             loss_i = chunk_loss_sum / safe_valid_count
 
-            # 如果 valid_count 是 0，强制 loss 为 0，避免无效梯度
             loss_i = torch.where(valid_count > 0, loss_i, loss_i.new_zeros(()))
             should_log_chunk = debug_ttt_logs and (i % debug_ttt_log_every == 0 or i == (steps - 1))
             if should_log_chunk:
@@ -919,11 +784,8 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
                 continue
 
             for _ in range(inner_steps):
-                # 内环梯度统一使用 local fast params，避免 backward 中 DTensor/Tensor 混加
-                fast_params = [_to_replicated_local_if_dtensor(fast[k]) for k in prime_keys]
-                for k, p in zip(prime_keys, fast_params):
-                    fast[k] = p
-                loss_for_inner = _to_local_if_dtensor(loss_i)
+                fast_params = [fast[k] for k in prime_keys]
+                loss_for_inner = loss_i
                 grads = torch.autograd.grad(
                     loss_for_inner,
                     fast_params,
@@ -981,15 +843,11 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
                 if bool(getattr(cfg, "detach_fast_weights", False)):
                     suffix_past = self._detach_past(suffix_past)
 
-        # ==========================================================
-        # 3. 循环结束后，处理 logits 的拼接与裁剪
-        # ==========================================================
         if len(all_logits_list) > 0:
             logits_full = torch.cat(all_logits_list, dim=1)
         else:
-            logits_full = logits # 兜底逻辑
+            logits_full = logits
             
-        # 恢复最初始代码里的 logits_to_keep 逻辑，这对推理 (Generation) 很重要
         if labels is None and logits_to_keep is not None and logits_to_keep > 0:
             logits = logits_full[:, -logits_to_keep:]
         else:

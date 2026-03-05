@@ -9,7 +9,7 @@
   "hidden_size": 2048,
   "num_hidden_layers": 28,
   "num_attention_heads": 16,
-  "intermediate_size": 5120,
+  "intermediate_size": 6144,
   "hidden_act": "silu",
   "rms_norm_eps": 1e-06,
   "initializer_range": 0.02,
@@ -17,10 +17,10 @@
   "max_position_embeddings": 40960,
   "rope_theta": 1000000.0,
 
-  "window_size": 1024,
+  "window_size": 2048,
 
-  "use_e2e_ttt": true,
-  "suffix_frac": 0.25,
+  "use_e2e_ttt": false,
+  "suffix_frac": 0,
   "mini_batch_size": 512,
   "inner_lr": 1,
   "ilr_init": 0.1,
