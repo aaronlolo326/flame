@@ -18,7 +18,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 from fla.modules import GatedMLP as TransformerMLP
 from .configuration_ttt_e2e import E2ETTTConfig
 from .layer_e2e_swiglu import E2ESWIGLULayer
-from torch.nn import RMSNorm
+from fla.modules import RMSNorm
 
 logger = logging.get_logger(__name__)
 
@@ -79,14 +79,18 @@ class E2ETTTBlock(nn.Module):
         self.layer_idx = layer_idx
         self.is_suffix = bool(is_suffix)
 
-        self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
+            config.hidden_size, eps=config.norm_eps
+        )
         self.attn = E2ESWIGLULayer(config, layer_idx=layer_idx, is_suffix=is_suffix) 
 
         mlp_hidden_act = str(getattr(config, "hidden_act", "swish")).lower()
         if mlp_hidden_act == "silu":
             mlp_hidden_act = "swish"
 
-        self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
+            config.hidden_size, eps=config.norm_eps
+        )
         # Assume TransformerMLP internals are safe.
         self.mlp = TransformerMLP(
             hidden_size=config.hidden_size,
@@ -96,10 +100,12 @@ class E2ETTTBlock(nn.Module):
             fuse_swiglu=config.fuse_swiglu,
         )
 
-        self.prime_mlp_norm: Optional[RMSNorm] = None
+        self.prime_mlp_norm: Optional[nn.Module] = None
         self.prime_mlp: Optional[PrimeSwiGLU] = None
         if self.is_suffix and bool(getattr(config, "two_mlp_per_block", True)):
-            self.prime_mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.prime_mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
+                config.hidden_size, eps=config.norm_eps
+            )
             self.prime_mlp = PrimeSwiGLU(config, name_prefix=f"layers.{layer_idx}.prime_mlp")
 
     def prime_param_names(self) -> List[str]:
@@ -130,20 +136,22 @@ class E2ETTTBlock(nn.Module):
             use_e2e_ttt_context=use_e2e_ttt_context,
             attn_backend_override=attn_backend_override,
         )
-        x = residual + a
-        residual = x
 
         if self.prime_mlp is not None:
-            p_in = (
-                self.prime_mlp_norm(x)
-                if self.prime_mlp_norm is not None
-                else x
-            )
+            if self.config.fuse_norm:
+                p_in, _ = self.prime_mlp_norm(a, residual, True)
+            else:
+                x = residual + a
+                p_in = self.prime_mlp_norm(x)
             p = self.prime_mlp(p_in, fast=fast)
-            x = x + p
-            residual = x
+            a = a + p
 
-        m_in = self.mlp_norm(x)
+        if self.config.fuse_norm:
+            m_in, residual = self.mlp_norm(a, residual, True)
+        else:
+            x = residual + a
+            residual = x
+            m_in = self.mlp_norm(x)
         m = self.mlp(m_in)
         x = residual + m
 
@@ -175,7 +183,9 @@ class E2ETTTModel(E2ETTTPreTrainedModel):
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = (RMSNorm if config.last_layer_fuse_norm else nn.RMSNorm)(
+            config.hidden_size, eps=config.norm_eps
+        )
 
         self.gradient_checkpointing = False
 
@@ -187,6 +197,8 @@ class E2ETTTModel(E2ETTTPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+
+    ### get fast weight ###
     def _collect_prime_params(self) -> List[str]:
         names: List[str] = []
         for layer in self.layers:
@@ -209,7 +221,7 @@ class E2ETTTModel(E2ETTTPreTrainedModel):
             if canonical_name in prime_names and canonical_name not in fast:
                 fast[canonical_name] = p
         return fast
-
+        ##########################
 
 
     def _normalize_position_ids(

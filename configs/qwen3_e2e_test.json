@@ -9,7 +9,7 @@
   "hidden_size": 2048,
   "num_hidden_layers": 28,
   "num_attention_heads": 16,
-  "intermediate_size": 5120,
+  "intermediate_size": 4992,
   "hidden_act": "silu",
   "rms_norm_eps": 1e-06,
   "initializer_range": 0.02,
@@ -21,10 +21,9 @@
 
   "use_e2e_ttt": true,
   "suffix_frac": 0.25,
-  "mini_batch_size": 512,
-  "inner_lr": 1,
-  "ilr_init": 0.1,
+  "mini_batch_size": 1024,
   "optimizer_inner": {
+    "ilr_init": 0.1,
     "optimizer_type": "sgd",
     "lr": 1,
     "clip_gradient": 1.0
@@ -49,5 +48,6 @@
   "sliding_window": null,
   "use_sliding_window": true,
   "debug_ttt_logs": false,
-  "debug_ttt_log_every": 1
+  "debug_ttt_log_every": 1,
+  "norm_eps": 1e-06
 }

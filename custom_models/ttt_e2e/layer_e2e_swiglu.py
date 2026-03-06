@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn import RMSNorm
+
+from fla.modules import RMSNorm
 from transformers.utils import logging
 from .configuration_ttt_e2e import E2ETTTConfig
 
@@ -90,16 +91,14 @@ class E2ESWIGLULayer(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.window_size = int(getattr(config, "window_size", 2048))
         self.default_backend = str(getattr(config, "attn_backend", "flash"))
-        self.attn_pdrop = float(getattr(config, "attn_pdrop", 0.0))
         self.qk_norm = bool(getattr(config, "qk_norm", True))
         self.pre_norm = bool(getattr(config, "pre_norm", True))
         self.post_norm = bool(getattr(config, "post_norm", True))
 
         self.qkv = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=False)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.q_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.resid_dropout = nn.Dropout(float(getattr(config, "resid_pdrop", 0.0)))
+        self.q_norm = RMSNorm(self.hidden_size, eps=config.norm_eps)
+        self.k_norm = RMSNorm(self.hidden_size, eps=config.norm_eps)
         self.rotary = RotaryEmbedding(self.head_dim, base=float(config.rope_theta))
 
     def _sdpa_local(
@@ -144,7 +143,6 @@ class E2ESWIGLULayer(nn.Module):
             return F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=mask,
-                dropout_p=(self.attn_pdrop if self.training else 0.0),
             )
 
     def _flash_local(
@@ -168,7 +166,6 @@ class E2ESWIGLULayer(nn.Module):
                 q_,
                 k_,
                 v_,
-                dropout_p=(self.attn_pdrop if self.training else 0.0),
                 causal=True,
                 window_size=window,
             )
@@ -199,24 +196,39 @@ class E2ESWIGLULayer(nn.Module):
         freqs = self.rotary(seq_len, device=hidden_states.device, dtype=hidden_states.dtype, position_ids=position_ids)
         q, k = apply_rotary(q, k, freqs)
 
+
         if past_key_value is not None:
             past_k, past_v = past_key_value
             k = torch.cat([past_k, k], dim=-2)
             v = torch.cat([past_v, v], dim=-2)
 
+        # --- 加入当场 Flush 的 Debugger ---
+        if self.layer_idx == 0 and not hasattr(self, "_e2e_debug_logged"):
+            self._e2e_debug_logged = True
+            logger.warning(f"\n" + "="*50)
+            logger.warning(f"[E2E FATAL BUG CHECK] Layer 0 Forward")
+            logger.warning(f"[TTT-DEBUG]Original Q seq_len: {q.size(-2)}")
+            logger.warning(f"[TTT-DEBUG]Original K seq_len: {k.size(-2)}")
+            logger.warning(f"[TTT-DEBUG]Window Size Config: {self.window_size}")
+            logger.warning("="*50 + "\n")
+        # ----------------------------------
+
+        # 计算返回给下一步推理的 Cache，这里可以截断，但不影响当前的 k, v
         if self.window_size > 0 and k.size(-2) > self.window_size:
-            k = k[:, :, -self.window_size :, :]
-            v = v[:, :, -self.window_size :, :]
+            next_k = k[:, :, -self.window_size :, :]
+            next_v = v[:, :, -self.window_size :, :]
+        else:
+            next_k, next_v = k, v
+            
+        next_kv = (next_k, next_v)
 
-        next_kv = (k, v)
-
+        # 注意：传给 flash_local 和 sdpa_local 的必须是未被截断的原始 k, v ！！！
         if backend == "flash":
             out = self._flash_local(q, k, v, attention_mask=attention_mask)
         else:
             out = self._sdpa_local(q, k, v, attention_mask=attention_mask)
-
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
-        return self.resid_dropout(self.o_proj(out)), next_kv
+        return self.o_proj(out), next_kv
 
     def _forward_prefix_flash(
         self,

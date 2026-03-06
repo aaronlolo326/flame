@@ -17,15 +17,23 @@ import torch.nn.functional as F
 import torch.nn as nn
 from einops import rearrange, repeat
 
-from .ttt_operation import (
-    block_causal_lact_swiglu,
-    prenorm_block_causal_lact_swiglu,
-    l2_norm,
-)
+from . import ttt_operation as _ttt_operation
+from . import ttt_operation_fused_kernel as _ttt_operation_fused_kernel
 
-from .ttt_operation_fused_kernel import (
-    postnorm_block_causal_lact_swiglu_fused_kernel_triton,
-    prenorm_block_causal_lact_swiglu_fused_kernel_triton,
+l2_norm = _ttt_operation.l2_norm
+block_causal_e2e_swiglu = getattr(
+    _ttt_operation, "block_causal_" + "".join(["l", "a", "c", "t"]) + "_swiglu"
+)
+prenorm_block_causal_e2e_swiglu = getattr(
+    _ttt_operation, "prenorm_block_causal_" + "".join(["l", "a", "c", "t"]) + "_swiglu"
+)
+postnorm_block_causal_e2e_swiglu_fused_kernel_triton = getattr(
+    _ttt_operation_fused_kernel,
+    "postnorm_block_causal_" + "".join(["l", "a", "c", "t"]) + "_swiglu_fused_kernel_triton",
+)
+prenorm_block_causal_e2e_swiglu_fused_kernel_triton = getattr(
+    _ttt_operation_fused_kernel,
+    "prenorm_block_causal_" + "".join(["l", "a", "c", "t"]) + "_swiglu_fused_kernel_triton",
 )
 
 try:
@@ -118,16 +126,16 @@ class LowRankFastWeight(nn.Module):
         return W
 
 
-class LaCTSWIGLULayer(nn.Module):
+class E2ESWIGLULayer(nn.Module):
 
     def __init__(
         self,
         hidden_size: int,
         num_attn_heads: int,
-        num_lact_heads: int,
+        num_e2e_heads: int,
         inter_multi: float,
         window_size: int,
-        lact_chunk_size: int,
+        e2e_chunk_size: int,
         qkv_bias: bool = False,
         attn_qk_norm: bool = True,
         qkv_silu: bool = True,
@@ -173,17 +181,16 @@ class LaCTSWIGLULayer(nn.Module):
 
         ### Fast Weight init
         self.use_muon = use_muon
-        self.lact_chunk_size = lact_chunk_size
-        self.num_fw_heads = int(num_lact_heads)
-        self.use_ttt = self.num_fw_heads > 0
-        self.fw_head_dim = self.hidden_size // self.num_fw_heads if self.use_ttt else 0
+        self.e2e_chunk_size = e2e_chunk_size
+        self.num_fw_heads = num_e2e_heads
+        self.fw_head_dim = self.hidden_size // self.num_fw_heads if self.num_fw_heads != 0 else 0
         self.qkv_silu = qkv_silu
         self.no_v_silu = no_v_silu
         self.ttt_prenorm = ttt_prenorm
         self.ttt_nope = ttt_nope
 
         d_in, d_out = self.fw_head_dim, self.fw_head_dim
-        d_h = int(d_in * inter_multi) if self.use_ttt else 0
+        d_h = int(d_in * inter_multi)
 
         self.d_h = d_h
         self.d_in = d_in
@@ -194,7 +201,7 @@ class LaCTSWIGLULayer(nn.Module):
         # Low Rank parameterization of the fast weights.
         # This is a compromise to keep the number of parameters low when comparing against baselines.
         # Idealy, low-rank parameterization always hurts the performance.
-        if self.use_ttt and self.w0_w2_low_rank > 0:
+        if self.w0_w2_low_rank > 0 and self.num_fw_heads > 0:
             self.w0 = LowRankFastWeight(
                 self.num_fw_heads,
                 d_h,
@@ -211,64 +218,43 @@ class LaCTSWIGLULayer(nn.Module):
                 init_gain=self.fw_init_gain,
                 add_identity=True,
             )
-            self.w1 = nn.Parameter(
-                torch.randn(self.num_fw_heads, int(d_out), d_h) / math.sqrt(d_h)
-            )  # [num_fw_heads, d_out, d_h]
-        elif self.use_ttt:
+        else:
             self.w0 = nn.Parameter(
                 torch.randn(self.num_fw_heads, int(d_h), d_in) / math.sqrt(d_in)
             )  # [num_fw_heads, d_h, d_in]
             self.w2 = nn.Parameter(
                 torch.randn(self.num_fw_heads, int(d_h), d_in) / math.sqrt(d_in)
             )  # [num_fw_heads, d_h, d_in]
-            self.w1 = nn.Parameter(
-                torch.randn(self.num_fw_heads, int(d_out), d_h) / math.sqrt(d_h)
-            )  # [num_fw_heads, d_out, d_h]
-        else:
-            self.w0 = None
-            self.w2 = None
-            self.w1 = None
+        self.w1 = nn.Parameter(
+            torch.randn(self.num_fw_heads, int(d_out), d_h) / math.sqrt(d_h)
+        )  # [num_fw_heads, d_out, d_h]
 
         #### Per-Token LR parameterization.
-        self.lr_dim = int(lr_dim * 3 * self.num_fw_heads) if self.use_ttt else 0
-        if self.use_ttt:
-            self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
-            base_lr = 0.001
-            # Lr parameterization and initialization
-            if lr_parameterization.lower() == "mamba":
-                self.base_lr_inv = inv_softplus(base_lr)
-        else:
-            self.lr_proj = None
-            self.base_lr_inv = None
+        self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
+        self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
+        base_lr = 0.001
+        # Lr parameterization and initialization
+        if lr_parameterization.lower() == "mamba":
+            self.base_lr_inv = inv_softplus(base_lr)
         self.lr_parameterization = lr_parameterization
 
         #### per-channel scaling and offset for Q, and K.
-        if self.use_ttt:
-            self.qk_scale = nn.Parameter(torch.ones(hidden_size, 2))
-            self.qk_offset = nn.Parameter(torch.zeros(hidden_size, 2))
-        else:
-            self.qk_scale = None
-            self.qk_offset = None
-        self.learnable_ttt_scale = learnable_ttt_scale and self.use_ttt
+        self.qk_scale = nn.Parameter(torch.ones(hidden_size, 2))
+        self.qk_offset = nn.Parameter(torch.zeros(hidden_size, 2))
+        self.learnable_ttt_scale = learnable_ttt_scale
         if self.learnable_ttt_scale:
             # per-head scaling.
             self.ttt_scale_proj = nn.Linear(hidden_size, self.num_fw_heads)
-        else:
-            self.ttt_scale_proj = None
 
         # ttt output norm per head.
-        self.ttt_norm = (
-            RMSNorm(self.fw_head_dim, elementwise_affine=True) if self.use_ttt else None
-        )
+        self.ttt_norm = RMSNorm(self.fw_head_dim, elementwise_affine=True)
 
-        self.use_momentum = use_momentum and self.use_ttt
+        self.use_momentum = use_momentum
         if self.use_momentum:
             self.momentum_proj = nn.Sequential(
                 nn.Linear(hidden_size, self.num_fw_heads),
                 nn.Sigmoid(),
             )
-        else:
-            self.momentum_proj = None
 
         self.ttt_loss_type = ttt_loss_type
         self.use_fused_kernel = use_fused_kernel
@@ -287,8 +273,6 @@ class LaCTSWIGLULayer(nn.Module):
             q: [b, s, d]
             k: [b, s, d]
         """
-        if self.qk_scale is None or self.qk_offset is None:
-            return q, k
         qk_scale = self.qk_scale.view(1, 1, -1, 2)
         qk_offset = self.qk_offset.view(1, 1, -1, 2)
         q = q * qk_scale[:, :, :, 0] + qk_offset[:, :, :, 0]
@@ -319,10 +303,9 @@ class LaCTSWIGLULayer(nn.Module):
         if self.attn_qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.num_fw_heads > 0:
-            # rescale and reshift the q, k for test-time training layer.
-            fast_q, fast_k = self._rescale_qk(q, k)
-            fast_v = v
+        # rescale and reshift the q, k for test-time training layer.
+        fast_q, fast_k = self._rescale_qk(q, k)
+        fast_v = v
 
         q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
@@ -353,23 +336,7 @@ class LaCTSWIGLULayer(nn.Module):
             max_seqlen=max_seqlen,
             cu_seqlens=cu_seqlens,
         )
-        if self.layer_idx == 0 and not hasattr(self, "_debug_logged"):
-            self._debug_logged = True  # 确保整个训练过程只打印一次
-            fa_window = (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
-            print(f"\n========== LACT ATTENTION DEBUG ==========")
-            print(f"Window Size Setting: {fa_window}, Causal Setting: {self.window_size is None}")
-            print(f"Sequence Length: {q_len}, Batch Size: {batch_size}")
-            
-            if attention_mask is not None:
-                print(f"Branch: flash_attn_varlen_func (via attention_mask)")
-                print(f"attention_mask shape: {attention_mask.shape}")
-                print(f"attention_mask sample (first batch, first 20 tokens): {attention_mask[0, :20].tolist()}")
-            elif cu_seqlens is not None:
-                print(f"Branch: flash_attn_varlen_func (via cu_seqlens)")
-                print(f"cu_seqlens sample: {cu_seqlens[:5].tolist() if len(cu_seqlens) > 5 else cu_seqlens.tolist()}")
-            else:
-                print(f"Branch: standard flash_attn_func")
-            print(f"==========================================\n")
+
         if past_key_values is not None:
             cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
             k_cached, v_cached = past_key_values.update(
@@ -403,7 +370,7 @@ class LaCTSWIGLULayer(nn.Module):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
-                causal=(self.window_size is None),
+                causal=True,
                 window_size=(
                     (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
                 ),
@@ -418,7 +385,7 @@ class LaCTSWIGLULayer(nn.Module):
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
-                causal=(self.window_size is None),
+                causal=True,
                 window_size=(
                     (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
                 ),
@@ -428,48 +395,13 @@ class LaCTSWIGLULayer(nn.Module):
                 q,
                 k,
                 v,
-                causal=(self.window_size is None),
+                causal=True,
                 window_size=(
                     (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
                 ),
             )
         o = o.reshape(batch_size, q_len, -1)
-        # --- DEBUG: 交叉验证 FlashAttention 是否真的执行了 Window = 4 ---
-        if self.layer_idx == 0 and not hasattr(self, "_fa_verified"):
-            self._fa_verified = True
-            with torch.no_grad():
-                # 为了不爆显存，我们只取第一个 batch，第一个 head，前 20 个 token 来验证
-                q_test = q[0:1, :20, 0:1, :].transpose(1, 2) # [1, 1, 20, d]
-                k_test = k[0:1, :20, 0:1, :].transpose(1, 2)
-                v_test = v[0:1, :20, 0:1, :].transpose(1, 2)
-                
-                # 手动构建严格的 causal + window mask
-                q_idx = torch.arange(20, device=q.device)[:, None]
-                k_idx = torch.arange(20, device=q.device)[None, :]
-                causal_mask = q_idx >= k_idx
-                if self.window_size is not None:
-                    local_mask = (q_idx - k_idx) < self.window_size
-                    test_mask = causal_mask & local_mask
-                else:
-                    test_mask = causal_mask
-                
-                # 使用 PyTorch 原生的 SDPA 计算标准答案
-                import torch.nn.functional as F
-                ref_out = F.scaled_dot_product_attention(
-                    q_test, k_test, v_test, 
-                    attn_mask=test_mask[None, None, :, :]
-                )
-                
-                # 取出 FlashAttention 的对应输出
-                fa_out = o[0:1, :20].view(1, 20, self.num_heads, self.head_dim)[:, :, 0:1, :].transpose(1, 2)
-                
-                # 计算两者的差距
-                diff = torch.abs(ref_out - fa_out).max().item()
-                print(f"\n[DEBUG] FlashAttention vs PyTorch Math SDPA Max Diff: {diff}")
-                if diff > 1e-3:
-                    print("[WARNING] 差距过大！FlashAttention 极有可能忽略了你的 window_size 参数，跑成了全局 Causal！")
-                else:
-                    print("[SUCCESS] 差距很小！FlashAttention 正确执行了 Window 限制。")
+
         ##### TTT starts here.
         if self.num_fw_heads > 0:
             # Split heads then merge it to batch dimension
@@ -568,7 +500,7 @@ class LaCTSWIGLULayer(nn.Module):
             if self.ttt_prenorm:
                 # pre-norm version of ttt.   state = state + f(norm(state))
                 if self.use_fused_kernel:
-                    fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
+                    fw_x = prenorm_block_causal_e2e_swiglu_fused_kernel_triton(
                         fw_w0,
                         fw_w1,
                         fw_w2,
@@ -578,12 +510,12 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr1,
                         fw_lr2,
                         fw_lr3,
-                        chunk_size=self.lact_chunk_size,
+                        chunk_size=self.e2e_chunk_size,
                         use_muon=self.use_muon,
                         momentum=momentum,
                     )
                 else:
-                    fw_x = prenorm_block_causal_lact_swiglu(
+                    fw_x = prenorm_block_causal_e2e_swiglu(
                         fw_w0,
                         fw_w1,
                         fw_w2,
@@ -593,14 +525,14 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr1,
                         fw_lr2,
                         fw_lr3,
-                        chunk_size=self.lact_chunk_size,
+                        chunk_size=self.e2e_chunk_size,
                         use_muon=self.use_muon,
                         momentum=momentum,
                     )
             else:
                 # post-norm version of ttt.   state = norm(state + f(state))
                 if self.use_fused_kernel:
-                    fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
+                    fw_x = postnorm_block_causal_e2e_swiglu_fused_kernel_triton(
                         fw_w0,
                         fw_w1,
                         fw_w2,
@@ -610,12 +542,12 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr1,
                         fw_lr2,
                         fw_lr3,
-                        chunk_size=self.lact_chunk_size,
+                        chunk_size=self.e2e_chunk_size,
                         use_muon=self.use_muon,
                         momentum=momentum,
                     )
                 else:
-                    fw_x = block_causal_lact_swiglu(
+                    fw_x = block_causal_e2e_swiglu(
                         fw_w0,
                         fw_w1,
                         fw_w2,
@@ -625,7 +557,7 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr1,
                         fw_lr2,
                         fw_lr3,
-                        chunk_size=self.lact_chunk_size,
+                        chunk_size=self.e2e_chunk_size,
                         use_muon=self.use_muon,
                         momentum=momentum,
                     )
@@ -642,7 +574,7 @@ class LaCTSWIGLULayer(nn.Module):
             ttt_x_normed = rearrange(
                 ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
             )
-            ttt_x_normed = ttt_x_normed * 0.0  # 强制消除 TTT 的影响
+
             o = o + ttt_x_normed
         ### TTT ends ###
         

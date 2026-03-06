@@ -24,8 +24,8 @@ from fla.modules import GatedMLP as TransformerMLP
 from fla.modules import RMSNorm
 import torch.nn as nn
 
-from .layer_lact_swiglu import LaCTSWIGLULayer
-from .configuration_lact_swiglu import LaCTSWIGLUConfig
+from .layer_e2e_swiglu import E2ESWIGLULayer
+from .configuration_ttt_e2e import E2ETTTConfig
 
 logger = logging.get_logger(__name__)
 
@@ -33,9 +33,9 @@ if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
 
 
-class LaCTBlock(nn.Module):
+class E2EBlock(nn.Module):
 
-    def __init__(self, config: LaCTSWIGLUConfig, layer_idx: int):
+    def __init__(self, config: E2ETTTConfig, layer_idx: int):
         super().__init__()
 
         self.config = config
@@ -44,13 +44,13 @@ class LaCTBlock(nn.Module):
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
             config.hidden_size, eps=config.norm_eps
         )
-        self.attn = LaCTSWIGLULayer(
+        self.attn = E2ESWIGLULayer(
             hidden_size=config.hidden_size,
             num_attn_heads=config.num_attn_heads,
-            num_lact_heads=config.num_lact_heads,
+            num_e2e_heads=config.num_e2e_heads,
             inter_multi=config.inter_multi,
             window_size=config.window_size,
-            lact_chunk_size=config.lact_chunk_size,
+            e2e_chunk_size=config.e2e_chunk_size,
             qkv_bias=config.qkv_bias,
             attn_qk_norm=config.attn_qk_norm,
             qkv_silu=config.qkv_silu,
@@ -125,12 +125,12 @@ class LaCTBlock(nn.Module):
         return outputs
 
 
-class LaCTPreTrainedModel(PreTrainedModel):
+class E2EPreTrainedModel(PreTrainedModel):
 
-    config_class = LaCTSWIGLUConfig
+    config_class = E2ETTTConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["LaCTBlock"]
+    _no_split_modules = ["E2EBlock"]
     _supports_cache_class = True
 
     def __init__(self, *inputs, **kwargs):
@@ -176,35 +176,32 @@ class LaCTPreTrainedModel(PreTrainedModel):
                         num_residuals_per_layer * self.config.num_hidden_layers
                     )
 
-        if isinstance(module, LaCTSWIGLULayer):
+        if isinstance(module, E2ESWIGLULayer):
             #### Initialize the parameters of the model
-            if module.qk_scale is not None:
-                nn.init.ones_(module.qk_scale)
-            if module.qk_offset is not None:
-                nn.init.zeros_(module.qk_offset)
+            nn.init.ones_(module.qk_scale)
+            nn.init.zeros_(module.qk_offset)
 
             logger.info(
-                f"in PreTrainedModel initialize fast weights for LaCTSWIGLULayer"
+                f"in PreTrainedModel initialize fast weights for E2ESWIGLULayer"
             )
             # init w0, w1, w2
-            if module.num_fw_heads > 0:
-                if module.w0_w2_low_rank > 0:
-                    module.w0._init_weights()
-                    module.w2._init_weights()
-                else:
-                    nn.init.normal_(
-                        module.w0, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
-                    )
-                    nn.init.normal_(
-                        module.w2, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
-                    )
+            if module.w0_w2_low_rank > 0:
+                module.w0._init_weights()
+                module.w2._init_weights()
+            else:
+                nn.init.normal_(
+                    module.w0, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
+                )
+                nn.init.normal_(
+                    module.w2, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
+                )
 
-                nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
+            nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
 
 
-class LaCTModel(LaCTPreTrainedModel):
+class E2EModel(E2EPreTrainedModel):
 
-    def __init__(self, config: LaCTSWIGLUConfig) -> LaCTModel:
+    def __init__(self, config: E2ETTTConfig) -> E2EModel:
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -214,7 +211,7 @@ class LaCTModel(LaCTPreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                LaCTBlock(config, layer_idx)
+                E2EBlock(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -350,13 +347,13 @@ class LaCTModel(LaCTPreTrainedModel):
         )
 
 
-class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
+class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = {"lm_head.weight": "model.embeddings.weight"} # ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = LaCTModel(config)
+        self.model = E2EModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.criterion = None
