@@ -181,9 +181,9 @@ class LaCTPreTrainedModel(PreTrainedModel):
             nn.init.ones_(module.qk_scale)
             nn.init.zeros_(module.qk_offset)
 
-            logger.info(
-                f"in PreTrainedModel initialize fast weights for LaCTSWIGLULayer"
-            )
+            # logger.info(
+            #     f"in PreTrainedModel initialize fast weights for LaCTSWIGLULayer"
+            # )
             # init w0, w1, w2
             if module.num_fw_heads > 0:
                 if module.w0_w2_low_rank > 0:

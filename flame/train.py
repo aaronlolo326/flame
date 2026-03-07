@@ -12,7 +12,7 @@ from datetime import timedelta
 
 import fla  # noqa
 import torch
-from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
+# from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss # commented out for now as it is not used so far; also not available in flash-linear-attention 0.4.0
 from fla.ops.utils import prepare_position_ids
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpoint import CheckpointManager
@@ -30,7 +30,6 @@ from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-import custom_models
 from flame.components.checkpoint import TrainState
 from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
@@ -38,7 +37,7 @@ from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
 
-
+# torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
@@ -64,6 +63,18 @@ register_train_spec(
 def main(job_config: JobConfig):
 
     # torch.cuda.memory._record_memory_history(max_entries=100000)
+
+    # get model_type attr from the json file at job_config.model.config, and import
+    import json
+    with open(job_config.model.config, "r") as f:
+        model_json = json.load(f)
+        model_type = model_json.get("model_type")
+        layer_types = model_json.get("layer_types")
+    from custom_models import MODEL_TYPE_TO_PARENT_DIR
+    parent_dir = MODEL_TYPE_TO_PARENT_DIR[model_type]
+    import importlib
+    importlib.import_module(f"custom_models.{parent_dir}")
+
 
     logger.info(f"Starting job: {job_config.job.description}")
 
@@ -241,6 +252,14 @@ def main(job_config: JobConfig):
         model.apply(lambda m: setattr(m, "_is_hf_initialized", False))
     logger.info(f"{color.blue}\n{model}{color.reset}\n")
 
+    # # Source - https://stackoverflow.com/a/79627453
+    # # Posted by Om Rastogi
+    # # Retrieved 2026-03-07, License - CC BY-SA 4.0
+
+    # for i, (name, tensor) in enumerate(model.state_dict().items()):
+    #     print(f"{i}: {name} → shape={tensor.shape}, dtype={tensor.dtype}")
+
+
     # Build the collection of model converters. No-op if `model.converters` empty
     model_converters = build_model_converters(job_config, parallel_dims)
     model_converters.convert(model)
@@ -300,6 +319,21 @@ def main(job_config: JobConfig):
         model.train()
 
         model_parts = [model]
+
+    ###
+    from collections import defaultdict
+
+    # dtypes = defaultdict(list)
+
+    # for name, p in model.named_parameters():
+    #     dtypes[p.dtype].append(name)
+
+    # for k, v in dtypes.items():
+    #     print(k, len(v))
+    for name, p in model.named_parameters():
+        if p.dtype == torch.float32:
+            print(name, "is in", p.dtype)
+    ###
 
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
