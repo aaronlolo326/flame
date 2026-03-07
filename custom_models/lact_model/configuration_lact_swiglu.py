@@ -44,6 +44,8 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         ttt_nope: bool = False,  # if True, no positional encoding for query and key used in ttt.
         w0_w2_low_rank: int = -1,  # -1 means fully learnable.  > 1 means low rank parameterization of the initial learnable weights.
         window_size: int = 2048,
+        use_sliding_window: bool = True,
+        layer_types: Optional[list] = None,
         rope_theta: Optional[float] = 10000.0,
         max_position_embeddings: int = 2048,
         hidden_ratio: Optional[int] = 4,
@@ -80,6 +82,18 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.qkv_silu = qkv_silu
         self.no_v_silu = no_v_silu
         self.window_size = window_size
+        # When `use_sliding_window` is False, LaCT will use full attention
+        # (i.e. no locality constraint) by passing `window_size=None` to the
+        # attention layer. This mirrors the `use_sliding_window` switch used in
+        # `Qwen3GDNConfig`, while keeping the existing `window_size` interface.
+        self.use_sliding_window = use_sliding_window
+        # Optional per-layer attention pattern, mirroring Qwen3GDNConfig.layer_types.
+        # Expected entries (if provided) include:
+        # - "full_attention": use global attention (window_size=None)
+        # - "linear_attention": mapped to LaCT with sliding window enabled
+        # - "sliding_attention": LaCT with sliding window enabled
+        # If None, all layers fall back to the global `use_sliding_window` flag.
+        self.layer_types = layer_types
         self.lr_parameterization = lr_parameterization
         self.learnable_ttt_scale = learnable_ttt_scale
         self.ttt_prenorm = ttt_prenorm

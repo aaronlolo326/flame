@@ -44,12 +44,37 @@ class LaCTBlock(nn.Module):
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
             config.hidden_size, eps=config.norm_eps
         )
+        # Determine the per-layer attention mode, optionally driven by a
+        # Qwen3GDN-style `layer_types` list if present on the config.
+        # Mapping:
+        # - "full_attention"     -> global/full attention   (window_size=None)
+        # - "linear_attention"   -> LaCT + sliding window   (window_size=config.window_size)
+        # - "sliding_attention"  -> LaCT + sliding window   (window_size=config.window_size)
+        # If `layer_types` is not provided, we fall back to the global
+        # `use_sliding_window` flag.
+        attention_type = None
+        if getattr(config, "layer_types", None) is not None:
+            if 0 <= layer_idx < len(config.layer_types):
+                attention_type = config.layer_types[layer_idx]
+
+        if attention_type == "full_attention":
+            window_size = None
+        elif attention_type in ("linear_attention", "sliding_attention"):
+            window_size = config.window_size
+        else:
+            # Fallback: behave like the original global toggle.
+            window_size = (
+                config.window_size
+                if getattr(config, "use_sliding_window", True)
+                else None
+            )
+
         self.attn = LaCTSWIGLULayer(
             hidden_size=config.hidden_size,
             num_attn_heads=config.num_attn_heads,
             num_lact_heads=config.num_lact_heads,
             inter_multi=config.inter_multi,
-            window_size=config.window_size,
+            window_size=window_size,
             lact_chunk_size=config.lact_chunk_size,
             qkv_bias=config.qkv_bias,
             attn_qk_norm=config.attn_qk_norm,
