@@ -38,6 +38,7 @@ def parallelize_fla(
     world_mesh: DeviceMesh,
     parallel_dims: ParallelDims,
     job_config: JobConfig,
+    **kwargs
 ):
     """
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
@@ -85,6 +86,7 @@ def parallelize_fla(
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.training.fsdp_reshard_after_forward,
+            **kwargs
         )
 
         if parallel_dims.dp_replicate_enabled:
@@ -411,6 +413,7 @@ def apply_fsdp(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    **kwargs
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -432,6 +435,12 @@ def apply_fsdp(
     """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
+    fsdp_config |= kwargs
+    # fully_shard expects ignored_params to be Optional[set[nn.Parameter]]
+    if fsdp_config.get("ignored_params") is not None and not isinstance(
+        fsdp_config["ignored_params"], set
+    ):
+        fsdp_config["ignored_params"] = set(fsdp_config["ignored_params"])
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 

@@ -312,7 +312,15 @@ def main(job_config: JobConfig):
         ensure_pp_loss_visible(parallel_dims, job_config, color)
     else:
         # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
-        train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config)
+        ignored_params = None
+        if model_type == 'qwen3_gdn' and layer_types is not None:
+            # FSDP fully_shard expects ignored_params to be a set of nn.Parameter
+            ignored_params = {
+                model.model.layers[idx].self_attn.A_log
+                for idx, layer_type in enumerate(layer_types)
+                if layer_type == 'linear_attention'
+            }
+        train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config, ignored_params=ignored_params)
         model.to_empty(device=init_device)
         with torch.no_grad():
             model.post_init()
