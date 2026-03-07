@@ -443,17 +443,17 @@ class GatedDeltaNet(nn.Module):
             self.q_conv1d = ShortConvolution(
                 hidden_size=self.key_dim,
                 kernel_size=config.conv_size,
-                # activation=config.hidden_act
+                activation=config.hidden_act # hei: uncommented; previously commented for distillation only?
             )
             self.k_conv1d = ShortConvolution(
                 hidden_size=self.key_dim,
                 kernel_size=config.conv_size,
-                # activation=config.hidden_act
+                activation=config.hidden_act # hei: uncommented; previously commented for distillation only?
             )
             self.v_conv1d = ShortConvolution(
                 hidden_size=self.value_dim,
                 kernel_size=config.conv_size,
-                # activation=config.hidden_act
+                activation=config.hidden_act # hei: uncommented; previously commented for distillation only?
             )
         else:
             raise UserWarning(
@@ -943,8 +943,9 @@ class Qwen3PreTrainedModel(PreTrainedModel):
         elif isinstance(module, Qwen3RMSNorm):
             module.weight.data.fill_(1.0)
         # NEW: initialize the depthwise convs to "identity-ish" when model is created from config
-        elif isinstance(module, GatedDeltaNet):
-            module._init_conv_to_one()
+        # hei: commented for this proj; useful for distillation only?
+        # elif isinstance(module, GatedDeltaNet):
+        #     module._init_conv_to_one()
 
 
 class Qwen3RotaryEmbedding(nn.Module):

@@ -3,10 +3,20 @@ from flame.config_manager import JobConfig
 from flame.tools.utils import get_nparams_and_flops
 import torch
 from transformers import AutoModelForCausalLM, AutoConfig
-import custom_models
 from torchtitan.tools.logging import logger, init_logger
 
 def main(job_config: JobConfig):
+
+    import json
+    with open(job_config.model.config, "r") as f:
+        model_json = json.load(f)
+        model_type = model_json.get("model_type")
+        layer_types = model_json.get("layer_types")
+    from custom_models import MODEL_TYPE_TO_PARENT_DIR
+    parent_dir = MODEL_TYPE_TO_PARENT_DIR[model_type]
+    import importlib
+    importlib.import_module(f"custom_models.{parent_dir}")
+
     print(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
 

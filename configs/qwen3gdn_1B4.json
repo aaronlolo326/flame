@@ -8,7 +8,7 @@
   "bos_token_id": 151643,
   "eos_token_id": 151643,
   "head_dim": 64,
-  "hidden_act": "swish",
+  "hidden_act": "silu",
   "hidden_size": 2048,
   "initializer_range": 0.02,
   "intermediate_size": 9216,
@@ -45,7 +45,7 @@
     "linear_attention",
     "full_attention"
   ],
-  "expand_v": 1,
+  "expand_v": 2,
   "mode": "chunk",
   "use_gate": true,
   "use_short_conv": true,
