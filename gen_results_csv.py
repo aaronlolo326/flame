@@ -4,7 +4,7 @@ import argparse
 import glob
 import json
 
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 from typing import List
 
@@ -38,7 +38,7 @@ def load_data(run_name, data_set):
         data = json.load(f)
 
     results = data.get("results", {})
-    flattened_data = {}
+    flattened_data = OrderedDict()
 
     if data_set == 'niah':
         # Define the context lengths you want to extract
@@ -51,30 +51,41 @@ def load_data(run_name, data_set):
                 json_key = f"{length},none"
                 if json_key in metrics:
                     flattened_data[column_name] = metrics[json_key] * 100
+                else:
+                    flattened_data[column_name] = None
 
     elif data_set == 'lm':
         all_tasks = "gsm8k,winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,race".split(",")
-        for key, metrics in results.items():
-            if key in all_tasks:
-                column_name = key
+        sorted_tasks = sorted(all_tasks)
+        # iterate over sorted task names so columns are added in order
+        for task in sorted_tasks:
+            if task in results:
+                metrics = results[task]
+                column_name = task
                 json_keys = ["acc,none", "exact_match,strict-match"]
                 for json_key in json_keys:
                     if json_key in metrics:
                         flattened_data[column_name] = metrics[json_key] * 100
+                        break
 
     elif data_set == 'lb':
         all_tasks = "2wikimqa,dureader,gov_report,hotpotqa,lcc,lsht,multi_news,multifieldqa_en,multifieldqa_zh,musique,narrativeqa,passage_count,passage_retrieval_en,passage_retrieval_zh,qasper,qmsum,repobench-p,samsum,trec,triviaqa,vcsum".split(",")
-        for key, metrics in results.items():
-            clean_name = key.replace("longbench_", "")
-            column_name = clean_name
-            if column_name in all_tasks:
+        sorted_tasks = sorted(all_tasks)
+        # ensure results are inserted in sorted order of task names
+        for task in sorted_tasks:
+            # results keys have 'longbench_' prefix
+            raw_key = f"longbench_{task}"
+            if raw_key in results:
+                metrics = results[raw_key]
+                column_name = task
                 json_keys = ["score,none"]
                 for json_key in json_keys:
                     if json_key in metrics:
                         flattened_data[column_name] = metrics[json_key] * 100
+                        break
 
     df = pd.DataFrame([flattened_data])
-    df = df.reindex(sorted(df.columns), axis=1)
+    # df = df.reindex(sorted(df.columns), axis=1)
     # Format all float values to two decimal places using DataFrame.astype(str) and DataFrame.round
     for col in df.select_dtypes(include=["float", "float64"]).columns:
         df[col] = df[col].map(lambda x: f"{x:.2f}")
