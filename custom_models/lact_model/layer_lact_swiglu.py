@@ -353,23 +353,6 @@ class LaCTSWIGLULayer(nn.Module):
             max_seqlen=max_seqlen,
             cu_seqlens=cu_seqlens,
         )
-        if self.layer_idx == 0 and not hasattr(self, "_debug_logged"):
-            self._debug_logged = True  # 确保整个训练过程只打印一次
-            fa_window = (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
-            print(f"\n========== LACT ATTENTION DEBUG ==========")
-            print(f"Window Size Setting: {fa_window}, Causal Setting: {self.window_size is None}")
-            print(f"Sequence Length: {q_len}, Batch Size: {batch_size}")
-            
-            if attention_mask is not None:
-                print(f"Branch: flash_attn_varlen_func (via attention_mask)")
-                print(f"attention_mask shape: {attention_mask.shape}")
-                print(f"attention_mask sample (first batch, first 20 tokens): {attention_mask[0, :20].tolist()}")
-            elif cu_seqlens is not None:
-                print(f"Branch: flash_attn_varlen_func (via cu_seqlens)")
-                print(f"cu_seqlens sample: {cu_seqlens[:5].tolist() if len(cu_seqlens) > 5 else cu_seqlens.tolist()}")
-            else:
-                print(f"Branch: standard flash_attn_func")
-            print(f"==========================================\n")
         if past_key_values is not None:
             cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
             k_cached, v_cached = past_key_values.update(
@@ -434,42 +417,6 @@ class LaCTSWIGLULayer(nn.Module):
                 ),
             )
         o = o.reshape(batch_size, q_len, -1)
-        # --- DEBUG: 交叉验证 FlashAttention 是否真的执行了 Window = 4 ---
-        if self.layer_idx == 0 and not hasattr(self, "_fa_verified"):
-            self._fa_verified = True
-            with torch.no_grad():
-                # 为了不爆显存，我们只取第一个 batch，第一个 head，前 20 个 token 来验证
-                q_test = q[0:1, :20, 0:1, :].transpose(1, 2) # [1, 1, 20, d]
-                k_test = k[0:1, :20, 0:1, :].transpose(1, 2)
-                v_test = v[0:1, :20, 0:1, :].transpose(1, 2)
-                
-                # 手动构建严格的 causal + window mask
-                q_idx = torch.arange(20, device=q.device)[:, None]
-                k_idx = torch.arange(20, device=q.device)[None, :]
-                causal_mask = q_idx >= k_idx
-                if self.window_size is not None:
-                    local_mask = (q_idx - k_idx) < self.window_size
-                    test_mask = causal_mask & local_mask
-                else:
-                    test_mask = causal_mask
-                
-                # 使用 PyTorch 原生的 SDPA 计算标准答案
-                import torch.nn.functional as F
-                ref_out = F.scaled_dot_product_attention(
-                    q_test, k_test, v_test, 
-                    attn_mask=test_mask[None, None, :, :]
-                )
-                
-                # 取出 FlashAttention 的对应输出
-                fa_out = o[0:1, :20].view(1, 20, self.num_heads, self.head_dim)[:, :, 0:1, :].transpose(1, 2)
-                
-                # 计算两者的差距
-                diff = torch.abs(ref_out - fa_out).max().item()
-                print(f"\n[DEBUG] FlashAttention vs PyTorch Math SDPA Max Diff: {diff}")
-                if diff > 1e-3:
-                    print("[WARNING] 差距过大！FlashAttention 极有可能忽略了你的 window_size 参数，跑成了全局 Causal！")
-                else:
-                    print("[SUCCESS] 差距很小！FlashAttention 正确执行了 Window 限制。")
         ##### TTT starts here.
         if self.num_fw_heads > 0:
             # Split heads then merge it to batch dimension
@@ -642,7 +589,6 @@ class LaCTSWIGLULayer(nn.Module):
             ttt_x_normed = rearrange(
                 ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
             )
-            ttt_x_normed = ttt_x_normed * 0.0  # 强制消除 TTT 的影响
             o = o + ttt_x_normed
         ### TTT ends ###
         

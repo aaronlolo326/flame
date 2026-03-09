@@ -88,7 +88,7 @@ IntOrIntTuple = Union[int, Tuple[int, int]]
 class E2ETTTConfig(PretrainedConfig):
     """HF config for an E2E-TTT-style model (Torch draft)."""
 
-    model_type = "e2e_ttt"
+    model_type = "e2e_legacy"
 
     def __init__(
         self,

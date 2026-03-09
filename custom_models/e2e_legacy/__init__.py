@@ -9,6 +9,6 @@ __all__ = [
     "E2ETTTForCausalLM",
 ]
 
-AutoConfig.register("e2e_ttt", E2ETTTConfig)
+AutoConfig.register("e2e_legacy", E2ETTTConfig)
 AutoModel.register(E2ETTTConfig, E2ETTTModel)
 AutoModelForCausalLM.register(E2ETTTConfig, E2ETTTForCausalLM)

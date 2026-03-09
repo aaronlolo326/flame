@@ -678,18 +678,16 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
         create_graph_for_inner = not bool(getattr(cfg, "detach_fast_weights", False))
         inner_optimizer_type, inner_target_lr, inner_clip_gradient = self._resolve_inner_optimizer()
 
-        x = x[:, :-1, :]
-        labels = labels[:, 1:]
-        position_ids = position_ids[:, :-1]
         if attention_mask is not None:
             if attention_mask.dim() != 2:
                 raise ValueError(
                     "attention_mask must have shape [batch_size, seq_len], "
                     f"got {tuple(attention_mask.shape)}"
                 )
-            attention_mask = attention_mask[:, :-1]
-
-        bsz, seqlen = x.shape[:2]
+        total_seq_len = x.size(1)
+        # Keep token states untouched; do causal shift only when pairing chunk logits with labels.
+        effective_seq_len = max(total_seq_len - 1, 0)
+        bsz = x.size(0)
         chunk = int(cfg.mini_batch_size)
         if chunk <= 0:
             raise ValueError("mini_batch_size must be > 0")
@@ -709,9 +707,9 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
         total_valid_tokens = x.new_zeros(()) # Initialize as a Tensor instead of int 0
         
         # This initial logits tensor is overwritten later, but keeps a safe fallback when steps == 0.
-        logits = x.new_zeros((bsz, 1, self.lm_head.out_features))
+        logits = x.new_zeros((bsz, 0, self.lm_head.out_features))
 
-        steps = math.ceil(seqlen / chunk)
+        steps = math.ceil(effective_seq_len / chunk) if effective_seq_len > 0 else 0
         if debug_ttt_logs:
             suffix_layers = len(self.model.layers) - int(self.model.suffix_start)
             suffix_layers_with_prime = sum(
@@ -734,16 +732,16 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
                 )
                 
         # 1. Initialize the logits collection list.
-        all_logits_list = []
+        # all_logits_list = []
         
         for i in range(steps):
             s = i * chunk
-            e = min((i + 1) * chunk, seqlen)
+            e = min((i + 1) * chunk, effective_seq_len)
             if e <= s:
                 continue
 
             x_chunk = prefix_outputs[:, s:e, :]
-            y_chunk = labels[:, s:e]
+            y_chunk = labels[:, s + 1 : e + 1]
             p_chunk = position_ids[:, s:e]
             mask_chunk = attention_mask[:, :e] if attention_mask is not None else None
             h_chunk, suffix_past = self.model.forward_suffix_blocks(
@@ -757,7 +755,7 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
 
             chunk_logits = F.linear(h_chunk, self.lm_head.weight, self.lm_head.bias)
             
-            all_logits_list.append(chunk_logits)
+            # all_logits_list.append(chunk_logits)
 
             valid_mask = y_chunk.ne(-100)
             valid_count = valid_mask.sum() 
@@ -855,10 +853,10 @@ class E2ETTTForCausalLM(E2ETTTPreTrainedModel, GenerationMixin):
                 if bool(getattr(cfg, "detach_fast_weights", False)):
                     suffix_past = self._detach_past(suffix_past)
 
-        if len(all_logits_list) > 0:
-            logits_full = torch.cat(all_logits_list, dim=1)
-        else:
-            logits_full = logits
+        # if len(all_logits_list) > 0:
+        #     logits_full = torch.cat(all_logits_list, dim=1)
+        # else:
+        logits_full = logits
             
         if labels is None and logits_to_keep is not None and logits_to_keep > 0:
             logits = logits_full[:, -logits_to_keep:]

@@ -229,3 +229,7 @@ class E2ETTTConfig(PretrainedConfig):
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if self.mini_batch_size <= 0:
             raise ValueError("mini_batch_size must be > 0")
+
+
+class E2ETTTV2Config(E2ETTTConfig):
+    model_type = "ttt_e2e_v2"

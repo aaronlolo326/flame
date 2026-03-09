@@ -1,14 +1,21 @@
-from .configuration_ttt_e2e import E2ETTTConfig
-from .modeling_e2e_v4 import E2ETTTForCausalLM, E2ETTTModel
+from .configuration_ttt_e2e import E2ETTTV2Config
+from .modeling_ttt_e2e import E2EForCausalLM, E2EModel
 
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
+class E2ETTTV2Model(E2EModel):
+    config_class = E2ETTTV2Config
+
+
+class E2ETTTV2ForCausalLM(E2EForCausalLM):
+    config_class = E2ETTTV2Config
+
 __all__ = [
-    "E2ETTTConfig",
-    "E2ETTTModel",
-    "E2ETTTForCausalLM",
+    "E2ETTTV2Config",
+    "E2ETTTV2Model",
+    "E2ETTTV2ForCausalLM",
 ]
 
-AutoConfig.register("e2e_ttt", E2ETTTConfig)
-AutoModel.register(E2ETTTConfig, E2ETTTModel)
-AutoModelForCausalLM.register(E2ETTTConfig, E2ETTTForCausalLM)
+AutoConfig.register("ttt_e2e_v2", E2ETTTV2Config)
+AutoModel.register(E2ETTTV2Config, E2ETTTV2Model)
+AutoModelForCausalLM.register(E2ETTTV2Config, E2ETTTV2ForCausalLM)

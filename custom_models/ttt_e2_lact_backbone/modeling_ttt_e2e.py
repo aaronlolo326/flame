@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 import warnings
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union, Dict
 
 import torch
 import torch.nn as nn
@@ -18,7 +19,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 from transformers.utils.deprecation import deprecate_kwarg
 
-from fla.models.utils import Cache
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
 from fla.modules import GatedMLP as TransformerMLP
 from fla.modules import RMSNorm
@@ -27,50 +27,124 @@ import torch.nn as nn
 from .layer_e2e_swiglu import E2ESWIGLULayer
 from .configuration_ttt_e2e import E2ETTTConfig
 
+import torch.nn.functional as F
 logger = logging.get_logger(__name__)
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
 
 
+LayerKV = Tuple[torch.Tensor, torch.Tensor]
+LegacyCache = Tuple[Optional[LayerKV], ...]
+
+
+def _normalize_cache_entry(entry: Any) -> Optional[LayerKV]:
+    if entry is None:
+        return None
+    if isinstance(entry, dict):
+        entry = entry.get("attn_state", None)
+    if isinstance(entry, (tuple, list)) and len(entry) == 2 and torch.is_tensor(entry[0]) and torch.is_tensor(entry[1]):
+        return entry[0], entry[1]
+    return None
+
+
+def _to_legacy_cache(past_key_values: Optional[Union[LegacyCache, List[Any], Any]]) -> Optional[LegacyCache]:
+    if past_key_values is None:
+        return None
+
+    if isinstance(past_key_values, (tuple, list)):
+        entries = tuple(past_key_values)
+    else:
+        to_legacy = getattr(past_key_values, "to_legacy_cache", None)
+        if not callable(to_legacy):
+            return None
+        entries = tuple(to_legacy())
+
+    if len(entries) == 2 and torch.is_tensor(entries[0]) and torch.is_tensor(entries[1]):
+        return ((entries[0], entries[1]),)
+    return tuple(_normalize_cache_entry(entry) for entry in entries)
+
+
+def _has_past_tokens(past_key_values: Optional[Union[LegacyCache, List[Any], Any]]) -> bool:
+    cache = _to_legacy_cache(past_key_values)
+    if cache is None:
+        return False
+    for kv in cache:
+        if kv is not None and int(kv[0].shape[1]) > 0:
+            return True
+    return False
+
+
+def _silu(x):
+    return F.silu(x)
+
+
+
+# === 2. Core Network Components ===
+
+@dataclass
+class E2ETTTOutput:
+    logits: torch.Tensor
+    loss: Optional[torch.Tensor] = None
+    fast_weights: Optional[Dict[str, torch.Tensor]] = None
+
+
+class PrimeSwiGLU(nn.Module):
+    """SwiGLU branch whose weights can be overridden by fast weights."""
+
+    def __init__(self, config, name_prefix: str):
+        super().__init__()
+        self.name_prefix = name_prefix
+        self.w0 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.w1 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.w2 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.dropout = nn.Dropout(float(getattr(config, "resid_pdrop", 0.0)))
+
+    def fast_param_names(self) -> List[str]:
+        return [
+            f"{self.name_prefix}.w0.weight",
+            f"{self.name_prefix}.w1.weight",
+            f"{self.name_prefix}.w2.weight",
+        ]
+
+    def forward(self, x: torch.Tensor, fast: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+        if fast is None:
+            h1 = F.linear(x, self.w0.weight)
+            h2 = F.linear(x, self.w2.weight)
+            out = F.linear(_silu(h1) * h2, self.w1.weight)
+            return self.dropout(out)
+
+        w0 = fast.get(f"{self.name_prefix}.w0.weight", self.w0.weight)
+        w1 = fast.get(f"{self.name_prefix}.w1.weight", self.w1.weight)
+        w2 = fast.get(f"{self.name_prefix}.w2.weight", self.w2.weight)
+        
+        h1 = F.linear(x, w0)
+        h2 = F.linear(x, w2)
+        act = _silu(h1) * h2
+        out = F.linear(act, w1)
+
+        return self.dropout(out)
+
+
+
+
+
+
+
+
+
 class E2EBlock(nn.Module):
 
-    def __init__(self, config: E2ETTTConfig, layer_idx: int):
+    def __init__(self, config, layer_idx: int, is_suffix: bool):
         super().__init__()
-
         self.config = config
         self.layer_idx = layer_idx
+        self.is_suffix = bool(is_suffix) and bool(getattr(config, "use_e2e_ttt", False))
 
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
             config.hidden_size, eps=config.norm_eps
         )
-        self.attn = E2ESWIGLULayer(
-            hidden_size=config.hidden_size,
-            num_attn_heads=config.num_attn_heads,
-            num_e2e_heads=config.num_e2e_heads,
-            inter_multi=config.inter_multi,
-            window_size=config.window_size,
-            e2e_chunk_size=config.e2e_chunk_size,
-            qkv_bias=config.qkv_bias,
-            attn_qk_norm=config.attn_qk_norm,
-            qkv_silu=config.qkv_silu,
-            no_v_silu=config.no_v_silu,
-            lr_dim=config.lr_dim,
-            use_muon=config.use_muon,
-            ttt_prenorm=config.ttt_prenorm,
-            ttt_nope=config.ttt_nope,
-            lr_parameterization=config.lr_parameterization,
-            learnable_ttt_scale=config.learnable_ttt_scale,
-            rope_theta=config.rope_theta,
-            max_position_embeddings=config.max_position_embeddings,
-            layer_idx=layer_idx,
-            w0_w2_low_rank=config.w0_w2_low_rank,
-            use_momentum=config.use_momentum,
-            ttt_loss_type=config.ttt_loss_type,
-            fw_init_gain=config.fw_init_gain,
-            use_fused_kernel=config.use_fused_kernel,
-            fp32_states=config.fp32_states,
-        )
+        self.attn = E2ESWIGLULayer(config=config, layer_idx=layer_idx, is_suffix=is_suffix)
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
             config.hidden_size, eps=config.norm_eps
@@ -83,11 +157,25 @@ class E2EBlock(nn.Module):
             fuse_swiglu=config.fuse_swiglu,
         )
 
+        self.prime_mlp_norm: Optional[nn.Module] = None
+        self.prime_mlp: Optional[PrimeSwiGLU] = None
+        if self.is_suffix and bool(getattr(config, "two_mlp_per_block", True)):
+            self.prime_mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
+                config.hidden_size, eps=config.norm_eps
+            )
+            self.prime_mlp = PrimeSwiGLU(config, name_prefix=f"layers.{layer_idx}.prime_mlp")
+
+    def prime_param_names(self) -> List[str]:
+        if self.prime_mlp is None:
+            return []
+        return self.prime_mlp.fast_param_names()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
+        fast: Optional[Dict[str, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[LegacyCache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         **kwargs: Unpack[Any],
@@ -105,6 +193,18 @@ class E2EBlock(nn.Module):
             output_attentions=output_attentions,
             **kwargs,
         )
+
+        if self.prime_mlp is not None and fast is not None:
+            if self.config.fuse_norm:
+                p_in, _ = self.prime_mlp_norm(hidden_states, residual, True)
+            else:
+                hidden_states = residual + hidden_states
+                residual = hidden_states
+                p_in = self.prime_mlp_norm(hidden_states)
+            p = self.prime_mlp(p_in, fast=fast)
+            hidden_states = residual + p
+
+
         if self.config.fuse_norm:
             hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
         else:
@@ -131,7 +231,7 @@ class E2EPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["E2EBlock"]
-    _supports_cache_class = True
+    _supports_cache_class = False
 
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
@@ -177,26 +277,17 @@ class E2EPreTrainedModel(PreTrainedModel):
                     )
 
         if isinstance(module, E2ESWIGLULayer):
-            #### Initialize the parameters of the model
-            nn.init.ones_(module.qk_scale)
-            nn.init.zeros_(module.qk_offset)
-
-            logger.info(
-                f"in PreTrainedModel initialize fast weights for E2ESWIGLULayer"
-            )
-            # init w0, w1, w2
-            if module.w0_w2_low_rank > 0:
-                module.w0._init_weights()
-                module.w2._init_weights()
-            else:
-                nn.init.normal_(
-                    module.w0, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
-                )
-                nn.init.normal_(
-                    module.w2, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
-                )
-
-            nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
+            # Keep layer-specific init resilient to implementation variants.
+            if hasattr(module, "qk_scale"):
+                nn.init.ones_(module.qk_scale)
+            if hasattr(module, "qk_offset"):
+                nn.init.zeros_(module.qk_offset)
+            if hasattr(module, "w0") and isinstance(module.w0, torch.Tensor):
+                nn.init.normal_(module.w0, mean=0.0, std=0.02)
+            if hasattr(module, "w2") and isinstance(module.w2, torch.Tensor):
+                nn.init.normal_(module.w2, mean=0.0, std=0.02)
+            if hasattr(module, "w1") and isinstance(module.w1, torch.Tensor):
+                nn.init.normal_(module.w1, mean=0.0, std=0.02)
 
 
 class E2EModel(E2EPreTrainedModel):
@@ -205,14 +296,16 @@ class E2EModel(E2EPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        suffix_start = int(config.num_hidden_layers - config.suffix_len)
+        self.suffix_start = max(0, suffix_start)
 
         self.embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
             [
-                E2EBlock(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
+                E2EBlock(config, layer_idx=i, is_suffix=(i >= self.suffix_start))
+                for i in range(config.num_hidden_layers)
             ]
         )
         # for flame, full act_ckpt will throw error if we fuse the last layer norm,
@@ -221,20 +314,43 @@ class E2EModel(E2EPreTrainedModel):
         )
 
         self.gradient_checkpointing = False
-
         self.post_init()
+
 
     def get_input_embeddings(self):
         return self.embeddings
 
     def set_input_embeddings(self, value):
         self.embeddings = value
+    ### get fast weight #################################################################################
+    def _collect_prime_params(self) -> List[str]:
+        names: List[str] = []
+        for layer in self.layers:
+            names.extend(layer.prime_param_names())
+        return names
 
+    @staticmethod
+    def _canonical_param_name(name: str) -> str:
+        wrapper_segments = {"_orig_mod", "_fsdp_wrapped_module"}
+        return ".".join(part for part in name.split(".") if part not in wrapper_segments)
+
+    def init_fast_weights(self) -> Dict[str, torch.Tensor]:
+        prime_names = set(self._collect_prime_params())
+        if not prime_names:
+            return {}
+
+        fast: Dict[str, torch.Tensor] = {}
+        for name, p in self.named_parameters():
+            canonical_name = self._canonical_param_name(name)
+            if canonical_name in prime_names and canonical_name not in fast:
+                fast[canonical_name] = p
+        return fast
+        ##############################################################################
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[Union[LegacyCache, List[Any], Any]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -274,8 +390,9 @@ class E2EModel(E2EPreTrainedModel):
         elif input_ids is None and inputs_embeds is None:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        if use_cache and not isinstance(past_key_values, Cache):
-            past_key_values = Cache.from_legacy_cache(past_key_values)
+        cache_state = _to_legacy_cache(past_key_values)
+        if use_cache and cache_state is None:
+            cache_state = tuple()
 
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
@@ -303,7 +420,7 @@ class E2EModel(E2EPreTrainedModel):
                     layer.__call__,
                     hidden_states,
                     attention_mask,
-                    past_key_values,
+                    cache_state,
                     output_attentions,
                     use_cache,
                     **kwargs,
@@ -312,7 +429,7 @@ class E2EModel(E2EPreTrainedModel):
                 layer_outputs = layer(
                     hidden_states,
                     attention_mask=attention_mask,
-                    past_key_values=past_key_values,
+                    past_key_values=cache_state,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     **kwargs,
@@ -321,7 +438,8 @@ class E2EModel(E2EPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_cache = layer_outputs[2 if output_attentions else 1]
+                cache_state = layer_outputs[2 if output_attentions else 1]
+                next_cache = cache_state
 
             if output_attentions:
                 all_attns += (layer_outputs[1],)
@@ -345,7 +463,67 @@ class E2EModel(E2EPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_attns,
         )
+    
 
+
+    def forward_prefix_blocks(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+    ) -> torch.Tensor:
+        if self.suffix_start <= 0:
+            return x
+        for i in range(self.suffix_start):
+            layer = self.layers[i]
+            layer_outputs = layer(
+                x,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                use_cache=use_cache,
+                attn_backend_override="flash",
+            )
+            x = layer_outputs[0]
+        return x
+
+
+    
+    def forward_suffix_blocks(
+        self,
+        x: torch.Tensor,
+        fast: Optional[Dict[str, torch.Tensor]],
+        attention_mask: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        past_key_values: Optional[LegacyCache] = None,
+        *,
+        ttt_step_idx: Optional[int] = None,
+        ttt_num_steps: Optional[int] = None,
+        ttt_chunk_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[LegacyCache]]:
+        if self.suffix_start >= len(self.layers):
+            return  self.norm(x), tuple()
+
+        cache_state = _to_legacy_cache(past_key_values)
+        if use_cache and cache_state is None:
+            cache_state = tuple()
+        for i in range(self.suffix_start, len(self.layers)):
+            layer = self.layers[i]
+            layer_outputs = layer(
+                x,
+                fast=fast,
+                attention_mask=attention_mask,
+                use_cache=use_cache,
+                past_key_values=cache_state,
+                attn_backend_override="sdpa",
+                ttt_step_idx=ttt_step_idx,
+                ttt_num_steps=ttt_num_steps,
+                ttt_chunk_size=ttt_chunk_size,
+            )
+            x = layer_outputs[0]
+            if use_cache:
+                cache_state = layer_outputs[-1]
+        next_kvs = cache_state if use_cache else None
+        return  self.norm(x), next_kvs
 
 class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
 
@@ -357,9 +535,18 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.criterion = None
+        self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.register_buffer("_inner_update_step", torch.zeros((), dtype=torch.long), persistent=False)
+
+    @staticmethod
+    def _warn_once(msg: str):
+        if hasattr(logger, "warning_once"):
+            logger.warning_once(msg)
+        else:
+            logger.warning(msg)
 
     def get_input_embeddings(self):
         return self.model.embeddings
@@ -379,23 +566,113 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
+    @staticmethod
+    def _detach_past(
+        past_key_values: Optional[LegacyCache],
+    ) -> Optional[LegacyCache]:
+        if past_key_values is None:
+            return None
+        detached: List[Optional[LayerKV]] = []
+        for kv in past_key_values:
+            if kv is None:
+                detached.append(None)
+            else:
+                detached.append((kv[0].detach(), kv[1].detach()))
+        return tuple(detached)
+
+    def _resolve_inner_optimizer(self) -> Tuple[str, float, float]:
+        cfg = self.config
+        optimizer_type = "sgd"
+        lr = float(getattr(cfg, "inner_lr", 1e-3))
+        clip_gradient = 0.0
+
+        opt_cfg = getattr(cfg, "optimizer_inner", None)
+        if opt_cfg is not None:
+            if not isinstance(opt_cfg, dict):
+                try:
+                    opt_cfg = dict(opt_cfg)
+                except Exception:
+                    opt_cfg = None
+                    self._warn_once("optimizer_inner is not a dict-like object; fallback to inner_lr + SGD.")
+            if isinstance(opt_cfg, dict):
+                optimizer_type = str(opt_cfg.get("optimizer_type", "sgd")).lower()
+                lr = float(opt_cfg.get("lr", lr))
+                clip_gradient = float(opt_cfg.get("clip_gradient", 0.0))
+
+        if optimizer_type != "sgd":
+            self._warn_once(
+                f"optimizer_inner.optimizer_type={optimizer_type!r} is not implemented in v4; fallback to 'sgd'."
+            )
+            optimizer_type = "sgd"
+
+        return optimizer_type, lr, clip_gradient
+
+    def _compute_inner_lr(self, target_lr: float) -> float:
+        cfg = self.config
+        warmup_steps = int(getattr(cfg, "ilr_warmup_steps", 0))
+        if warmup_steps <= 0:
+            return target_lr
+
+        ilr_init = float(getattr(cfg, "ilr_init", target_lr))
+        step = int(self._inner_update_step.detach().item())
+        progress = min(1.0, float(step + 1) / float(warmup_steps))
+        return ilr_init + (target_lr - ilr_init) * progress
+
+    @staticmethod
+    def _clip_inner_grads(
+        grads: Tuple[Optional[torch.Tensor], ...],
+        max_norm: float,
+    ) -> Tuple[Tuple[Optional[torch.Tensor], ...], Optional[torch.Tensor]]:
+        if max_norm <= 0.0:
+            return grads, None
+
+        present_grads = [g for g in grads if g is not None]
+        if not present_grads:
+            return grads, None
+
+        grad_norms = [g.norm(2) for g in present_grads]
+        if len(grad_norms) == 1:
+            total_norm = grad_norms[0]
+        else:
+            total_norm = torch.linalg.vector_norm(torch.stack(grad_norms), ord=2)
+
+        scale = torch.clamp(
+            torch.as_tensor(max_norm, device=total_norm.device, dtype=total_norm.dtype) / (total_norm + 1e-6),
+            max=1.0,
+        )
+        clipped_grads = tuple(None if g is None else g * scale.to(dtype=g.dtype) for g in grads)
+        return clipped_grads, total_norm
+
+    def _causal_lm_loss(self, logits: torch.Tensor, labels: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if labels is None:
+            return None
+        if logits.size(1) < 2:
+            return logits.new_zeros(())
+
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        return self.loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+    
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.LongTensor = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Union[LegacyCache, List[Any], Any]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         use_cache: bool = True,
         logits_to_keep: Optional[int] = None,
         **kwargs,
     ):
-        use_cache = False
+        
         # only last token for `inputs_ids` if the `past_key_values` is not empty.
-        if past_key_values is not None and len(past_key_values) > 0 and use_cache:
+        if use_cache and _has_past_tokens(past_key_values):
             input_ids = input_ids[:, -1:]
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and len(past_key_values) == 0:
+        if inputs_embeds is not None and not _has_past_tokens(past_key_values):
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
@@ -409,7 +686,7 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
 
         model_inputs.update(
             {
-                "past_key_values": None,  # past_key_values,
+                "past_key_values": _to_legacy_cache(past_key_values),
                 "use_cache": use_cache,
                 "attention_mask": attention_mask,
             }
@@ -421,17 +698,18 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Union[LegacyCache, List[Any], Any]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        use_e2e_ttt: Optional[bool] = None,
         logits_to_keep: Optional[int] = 0,
         **kwargs: Unpack[Any],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        use_cache = False
+        use_cache = True
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -446,61 +724,271 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs,
-        )
-
-        hidden_states = outputs[0]
-        fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
-        logits = (
-            None
-            if fuse_linear_and_cross_entropy
-            else self.lm_head(hidden_states[:, -logits_to_keep:])
-        )
-
-        loss = None
-        if labels is not None:
-            if getattr(self, "criterion", None) is None:
-                if fuse_linear_and_cross_entropy:
-                    criterion = FusedLinearCrossEntropyLoss()
-                elif self.config.fuse_cross_entropy:
-                    criterion = FusedCrossEntropyLoss(inplace_backward=True)
-                else:
-                    criterion = nn.CrossEntropyLoss()
-            else:
-                criterion = self.criterion
-            # Enable model parallelism
-            labels = labels.to(hidden_states.device)
-            labels = torch.cat(
-                (
-                    labels[..., 1:],
-                    torch.full_like(labels[:, :1], criterion.ignore_index),
-                ),
-                1,
+        cfg = self.config
+        if use_e2e_ttt is None:
+            use_e2e_ttt = bool(getattr(cfg, "use_e2e_ttt", False))
+        debug_ttt_logs = bool(getattr(cfg, "debug_ttt_logs", False))
+        debug_ttt_log_every = max(1, int(getattr(cfg, "debug_ttt_log_every", 50)))
+        create_graph_for_inner = not bool(getattr(cfg, "detach_fast_weights", False))
+        inner_optimizer_type, inner_target_lr, inner_clip_gradient = self._resolve_inner_optimizer()
+        inner_steps = int(getattr(cfg, "inner_steps_per_chunk", 1))
+        if inner_steps != 1:
+            self._warn_once(
+                f"inner_steps_per_chunk={inner_steps} is not implemented in v4; forcing to 1."
             )
-            if fuse_linear_and_cross_entropy:
-                loss = criterion(
-                    hidden_states, labels, self.lm_head.weight, self.lm_head.bias
+            inner_steps = 1
+
+        run_e2e_ttt = bool(use_e2e_ttt) and labels is not None
+        outputs = None
+        if not run_e2e_ttt:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs,
+            )
+
+            hidden_states = outputs[0]
+            fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
+            logits = (
+                None
+                if fuse_linear_and_cross_entropy
+                else self.lm_head(hidden_states[:, -logits_to_keep:])
+            )
+
+            loss = None
+            if labels is not None:
+                if getattr(self, "criterion", None) is None:
+                    if fuse_linear_and_cross_entropy:
+                        criterion = FusedLinearCrossEntropyLoss()
+                    elif self.config.fuse_cross_entropy:
+                        criterion = FusedCrossEntropyLoss(inplace_backward=True)
+                    else:
+                        criterion = nn.CrossEntropyLoss()
+                else:
+                    criterion = self.criterion
+                # Enable model parallelism
+                labels = labels.to(hidden_states.device)
+                labels = torch.cat(
+                    (
+                        labels[..., 1:],
+                        torch.full_like(labels[:, :1], criterion.ignore_index),
+                    ),
+                    1,
                 )
+                if fuse_linear_and_cross_entropy:
+                    loss = criterion(
+                        hidden_states, labels, self.lm_head.weight, self.lm_head.bias
+                    )
+                else:
+                    loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
+
+                    
+        else:
+            if input_ids is not None and inputs_embeds is not None:
+                raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            if input_ids is None and inputs_embeds is None:
+                raise ValueError("You must specify either input_ids or inputs_embeds")
+
+            x = self.model.embeddings(input_ids) if inputs_embeds is None else inputs_embeds
+            total_seq_len = x.size(1)
+            effective_seq_len = max(total_seq_len - 1, 0)
+            bsz = x.size(0)
+            labels = labels.to(x.device)
+            total_loss_sum = x.new_zeros(())
+            total_valid_tokens = x.new_zeros(())
+            suffix_past = _to_legacy_cache(past_key_values)
+            if use_cache and suffix_past is None:
+                suffix_past = tuple()
+            logits = x.new_zeros((bsz, 0, self.lm_head.out_features))
+            chunk = int(cfg.mini_batch_size)
+            if chunk <= 0:
+                raise ValueError("mini_batch_size must be > 0")
+
+            fast = self.model.init_fast_weights()
+            prime_keys = list(fast.keys())
+
+            steps = math.ceil(effective_seq_len / chunk) if effective_seq_len > 0 else 0
+
+
+            prefix_output = self.model.forward_prefix_blocks(
+                x,
+                attention_mask=attention_mask,
+                use_cache=use_cache,
+            )
+            if debug_ttt_logs:
+                suffix_layers = len(self.model.layers) - int(self.model.suffix_start)
+                suffix_layers_with_prime = sum(
+                    int(getattr(layer, "prime_mlp", None) is not None)
+                    for layer in self.model.layers[self.model.suffix_start :]
+                )
+                self._warn_once(
+                    "[TTT-DEBUG] e2e_ttt on: "
+                    f"suffix_start={self.model.suffix_start}, "
+                    f"suffix_layers={suffix_layers}, "
+                    f"suffix_layers_with_prime_mlp={suffix_layers_with_prime}, "
+                    f"prime_keys={len(prime_keys)}, "
+                    f"create_graph={create_graph_for_inner}, "
+                    f"detach_fast_weights={bool(getattr(cfg, 'detach_fast_weights', False))}, "
+                    f"chunk_size={chunk}, steps={steps}"
+                )
+                if not prime_keys:
+                    logger.warning(
+                        "[TTT-DEBUG] prime_keys is empty. Inner-loop updates for prime MLP are skipped."
+                    )
+                    
+            all_logits_list = []
+            for i in range(steps):
+                s = i * chunk
+                e = min((i + 1) * chunk, effective_seq_len)
+                if e <= s:
+                    continue
+
+                x_chunk = prefix_output[:, s:e, :]
+                y_chunk = labels[:, s + 1 : e + 1]
+                mask_chunk = attention_mask[:, :e] if attention_mask is not None else None
+                h_chunk, suffix_past = self.model.forward_suffix_blocks(
+                    x_chunk,
+                    fast=fast,
+                    attention_mask=mask_chunk,
+                    use_cache=use_cache,
+                    past_key_values=suffix_past,
+                    ttt_step_idx=i,
+                    ttt_num_steps=steps,
+                    ttt_chunk_size=chunk,
+                )
+                chunk_logits = self.lm_head(h_chunk)
+                    
+                if logits_to_keep > 0:
+                    all_logits_list.append(chunk_logits.detach().to("cpu", non_blocking=True))
+
+                valid_mask = y_chunk.ne(-100)
+                valid_count = valid_mask.sum() 
+                total_valid_tokens = total_valid_tokens + valid_count
+
+                safe_valid_count = valid_count.clamp(min=1).float()
+
+                flat_logits = chunk_logits.reshape(-1, chunk_logits.size(-1))
+                flat_labels = y_chunk.reshape(-1)
+                
+                chunk_loss_sum = F.cross_entropy(
+                    flat_logits,
+                    flat_labels,
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+
+                total_loss_sum = total_loss_sum + chunk_loss_sum
+
+                loss_i = chunk_loss_sum / safe_valid_count
+
+                loss_i = torch.where(valid_count > 0, loss_i, loss_i.new_zeros(()))
+                should_log_chunk = debug_ttt_logs and (i % debug_ttt_log_every == 0 or i == (steps - 1))
+                if should_log_chunk:
+                    logger.warning(
+                        "[TTT-DEBUG] chunk=%d/%d token_span=[%d,%d) valid_tokens=%d suffix_past=%s",
+                        i + 1,
+                        steps,
+                        s,
+                        e,
+                        int(valid_count.detach().item()),
+                        "yes" if suffix_past is not None else "no",
+                    )
+
+                if not prime_keys:
+                    continue
+                for _ in range(inner_steps):
+                    fast_params = [fast[k] for k in prime_keys]
+                    loss_for_inner = loss_i
+                    grads = torch.autograd.grad(
+                        loss_for_inner,
+                        fast_params,
+                        create_graph=create_graph_for_inner,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    if should_log_chunk:
+                        grad_present = sum(1 for g in grads if g is not None)
+                        grad_require_graph = sum(1 for g in grads if (g is not None and g.requires_grad))
+                        sample = ", ".join(
+                            f"{name.split('.')[-3]}.{name.split('.')[-2]}.{name.split('.')[-1]}="
+                            f"{'none' if g is None else ('rg1' if g.requires_grad else 'rg0')}"
+                            for name, g in zip(prime_keys[:6], grads[:6])
+                        )
+                        logger.warning(
+                            "[TTT-DEBUG] prime_grad chunk=%d present=%d/%d require_grad=%d/%d "
+                            "second_order_ready=%s create_graph=%s sample=[%s]",
+                            i + 1,
+                            grad_present,
+                            len(grads),
+                            grad_require_graph,
+                            len(grads),
+                            grad_require_graph > 0,
+                            create_graph_for_inner,
+                            sample,
+                        )
+
+                    lr = self._compute_inner_lr(inner_target_lr)
+                    grads, grad_norm = self._clip_inner_grads(grads, inner_clip_gradient)
+                    if should_log_chunk:
+                        logger.warning(
+                            "[TTT-DEBUG] inner_opt chunk=%d type=%s lr=%.6g ilr_init=%.6g warmup_steps=%d "
+                            "clip_gradient=%.6g grad_norm=%s inner_step=%d",
+                            i + 1,
+                            inner_optimizer_type,
+                            lr,
+                            float(getattr(cfg, "ilr_init", inner_target_lr)),
+                            int(getattr(cfg, "ilr_warmup_steps", 0)),
+                            inner_clip_gradient,
+                            "none" if grad_norm is None else f"{float(grad_norm.detach().item()):.6g}",
+                            int(self._inner_update_step.detach().item()),
+                        )
+
+                    updated: Dict[str, torch.Tensor] = {}
+                    for k, w, g in zip(prime_keys, fast_params, grads):
+                        if g is None:
+                            updated[k] = w
+                        else:
+                            updated[k] = w - lr * g
+                    fast = {**fast, **updated}
+                    with torch.no_grad():
+                        self._inner_update_step.add_(1)
+
+                    if bool(getattr(cfg, "detach_fast_weights", False)):
+                        suffix_past = self._detach_past(suffix_past)
+
+            if len(all_logits_list) > 0:
+                logits_full = torch.cat(all_logits_list, dim=1)
             else:
-                loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
+                logits_full = logits
+                
+            if labels is None and logits_to_keep is not None and logits_to_keep > 0:
+                logits = logits_full[:, -logits_to_keep:]
+            else:
+                logits = logits_full
+
+            if total_valid_tokens > 0:
+                # Divide by the tensor directly to keep it in the graph/device
+                loss = total_loss_sum / total_valid_tokens.float()
+            else:
+                loss = total_loss_sum.new_zeros(()).requires_grad_(True)
 
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            if outputs is None:
+                output = (logits, suffix_past)
+            else:
+                output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            past_key_values=suffix_past if outputs is None else outputs.past_key_values,
+            hidden_states=None if outputs is None else outputs.hidden_states,
+            attentions=None if outputs is None else outputs.attentions,
         )
