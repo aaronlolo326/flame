@@ -377,7 +377,7 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = {"lm_head.weight": "model.embeddings.weight"} # ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, *args, **kwargs):
         super().__init__(config)
         self.model = LaCTModel(config)
         self.vocab_size = config.vocab_size

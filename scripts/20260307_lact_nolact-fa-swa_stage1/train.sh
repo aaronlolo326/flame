@@ -22,8 +22,8 @@ fi
 echo $RUN_NAME
 
 
-batch_size=1
-grad_accum=4
+batch_size=2
+grad_accum=2
 no_tokens=$(( 100 * 10**9 ))
 seed=42
 
@@ -88,7 +88,7 @@ NNODE=${NNODE} NGPU=${NGPU} LOG_RANK=${local_rank} bash train.sh \
   --training.data_parallel_shard_degree -1 \
   --training.tensor_parallel_degree 1 \
   --checkpoint.enable_checkpoint \
-  --checkpoint.folder checkpoints \
+  --checkpoint.folder checkpoint \
   --checkpoint.interval ${interval} \
   --checkpoint.export_dtype float32 \
   --checkpoint.async_mode disabled \
@@ -117,3 +117,13 @@ NNODE=${NNODE} NGPU=${NGPU} LOG_RANK=${local_rank} bash train.sh \
    # --training.dataset arrow \
   # --training.dataset_split train \
   # --training.data_dir /nfs-export/hei/.cache/huggingface/datasets/HuggingFaceFW___fineweb-edu/sample-350BT \
+
+
+if [ ${local_rank} -eq 0 ]; then
+    echo "Converting the DCP checkpoints to HF format..."
+    python -m flame.utils.convert_dcp_to_hf \
+      --path $dump_folder \
+      --step $steps \
+      --config $MODEL_CONFIG_PATH \
+      --tokenizer $TOKENIZER_PATH
+fi

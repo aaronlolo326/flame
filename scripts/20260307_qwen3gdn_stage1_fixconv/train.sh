@@ -88,7 +88,7 @@ NNODE=${NNODE} NGPU=${NGPU} LOG_RANK=${local_rank} bash train.sh \
   --training.data_parallel_shard_degree -1 \
   --training.tensor_parallel_degree 1 \
   --checkpoint.enable_checkpoint \
-  --checkpoint.folder checkpoints \
+  --checkpoint.folder checkpoint \
   --checkpoint.interval ${interval} \
   --checkpoint.export_dtype float32 \
   --checkpoint.async_mode disabled \

@@ -3,12 +3,12 @@ source "$(dirname "$0")/vars.sh"
 # source $(conda info --base)/etc/profile.d/conda.sh
 # conda activate base+
 
-python plot.py \
+python gen_results_csv.py \
     --data_set lm \
     --run_name ${RUN_NAME}
-python plot.py \
+python gen_results_csv.py \
     --data_set lb \
     --run_name ${RUN_NAME}
-python plot.py \
+python pgen_results_csvy \
     --data_set niah \
     --run_name ${RUN_NAME}

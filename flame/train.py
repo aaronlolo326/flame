@@ -37,6 +37,7 @@ from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
 
+import custom_models
 # torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
@@ -64,16 +65,16 @@ def main(job_config: JobConfig):
 
     # torch.cuda.memory._record_memory_history(max_entries=100000)
 
-    # get model_type attr from the json file at job_config.model.config, and import
-    import json
-    with open(job_config.model.config, "r") as f:
-        model_json = json.load(f)
-        model_type = model_json.get("model_type")
-        layer_types = model_json.get("layer_types")
-    from custom_models import MODEL_TYPE_TO_PARENT_DIR
-    parent_dir = MODEL_TYPE_TO_PARENT_DIR[model_type]
-    import importlib
-    importlib.import_module(f"custom_models.{parent_dir}")
+    # # get model_type attr from the json file at job_config.model.config, and import
+    # import json
+    # with open(job_config.model.config, "r") as f:
+    #     model_json = json.load(f)
+    #     model_type = model_json.get("model_type")
+    #     layer_types = model_json.get("layer_types")
+    # from custom_models import MODEL_TYPE_TO_PARENT_DIR
+    # parent_dir = MODEL_TYPE_TO_PARENT_DIR[model_type]
+    # import importlib
+    # importlib.import_module(f"custom_models.{parent_dir}")
 
 
     logger.info(f"Starting job: {job_config.job.description}")
