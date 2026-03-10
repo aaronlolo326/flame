@@ -9,6 +9,6 @@ python gen_results_csv.py \
 python gen_results_csv.py \
     --data_set lb \
     --run_name ${RUN_NAME}
-python pgen_results_csvy \
+python gen_results_csv.py \
     --data_set niah \
     --run_name ${RUN_NAME}

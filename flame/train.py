@@ -75,6 +75,8 @@ def main(job_config: JobConfig):
     # parent_dir = MODEL_TYPE_TO_PARENT_DIR[model_type]
     # import importlib
     # importlib.import_module(f"custom_models.{parent_dir}")
+    model_type=None
+    layer_types=None
 
 
     logger.info(f"Starting job: {job_config.job.description}")

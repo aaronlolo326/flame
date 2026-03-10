@@ -18,7 +18,7 @@ base_model_hfac="Qwen"
 base_model_name="Qwen3-1.7B-Base"
 TOKENIZER_PATH="${base_model_hfac}/${base_model_name}"
 
-lm_eval_output_path="/storage/backup/${USERNAME}}/ttt/flame/results/${RUN_NAME}"
+lm_eval_output_path="/storage/backup/${USERNAME}/ttt/flame/results/${RUN_NAME}"
 dump_folder=/storage/backup/${USERNAME}/ttt/flame/exp/${RUN_NAME}
 
 seq_len=16384

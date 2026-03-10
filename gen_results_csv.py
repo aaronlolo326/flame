@@ -27,7 +27,7 @@ pretrained_models = [
 
 def load_data(run_name, data_set):
     results_dir = os.path.join(RESULTS_ROOT, run_name, data_set)
-    results_files = glob.glob(os.path.join(results_dir, "results*.json"))
+    results_files = glob.glob(os.path.join(results_dir, "*", "results*.json"))
     if len(results_files) != 1:
         raise FileNotFoundError(f"Expected exactly one results*.json file in {results_dir}, found {len(results_files)}: {results_files}")
     results_path = results_files[0]
