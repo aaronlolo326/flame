@@ -39,7 +39,7 @@
     "attn_qk_norm": false,
     "qkv_silu": true,
     "lact_chunk_size": 2048,
-    "window_size": 16384,
+    "window_size": 8192,
     "use_muon": true,
     "lr_dim": 1,
     "lr_parameterization": "mamba",
