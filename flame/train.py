@@ -323,7 +323,8 @@ def main(job_config: JobConfig):
                 for idx, layer_type in enumerate(layer_types)
                 if layer_type == 'linear_attention'
             }
-        train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config, ignored_params=ignored_params)
+        # train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config, ignored_params=ignored_params)
+        train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config)
         model.to_empty(device=init_device)
         with torch.no_grad():
             model.post_init()
@@ -526,6 +527,12 @@ def main(job_config: JobConfig):
     logger.info(
         f"{color.green}  Number of embedding parameters = {nparams_embedding:,} {color.reset}"
     )
+    if model_config.tie_word_embeddings:
+        logger.info("Model ties input and output word embeddings, so")
+        logger.info(f"Number of distinct parameters = {model_param_count - nparams_embedding:,}")
+    else:
+        logger.info(f"Model does not tie input and output word embeddings, so the number of unique model parameters is the above.")
+    
 
     with (
         maybe_enable_profiling(
