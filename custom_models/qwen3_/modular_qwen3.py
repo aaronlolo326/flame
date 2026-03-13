@@ -17,17 +17,17 @@ from collections.abc import Callable
 
 import torch
 
-from ...cache_utils import Cache
-from ...modeling_flash_attention_utils import FlashAttentionKwargs
-from ...modeling_outputs import CausalLMOutputWithPast
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
-from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, logging
-from ..gemma.modeling_gemma import GemmaMLP
-from ..llama.modeling_llama import (
+from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, logging
+from transformers.models.gemma.modeling_gemma import GemmaMLP
+from transformers.models.llama.modeling_llama import (
     LlamaAttention,
 )
-from ..qwen2.modeling_qwen2 import (
+from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2ForCausalLM,
     Qwen2ForQuestionAnswering,
     Qwen2ForSequenceClassification,
@@ -89,9 +89,9 @@ class Qwen3Attention(LlamaAttention):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,

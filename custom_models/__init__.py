@@ -4,4 +4,5 @@
 # }
 
 from .lact_model import *
+from .qwen3_ import *
 # from .qwen3_gdn import *
