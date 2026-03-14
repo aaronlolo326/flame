@@ -56,6 +56,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--use-fused-lact-kernel", action="store_true")
     parser.add_argument(
+        "--result-model-name",
+        default=None,
+        help=(
+            "Optional alias recorded in result rows instead of the source model key. "
+            "Only valid when benchmarking exactly one model."
+        ),
+    )
+    parser.add_argument(
         "--stop-after-oom",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -73,6 +81,8 @@ def main() -> None:
     import torch
 
     args = parse_args()
+    if args.result_model_name is not None and len(args.models) != 1:
+        raise ValueError("--result-model-name can only be used when exactly one model is selected.")
     rows: list[BenchmarkRow] = []
     device = args.device
     output_csv = args.output_prefix.with_suffix(".csv")
@@ -92,12 +102,13 @@ def main() -> None:
 
     try:
         for model_key in args.models:
+            output_model_key = args.result_model_name or model_key
             stop_model = False
             for seq_len in args.seq_lens:
                 if stop_model:
                     row = BenchmarkRow(
                         benchmark="whole_model_train",
-                        model=model_key,
+                        model=output_model_key,
                         runtime_env=args.runtime_env,
                         seq_len=seq_len,
                         batch_size=args.batch_size,
@@ -116,10 +127,10 @@ def main() -> None:
                     rows.append(row)
                     append_row_jsonl(output_jsonl, row)
                     write_rows_csv(output_csv, rows)
-                    log(f"[skip] model={model_key} seq_len={seq_len} reason=previous_oom")
+                    log(f"[skip] model={output_model_key} seq_len={seq_len} reason=previous_oom")
                     continue
                 log(
-                    f"[build] model={model_key} seq_len={seq_len} local_batch={args.batch_size} "
+                    f"[build] model={output_model_key} seq_len={seq_len} local_batch={args.batch_size} "
                     f"chunk={args.lact_chunk_size or 'config'} window={args.sliding_window or 'config'}"
                 )
                 try:
@@ -141,7 +152,7 @@ def main() -> None:
                     input_ids = torch.randint(vocab_size, (args.batch_size, seq_len), device=device)
                     labels = input_ids.clone()
                     log(
-                        f"[warmup] model={model_key} seq_len={seq_len} "
+                        f"[warmup] model={output_model_key} seq_len={seq_len} "
                         f"warmup_steps={args.warmup_steps} timed_steps={args.steps}"
                     )
 
@@ -192,7 +203,7 @@ def main() -> None:
                     )
                     row = BenchmarkRow(
                         benchmark="whole_model_train",
-                        model=model_key,
+                        model=output_model_key,
                         runtime_env=args.runtime_env,
                         seq_len=seq_len,
                         batch_size=args.batch_size,
@@ -207,6 +218,7 @@ def main() -> None:
                         peak_memory_gb=peak_gb,
                         status="ok",
                         notes=(
+                            f"source_model={model_key}; "
                             f"local_batch_size={args.batch_size}; "
                             f"num_attn_heads={args.num_attn_heads}; "
                             f"num_lact_heads={args.num_lact_heads}; "
@@ -219,7 +231,7 @@ def main() -> None:
                     append_row_jsonl(output_jsonl, row)
                     write_rows_csv(output_csv, rows)
                     log(
-                        f"[done] model={model_key} seq_len={seq_len} status=ok "
+                        f"[done] model={output_model_key} seq_len={seq_len} status=ok "
                         f"step_ms={step_ms:.2f} tokens/s={row.tokens_per_second:.2f} "
                         f"peak_gb={peak_gb:.2f}"
                     )
@@ -231,7 +243,7 @@ def main() -> None:
                     status = "oom" if "out of memory" in str(exc).lower() else "error"
                     row = BenchmarkRow(
                         benchmark="whole_model_train",
-                        model=model_key,
+                        model=output_model_key,
                         runtime_env=args.runtime_env,
                         seq_len=seq_len,
                         batch_size=args.batch_size,
@@ -245,12 +257,12 @@ def main() -> None:
                         tokens_per_second=0.0,
                         peak_memory_gb=0.0,
                         status=status,
-                        notes=str(exc),
+                        notes=f"source_model={model_key}; {exc}",
                     )
                     rows.append(row)
                     append_row_jsonl(output_jsonl, row)
                     write_rows_csv(output_csv, rows)
-                    log(f"[done] model={model_key} seq_len={seq_len} status={status} error={exc}")
+                    log(f"[done] model={output_model_key} seq_len={seq_len} status={status} error={exc}")
                     if status == "oom" and args.stop_after_oom:
                         stop_model = True
                     if "cuda" in device:

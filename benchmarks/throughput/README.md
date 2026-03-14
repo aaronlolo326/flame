@@ -3,6 +3,7 @@
 This folder is a draft benchmark framework for comparing LaCT against three user-requested baselines on a single GPU.
 
 - `lact`: LaCT layer + sliding-window flash attention from `flame/custom_models/lact_model`
+- `e2e_ttt`: E2E-TTT backbone from `flame/custom_models/ttt_e2_lact_backbone`
 - `hybrid_lact`: 75% LaCT blocks + 25% full-attention blocks (benchmark-only mixed stack)
 - `full_attention`: full-attention Qwen3 with `flash_attention_2`
 - `hybrid_swa`: 75% sliding-window attention + 25% full attention
@@ -52,7 +53,7 @@ From `/work/yufei/projects/flame`:
 
 ```bash
 python -m benchmarks.throughput.whole_model \
-  --models lact hybrid_lact full_attention hybrid_swa hybrid_gdn \
+  --models lact e2e_ttt hybrid_lact full_attention hybrid_swa hybrid_gdn \
   --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
   --lact-chunk-size 2048 \
   --sliding-window 2048 \
@@ -126,7 +127,7 @@ The same split-env pattern works for whole-model throughput if `hybrid_gdn` need
 
 ```bash
 python -m benchmarks.throughput.whole_model \
-  --models lact full_attention hybrid_swa \
+  --models lact e2e_ttt hybrid_lact full_attention hybrid_swa \
   --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
   --lact-chunk-size 2048 \
   --sliding-window 2048 \
@@ -157,6 +158,29 @@ python -m benchmarks.throughput.whole_model \
 python -m benchmarks.throughput.merge_results \
   --inputs benchmarks/throughput/results/whole-model-main.csv \
            benchmarks/throughput/results/whole-model-gdn.csv \
+  --output-prefix benchmarks/throughput/results/whole-model-merged
+```
+
+To benchmark only the E2E-TTT model and merge it into an existing merged whole-model file:
+
+```bash
+python -m benchmarks.throughput.whole_model \
+  --models e2e_ttt \
+  --seq-lens 4096 8192 16384 32768 65536 131072 262144 524288 1048576 \
+  --batch-size 1 \
+  --steps 10 \
+  --warmup-steps 3 \
+  --dtype bfloat16 \
+  --device cuda \
+  --runtime-env nm-dev \
+  --output-prefix benchmarks/throughput/results/whole-model-e2e-ttt
+```
+
+```bash
+python -m benchmarks.throughput.merge_results \
+  --inputs benchmarks/throughput/results/whole-model-merged.csv \
+           benchmarks/throughput/results/whole-model-e2e-ttt.csv \
+  --dedupe-by benchmark model runtime_env seq_len batch_size \
   --output-prefix benchmarks/throughput/results/whole-model-merged
 ```
 

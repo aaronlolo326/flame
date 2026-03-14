@@ -8,6 +8,7 @@ from pathlib import Path
 
 MODEL_ORDER = [
     "lact",
+    "e2e_ttt",
     "hybrid_lact",
     "full_attention",
     "hybrid_swa",
@@ -16,6 +17,7 @@ MODEL_ORDER = [
 
 MODEL_LABELS = {
     "lact": "LaCT",
+    "e2e_ttt": "E2E-TTT",
     "hybrid_lact": "75% LaCT + 25% FA",
     "full_attention": "Full Attention",
     "hybrid_swa": "75% SWA + 25% FA",

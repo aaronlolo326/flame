@@ -134,8 +134,47 @@ def main() -> None:
         "lact_subconfig": lact_cfg,
     }
 
+    e2e_ttt_cfg = {
+        "model_type": "e2e_ttt",
+        "label": "E2E-TTT",
+        "vocab_size": cfg["vocab_size"],
+        "hidden_size": cfg["hidden_size"],
+        "num_hidden_layers": cfg["num_hidden_layers"],
+        "num_attention_heads": cfg["num_attn_heads"],
+        "intermediate_size": cfg.get("intermediate_size", cfg["hidden_size"] * 4),
+        "hidden_act": cfg.get("hidden_act", "swish"),
+        "rms_norm_eps": cfg.get("norm_eps", 1e-6),
+        "norm_eps": cfg.get("norm_eps", 1e-6),
+        "initializer_range": cfg.get("initializer_range", 0.02),
+        "max_position_embeddings": max(args.seq_len, int(cfg.get("max_position_embeddings", args.seq_len))),
+        "rope_theta": cfg.get("rope_theta", 10_000.0),
+        "window_size": window_size,
+        "use_e2e_ttt": True,
+        "suffix_frac": 0.25,
+        "suffix_len": max(1, int(round(num_layers * 0.25))),
+        "mini_batch_size": chunk_size,
+        "optimizer_inner": {
+            "optimizer_type": "sgd",
+            "lr": 1e-3,
+            "clip_gradient": 0.0,
+        },
+        "inner_steps_per_chunk": 1,
+        "ttt_mlp_only": True,
+        "two_mlp_per_block": True,
+        "detach_fast_weights": False,
+        "inner_param_filter": "prime_mlp",
+        "attn_backend": "flash",
+        "fuse_cross_entropy": True,
+        "fuse_norm": True,
+        "last_layer_fuse_norm": True,
+        "fuse_swiglu": True,
+        "hidden_ratio": 4,
+        "use_cache": False,
+    }
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dump_json(args.output_dir / "lact.json", lact_cfg)
+    dump_json(args.output_dir / "e2e_ttt.json", e2e_ttt_cfg)
     dump_json(args.output_dir / "hybrid_lact.json", hybrid_lact_cfg)
     dump_json(args.output_dir / "full_attention.json", full_attention_cfg)
     dump_json(args.output_dir / "hybrid_swa.json", hybrid_swa_cfg)
@@ -155,6 +194,7 @@ def main() -> None:
         "gdn_reference": QWEN35_2B_BASE_GDN,
         "written_files": [
             "lact.json",
+            "e2e_ttt.json",
             "hybrid_lact.json",
             "full_attention.json",
             "hybrid_swa.json",

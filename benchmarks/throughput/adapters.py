@@ -27,6 +27,7 @@ class ModelSpec:
 
 MODEL_SPECS = {
     "lact": ModelSpec("lact", "LaCT", "lact"),
+    "e2e_ttt": ModelSpec("e2e_ttt", "E2E-TTT", "e2e_ttt"),
     "hybrid_lact": ModelSpec("hybrid_lact", "75% LaCT + 25% FA", "hybrid_lact"),
     "full_attention": ModelSpec("full_attention", "Full Attention (FlashAttention)", "qwen3_swa"),
     "hybrid_swa": ModelSpec("hybrid_swa", "75% SWA + 25% FA", "qwen3_swa"),
@@ -287,6 +288,15 @@ def import_lact_modules() -> tuple[type, type, type]:
     return LaCTSWIGLUConfig, LaCTForCausalLM, LaCTSWIGLULayer
 
 
+def import_e2e_ttt_modules() -> tuple[type, type]:
+    with prepend_sys_path(FLAME_ROOT):
+        import custom_models  # noqa: F401
+        from custom_models.ttt_e2_lact_backbone.configuration_ttt_e2e import E2ETTTConfig
+        from custom_models.ttt_e2_lact_backbone.modeling_ttt_e2e import E2EForCausalLM
+
+    return E2ETTTConfig, E2EForCausalLM
+
+
 def resolve_dtype(torch_module: Any, dtype_name: str):
     normalized = str(dtype_name).replace("torch.", "")
     mapping = {
@@ -363,6 +373,55 @@ def build_whole_model(
             )
         if use_fused_kernel is not None:
             config_kwargs["use_fused_kernel"] = use_fused_kernel
+        config = config_cls(**config_kwargs)
+        model = model_cls(config)
+    elif model_key == "e2e_ttt":
+        config_cls, model_cls = import_e2e_ttt_modules()
+        hidden_size = int(base_cfg_for_model["hidden_size"])
+        num_heads = int(base_cfg_for_model.get("num_attn_heads", base_cfg_for_model.get("num_heads")))
+        if hidden_size % num_heads != 0:
+            raise ValueError(
+                f"Invalid num_attn_heads={num_heads} for hidden_size={hidden_size}. "
+                "hidden_size must be divisible by num_attn_heads."
+            )
+        config_kwargs = {
+            "vocab_size": int(base_cfg_for_model["vocab_size"]),
+            "bos_token_id": base_cfg_for_model.get("bos_token_id", 1),
+            "eos_token_id": base_cfg_for_model.get("eos_token_id", 2),
+            "pad_token_id": base_cfg_for_model.get("pad_token_id"),
+            "tie_word_embeddings": bool(base_cfg_for_model.get("tie_word_embeddings", False)),
+            "hidden_size": hidden_size,
+            "num_hidden_layers": int(base_cfg_for_model["num_hidden_layers"]),
+            "num_attention_heads": num_heads,
+            "intermediate_size": int(base_cfg_for_model.get("intermediate_size", hidden_size * 4)),
+            "hidden_act": str(base_cfg_for_model.get("hidden_act", "swish")),
+            "rms_norm_eps": float(base_cfg_for_model.get("norm_eps", 1e-6)),
+            "norm_eps": float(base_cfg_for_model.get("norm_eps", 1e-6)),
+            "initializer_range": float(base_cfg_for_model.get("initializer_range", 0.02)),
+            "max_position_embeddings": max(seq_len, int(base_cfg_for_model.get("max_position_embeddings", seq_len))),
+            "rope_theta": float(base_cfg_for_model.get("rope_theta", 10_000.0)),
+            "window_size": int(window_size),
+            "use_e2e_ttt": True,
+            "suffix_frac": 0.25,
+            "mini_batch_size": int(chunk_size),
+            "optimizer_inner": {
+                "optimizer_type": "sgd",
+                "lr": 1e-3,
+                "clip_gradient": 0.0,
+            },
+            "inner_steps_per_chunk": 1,
+            "ttt_mlp_only": True,
+            "two_mlp_per_block": True,
+            "detach_fast_weights": False,
+            "inner_param_filter": "prime_mlp",
+            "attn_backend": "flash",
+            "fuse_cross_entropy": True,
+            "fuse_norm": True,
+            "last_layer_fuse_norm": True,
+            "fuse_swiglu": True,
+            "hidden_ratio": 4,
+            "use_cache": False,
+        }
         config = config_cls(**config_kwargs)
         model = model_cls(config)
     elif model_key == "hybrid_lact":
