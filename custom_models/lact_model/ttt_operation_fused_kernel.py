@@ -52,11 +52,20 @@ def zeropower_via_newtonschulz5(G):
         (2.8769, -3.1427, 1.2046),
         (2.8366, -3.0525, 1.2012),
     ]:
-        A = X @ X.transpose(1, 2)
-        B = (
-            b * A + c * A @ A
-        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
+        # ## Original ###
+        # A = X @ X.transpose(1, 2)
+        # B = (
+        #     b * A + c * A @ A
+        # )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        # X = a * X + B @ X
+        # ##
+        
+        ### Ali's suggestion ### OOM
+        A = torch.bmm(X, X.transpose(1, 2))
+        B = torch.baddbmm(A, A, A, beta=b, alpha=c)
+        X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)
+        ###
+
 
     if G.size(1) > G.size(2):
         X = X.transpose(1, 2)

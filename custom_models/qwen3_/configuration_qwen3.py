@@ -13,15 +13,15 @@
 # limitations under the License.
 """Qwen3 model configuration"""
 
-from ...configuration_utils import PreTrainedConfig, layer_type_validation
-from ...modeling_rope_utils import RopeParameters
-from ...utils import logging
+from transformers.configuration_utils import PreTrainedConfig, layer_type_validation
+from transformers.modeling_rope_utils import RopeParameters
+from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)
 
 
-class Qwen3Config(PreTrainedConfig):
+class Qwen3_Config(PreTrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3Model`]. It is used to instantiate a
     Qwen3 model according to the specified arguments, defining the model architecture. Instantiating a configuration
@@ -103,7 +103,7 @@ class Qwen3Config(PreTrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "qwen3"
+    model_type = "qwen3_"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     # Default tensor parallel plan for base model `Qwen3`
@@ -134,7 +134,7 @@ class Qwen3Config(PreTrainedConfig):
         hidden_act: str | None = "silu",
         max_position_embeddings: int | None = 32768,
         initializer_range: float | None = 0.02,
-        rms_norm_eps: float | None = 1e-6,
+        rms_norm_eps: int | None = 1e-6,
         use_cache: bool | None = True,
         tie_word_embeddings: bool | None = False,
         rope_parameters: RopeParameters | dict[str, RopeParameters] | None = None,

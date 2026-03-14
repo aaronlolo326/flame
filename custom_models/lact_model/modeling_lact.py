@@ -44,12 +44,37 @@ class LaCTBlock(nn.Module):
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
             config.hidden_size, eps=config.norm_eps
         )
+        # Determine the per-layer attention mode, optionally driven by a
+        # Qwen3GDN-style `layer_types` list if present on the config.
+        # Mapping:
+        # - "full_attention"     -> global/full attention   (window_size=None)
+        # - "linear_attention"   -> LaCT + sliding window   (window_size=config.window_size)
+        # - "sliding_attention"  -> LaCT + sliding window   (window_size=config.window_size)
+        # If `layer_types` is not provided, we fall back to the global
+        # `use_sliding_window` flag.
+        attention_type = None
+        if getattr(config, "layer_types", None) is not None:
+            if 0 <= layer_idx < len(config.layer_types):
+                attention_type = config.layer_types[layer_idx]
+
+        if attention_type == "full_attention":
+            window_size = None
+        elif attention_type in ("linear_attention", "sliding_attention"):
+            window_size = config.window_size
+        else:
+            # Fallback: behave like the original global toggle.
+            window_size = (
+                config.window_size
+                if getattr(config, "use_sliding_window", True)
+                else None
+            )
+
         self.attn = LaCTSWIGLULayer(
             hidden_size=config.hidden_size,
             num_attn_heads=config.num_attn_heads,
             num_lact_heads=config.num_lact_heads,
             inter_multi=config.inter_multi,
-            window_size=config.window_size,
+            window_size=window_size,
             lact_chunk_size=config.lact_chunk_size,
             qkv_bias=config.qkv_bias,
             attn_qk_norm=config.attn_qk_norm,
@@ -181,22 +206,23 @@ class LaCTPreTrainedModel(PreTrainedModel):
             nn.init.ones_(module.qk_scale)
             nn.init.zeros_(module.qk_offset)
 
-            logger.info(
-                f"in PreTrainedModel initialize fast weights for LaCTSWIGLULayer"
-            )
+            # logger.info(
+            #     f"in PreTrainedModel initialize fast weights for LaCTSWIGLULayer"
+            # )
             # init w0, w1, w2
-            if module.w0_w2_low_rank > 0:
-                module.w0._init_weights()
-                module.w2._init_weights()
-            else:
-                nn.init.normal_(
-                    module.w0, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
-                )
-                nn.init.normal_(
-                    module.w2, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
-                )
+            if module.num_fw_heads > 0:
+                if module.w0_w2_low_rank > 0:
+                    module.w0._init_weights()
+                    module.w2._init_weights()
+                else:
+                    nn.init.normal_(
+                        module.w0, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
+                    )
+                    nn.init.normal_(
+                        module.w2, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
+                    )
 
-            nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
+                nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
 
 
 class LaCTModel(LaCTPreTrainedModel):
@@ -351,7 +377,7 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
 
     _tied_weights_keys = {"lm_head.weight": "model.embeddings.weight"} # ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, *args, **kwargs):
         super().__init__(config)
         self.model = LaCTModel(config)
         self.vocab_size = config.vocab_size

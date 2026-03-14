@@ -175,7 +175,7 @@ class LaCTSWIGLULayer(nn.Module):
         self.use_muon = use_muon
         self.lact_chunk_size = lact_chunk_size
         self.num_fw_heads = num_lact_heads
-        self.fw_head_dim = self.hidden_size // self.num_fw_heads
+        self.fw_head_dim = self.hidden_size // self.num_fw_heads if self.num_fw_heads != 0 else 0
         self.qkv_silu = qkv_silu
         self.no_v_silu = no_v_silu
         self.ttt_prenorm = ttt_prenorm
@@ -193,7 +193,7 @@ class LaCTSWIGLULayer(nn.Module):
         # Low Rank parameterization of the fast weights.
         # This is a compromise to keep the number of parameters low when comparing against baselines.
         # Idealy, low-rank parameterization always hurts the performance.
-        if self.w0_w2_low_rank > 0:
+        if self.w0_w2_low_rank > 0 and self.num_fw_heads > 0:
             self.w0 = LowRankFastWeight(
                 self.num_fw_heads,
                 d_h,
@@ -395,178 +395,181 @@ class LaCTSWIGLULayer(nn.Module):
         o = o.reshape(batch_size, q_len, -1)
 
         ##### TTT starts here.
-        # Split heads then merge it to batch dimension
-        fast_q = rearrange(fast_q, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
-        fast_k = rearrange(fast_k, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
-        fast_v = rearrange(fast_v, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
+        if self.num_fw_heads > 0:
+            # Split heads then merge it to batch dimension
+            fast_q = rearrange(fast_q, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
+            fast_k = rearrange(fast_k, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
+            fast_v = rearrange(fast_v, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
 
-        if self.qkv_silu:
-            if self.no_v_silu:
-                fast_q = F.silu(fast_q)
-                fast_k = F.silu(fast_k)
+            if self.qkv_silu:
+                if self.no_v_silu:
+                    fast_q = F.silu(fast_q)
+                    fast_k = F.silu(fast_k)
+                else:
+                    fast_q = F.silu(fast_q)
+                    fast_k = F.silu(fast_k)
+                    fast_v = F.silu(fast_v)
+
+            # per head l2 norm for fast_q, fast_k.
+            fast_q = l2_norm(fast_q)
+            fast_k = l2_norm(fast_k)
+
+            if not self.ttt_nope:
+                #### Apply rotary embedding.  Here we use the same rope as the attention layer.
+                # I observed that using NoPE for ttt (No positional encoding) here also works.
+                fast_q = rearrange(
+                    fast_q, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
+                )
+                fast_k = rearrange(
+                    fast_k, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
+                )
+
+                fast_q = rearrange(fast_q, "b s (n_h d) -> b s n_h d", n_h=self.num_heads)
+                fast_k = rearrange(fast_k, "b s (n_h d) -> b s n_h d", n_h=self.num_heads)
+
+                fast_q, fast_k = self.rotary(
+                    fast_q,
+                    fast_k,
+                    seqlen_offset=seqlen_offset,
+                    max_seqlen=max_seqlen,
+                    cu_seqlens=cu_seqlens,
+                )
+
+                fast_q = rearrange(fast_q, "b s n_h d -> b s (n_h d)", n_h=self.num_heads)
+                fast_k = rearrange(fast_k, "b s n_h d -> b s (n_h d)", n_h=self.num_heads)
+
+                fast_q = rearrange(
+                    fast_q, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
+                )
+                fast_k = rearrange(
+                    fast_k, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
+                )
+                #### RoPE done. ####
+
+            if self.w0_w2_low_rank > 0:
+                fw_w0 = self.w0().repeat(batch_size, 1, 1)
+                fw_w2 = self.w2().repeat(batch_size, 1, 1)
             else:
-                fast_q = F.silu(fast_q)
-                fast_k = F.silu(fast_k)
-                fast_v = F.silu(fast_v)
+                fw_w0 = self.w0.repeat(
+                    batch_size, 1, 1
+                )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
+                fw_w2 = self.w2.repeat(
+                    batch_size, 1, 1
+                )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
 
-        # per head l2 norm for fast_q, fast_k.
-        fast_q = l2_norm(fast_q)
-        fast_k = l2_norm(fast_k)
-
-        if not self.ttt_nope:
-            #### Apply rotary embedding.  Here we use the same rope as the attention layer.
-            # I observed that using NoPE for ttt (No positional encoding) here also works.
-            fast_q = rearrange(
-                fast_q, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
-            )
-            fast_k = rearrange(
-                fast_k, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
-            )
-
-            fast_q = rearrange(fast_q, "b s (n_h d) -> b s n_h d", n_h=self.num_heads)
-            fast_k = rearrange(fast_k, "b s (n_h d) -> b s n_h d", n_h=self.num_heads)
-
-            fast_q, fast_k = self.rotary(
-                fast_q,
-                fast_k,
-                seqlen_offset=seqlen_offset,
-                max_seqlen=max_seqlen,
-                cu_seqlens=cu_seqlens,
-            )
-
-            fast_q = rearrange(fast_q, "b s n_h d -> b s (n_h d)", n_h=self.num_heads)
-            fast_k = rearrange(fast_k, "b s n_h d -> b s (n_h d)", n_h=self.num_heads)
-
-            fast_q = rearrange(
-                fast_q, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
-            )
-            fast_k = rearrange(
-                fast_k, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
-            )
-            #### RoPE done. ####
-
-        if self.w0_w2_low_rank > 0:
-            fw_w0 = self.w0().repeat(batch_size, 1, 1)
-            fw_w2 = self.w2().repeat(batch_size, 1, 1)
-        else:
-            fw_w0 = self.w0.repeat(
+            fw_w1 = self.w1.repeat(
                 batch_size, 1, 1
-            )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
-            fw_w2 = self.w2.repeat(
-                batch_size, 1, 1
-            )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
+            )  # [nh, d_out, d_h] -> [b*nh, d_out, d_h]
 
-        fw_w1 = self.w1.repeat(
-            batch_size, 1, 1
-        )  # [nh, d_out, d_h] -> [b*nh, d_out, d_h]
-
-        lr = self.lr_proj(hidden_states)  # [b, s, num_heads * lr_dim_per_head]
-        if self.lr_parameterization == "mamba":
-            lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
-        else:
-            raise NotImplementedError(
-                f"LR parameterization {self.lr_parameterization} not implemented"
+            lr = self.lr_proj(hidden_states)  # [b, s, num_heads * lr_dim_per_head]
+            if self.lr_parameterization == "mamba":
+                lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
+            else:
+                raise NotImplementedError(
+                    f"LR parameterization {self.lr_parameterization} not implemented"
+                )
+            fw_lr = rearrange(
+                lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=self.num_fw_heads
             )
-        fw_lr = rearrange(
-            lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=self.num_fw_heads
-        )
-        fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
+            fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
 
-        if self.use_momentum:
-            momentum = self.momentum_proj(hidden_states).float()  # [b, s, nh]
-            momentum = rearrange(
-                momentum, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
-            )
-        else:
-            momentum = None
-
-        if self.fp32_states:
-            # here we cast the fast weights to fp32, but all matmuls are still in bf16
-            # only fast weight updates are in fp32.  This is similar to bf16 training of slow weights.
-            fw_w0 = fw_w0.to(torch.float32)
-            fw_w1 = fw_w1.to(torch.float32)
-            fw_w2 = fw_w2.to(torch.float32)
-
-        # [b * nh, s, d_ttt_head]
-        if self.ttt_prenorm:
-            # pre-norm version of ttt.   state = state + f(norm(state))
-            if self.use_fused_kernel:
-                fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
+            if self.use_momentum:
+                momentum = self.momentum_proj(hidden_states).float()  # [b, s, nh]
+                momentum = rearrange(
+                    momentum, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
                 )
             else:
-                fw_x = prenorm_block_causal_lact_swiglu(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
-                )
-        else:
-            # post-norm version of ttt.   state = norm(state + f(state))
-            if self.use_fused_kernel:
-                fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
-                )
+                momentum = None
+
+            if self.fp32_states:
+                # here we cast the fast weights to fp32, but all matmuls are still in bf16
+                # only fast weight updates are in fp32.  This is similar to bf16 training of slow weights.
+                fw_w0 = fw_w0.to(torch.float32)
+                fw_w1 = fw_w1.to(torch.float32)
+                fw_w2 = fw_w2.to(torch.float32)
+
+            # [b * nh, s, d_ttt_head]
+            if self.ttt_prenorm:
+                # pre-norm version of ttt.   state = state + f(norm(state))
+                if self.use_fused_kernel:
+                    fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        fast_q,
+                        fast_k,
+                        fast_v,
+                        fw_lr1,
+                        fw_lr2,
+                        fw_lr3,
+                        chunk_size=self.lact_chunk_size,
+                        use_muon=self.use_muon,
+                        momentum=momentum,
+                    )
+                else:
+                    fw_x = prenorm_block_causal_lact_swiglu(
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        fast_q,
+                        fast_k,
+                        fast_v,
+                        fw_lr1,
+                        fw_lr2,
+                        fw_lr3,
+                        chunk_size=self.lact_chunk_size,
+                        use_muon=self.use_muon,
+                        momentum=momentum,
+                    )
             else:
-                fw_x = block_causal_lact_swiglu(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
+                # post-norm version of ttt.   state = norm(state + f(state))
+                if self.use_fused_kernel:
+                    fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        fast_q,
+                        fast_k,
+                        fast_v,
+                        fw_lr1,
+                        fw_lr2,
+                        fw_lr3,
+                        chunk_size=self.lact_chunk_size,
+                        use_muon=self.use_muon,
+                        momentum=momentum,
+                    )
+                else:
+                    fw_x = block_causal_lact_swiglu(
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        fast_q,
+                        fast_k,
+                        fast_v,
+                        fw_lr1,
+                        fw_lr2,
+                        fw_lr3,
+                        chunk_size=self.lact_chunk_size,
+                        use_muon=self.use_muon,
+                        momentum=momentum,
+                    )
+
+            # per-head output norm for ttt layer.
+            ttt_x_normed = self.ttt_norm(fw_x)
+            if self.learnable_ttt_scale:
+                ttt_scale = F.silu(self.ttt_scale_proj(hidden_states), inplace=False)
+                ttt_scale = rearrange(
+                    ttt_scale, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
                 )
+                ttt_x_normed = ttt_x_normed * ttt_scale
 
-        # per-head output norm for ttt layer.
-        ttt_x_normed = self.ttt_norm(fw_x)
-        if self.learnable_ttt_scale:
-            ttt_scale = F.silu(self.ttt_scale_proj(hidden_states), inplace=False)
-            ttt_scale = rearrange(
-                ttt_scale, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
+            ttt_x_normed = rearrange(
+                ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
             )
-            ttt_x_normed = ttt_x_normed * ttt_scale
 
-        ttt_x_normed = rearrange(
-            ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
-        )
-
-        o = o + ttt_x_normed
+            o = o + ttt_x_normed
+        ### TTT ends ###
+        
         o = self.o_proj(o)
 
         if not output_attentions:

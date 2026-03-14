@@ -1,7 +1,7 @@
 source "$(dirname "$0")/vars.sh"
 echo $RUN_NAME
 
-debug=false
+debug=true
 profile=false
 
 batch_size=8

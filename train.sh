@@ -31,50 +31,54 @@ if $train; then
     export MASTER_PORT="0"
   fi
 
-  : '
-  Usage:
+  # : '
+  # Usage:
 
-  bash train.sh -h
+  # bash train.sh -h
 
-  Training a 340M model:
+  # Training a 340M model:
 
-  NNODE=1 NGPU=8 LOG_RANK=0 bash train.sh \
-    --job.config_file flame/models/fla.toml \
-    --job.dump_folder exp/transformer-340M-10B/batch32.seqlen2048.warmup1024.update1.steps20480.lr3e-4 \
-    --model.config configs/transformer_340M.json \
-    --model.tokenizer_path fla-hub/transformer-1.3B-100B \
-    --optimizer.name AdamW \
-    --optimizer.eps 1e-15 \
-    --optimizer.lr 3e-4 \
-    --lr_scheduler.warmup_steps 1024 \
-    --lr_scheduler.lr_min 0.1 \
-    --lr_scheduler.decay_type cosine \
-    --training.batch_size 32 \
-    --training.seq_len 2048 \
-    --training.gradient_accumulation_steps 1 \
-    --training.steps 20480 \
-    --training.max_norm 1.0 \
-    --training.skip_nan_inf \
-    --training.dataset HuggingFaceFW/fineweb-edu \
-    --training.dataset_name default \
-    --training.dataset_split train \
-    --training.streaming \
-    --training.num_workers 32 \
-    --training.prefetch_factor 2 \
-    --training.seed 42 \
-    --training.compile \
-    --training.tensor_parallel_degree 1 \
-    --training.disable_loss_parallel \
-    --checkpoint.interval 2048 \
-    --checkpoint.load_step -1 \
-    --metrics.log_freq 1
-  '
+  # NNODE=1 NGPU=8 LOG_RANK=0 bash train.sh \
+  #   --job.config_file flame/models/fla.toml \
+  #   --job.dump_folder exp/transformer-340M-10B/batch32.seqlen2048.warmup1024.update1.steps20480.lr3e-4 \
+  #   --model.config configs/transformer_340M.json \
+  #   --model.tokenizer_path fla-hub/transformer-1.3B-100B \
+  #   --optimizer.name AdamW \
+  #   --optimizer.eps 1e-15 \
+  #   --optimizer.lr 3e-4 \
+  #   --lr_scheduler.warmup_steps 1024 \
+  #   --lr_scheduler.lr_min 0.1 \
+  #   --lr_scheduler.decay_type cosine \
+  #   --training.batch_size 32 \
+  #   --training.seq_len 2048 \
+  #   --training.gradient_accumulation_steps 1 \
+  #   --training.steps 20480 \
+  #   --training.max_norm 1.0 \
+  #   --training.skip_nan_inf \
+  #   --training.dataset HuggingFaceFW/fineweb-edu \
+  #   --training.dataset_name default \
+  #   --training.dataset_split train \
+  #   --training.streaming \
+  #   --training.num_workers 32 \
+  #   --training.prefetch_factor 2 \
+  #   --training.seed 42 \
+  #   --training.compile \
+  #   --training.tensor_parallel_degree 1 \
+  #   --training.disable_loss_parallel \
+  #   --checkpoint.interval 2048 \
+  #   --checkpoint.load_step -1 \
+  #   --metrics.log_freq 1
+  # '
 
   echo "Launching training..."
 
+  # model=$(
+  #   python -c "import fla, sys; from transformers import AutoConfig; import custom_models; print(AutoConfig.from_pretrained(sys.argv[1]).to_json_string())" "$config" | jq -r '.model_type'
+  # )
   model=$(
-    python -c "import fla, sys; from transformers import AutoConfig; import custom_models; print(AutoConfig.from_pretrained(sys.argv[1]).to_json_string())" "$config" | jq -r '.model_type'
+    python -c "import json; import sys; j = json.load(open(sys.argv[1])); print (j.get(\"model_type\"))" "$config"
   )
+
 
   mkdir -p $path
   cp * $path
@@ -107,7 +111,8 @@ if $train; then
   PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
   torchrun --nnodes=${NNODE} \
     --nproc_per_node=${NGPU} \
-    --rdzv_backend c10d \
+    --node-rank ${LOG_RANK} \
+    --rdzv_backend static \
     --rdzv_endpoint "${MASTER_ADDR}:${MASTER_PORT}" \
     --local-ranks-filter ${LOG_RANK} \
     --role rank \
@@ -116,16 +121,20 @@ if $train; then
     -m flame.train \
     $params
 
-  echo "TRAINING DONE!"
-fi
-
-if $convert; then
-  echo "Converting the DCP checkpoints to HF format..."
-  python -m flame.utils.convert_dcp_to_hf \
-    --path $path \
-    --step $steps \
-    --config $config \
-    --tokenizer $tokenizer
+  status=$?
+  if [ $status -eq 0 ]; then
+    echo "TRAINING DONE!"
+    if $convert && [ ${LOG_RANK} -eq 0 ]; then
+      echo "Converting the DCP checkpoints to HF format..."
+      python -m flame.utils.convert_dcp_to_hf \
+        --path $path \
+        --step $steps \
+        --config $config \
+        --tokenizer $tokenizer
+    fi
+  else
+    echo "TRAINING FAILED with exit code $status, skipping conversion."
+  fi
 fi
 
 echo "RUNNING DONE!"

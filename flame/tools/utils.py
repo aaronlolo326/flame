@@ -23,11 +23,11 @@ def get_total_embedding_params(model):
 
 def get_nparams_and_flops(model: nn.Module, model_config, seq_len: int) -> tuple[int, int]:
     nparams = sum(p.numel() for p in model.parameters())
-    logger.info(
-        pformat(
-            {name: p.numel() for name, p in model.named_parameters()}
-        )
-    )
+    # logger.info(
+    #     pformat(
+    #         {name: p.numel() for name, p in model.named_parameters()}
+    #     )
+    # )
 
     # nparams_embedding = sum(
     #     sum(p.numel() for p in m.parameters())

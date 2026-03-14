@@ -24,26 +24,25 @@ from typing import Optional
 import torch
 from torch import nn
 
-from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
-from ...generation import GenerationMixin
-from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
-from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from ...modeling_flash_attention_utils import FlashAttentionKwargs
-from ...modeling_layers import (
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.generation import GenerationMixin
+from transformers.integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_layers import (
     GenericForQuestionAnswering,
     GenericForSequenceClassification,
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
-from ...utils.generic import maybe_autocast, merge_with_config_defaults
-from ...utils.output_capturing import capture_outputs
-from .configuration_qwen3 import Qwen3Config
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
+from transformers.utils.generic import check_model_inputs, maybe_autocast
+from .configuration_qwen3 import Qwen3_Config
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -86,7 +85,7 @@ class Qwen3MLP(nn.Module):
 class Qwen3RotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: Qwen3Config, device=None):
+    def __init__(self, config: Qwen3_Config, device=None):
         super().__init__()
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
@@ -104,7 +103,7 @@ class Qwen3RotaryEmbedding(nn.Module):
 
     @staticmethod
     def compute_default_rope_parameters(
-        config: Qwen3Config | None = None,
+        config: Qwen3_Config | None = None,
         device: Optional["torch.device"] = None,
         seq_len: int | None = None,
     ) -> tuple["torch.Tensor", float]:
@@ -208,7 +207,8 @@ def eager_attention_forward(
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
@@ -222,7 +222,7 @@ def eager_attention_forward(
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3_Config, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.config = config
@@ -273,10 +273,18 @@ class Qwen3Attention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-        print (self.config._attn_implementation, attention_interface)
+        attention_interface: Callable = eager_attention_forward
+        # breakpoint()
+        # print (self.config._attn_implementation)
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # if self.layer_idx == 3:
+        #     print (attention_interface)
+        #     print (self.config._attn_implementation)
+        #     print (ALL_ATTENTION_FUNCTIONS)
+        #     print (self.config._attn_implementation in ALL_ATTENTION_FUNCTIONS)
+        #     print (attention_interface == eager_attention_forward)
+
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -296,7 +304,7 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3DecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3_Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -343,7 +351,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class Qwen3PreTrainedModel(PreTrainedModel):
-    config: Qwen3Config
+    config: Qwen3_Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen3DecoderLayer"]
@@ -361,8 +369,8 @@ class Qwen3PreTrainedModel(PreTrainedModel):
 
 
 @auto_docstring
-class Qwen3Model(Qwen3PreTrainedModel):
-    def __init__(self, config: Qwen3Config):
+class Qwen3_Model(Qwen3PreTrainedModel):
+    def __init__(self, config: Qwen3_Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -379,8 +387,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @merge_with_config_defaults
-    @capture_outputs
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,
@@ -416,7 +423,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             # Prepare mask arguments
             mask_kwargs = {
                 "config": self.config,
-                "inputs_embeds": inputs_embeds,
+                "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
@@ -453,14 +460,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
 
 @auto_docstring
-class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
+class Qwen3_ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _tp_plan = {"lm_head": "colwise_gather_output"}
+    _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3Model(config)
+        self.model = Qwen3_Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -546,10 +553,10 @@ class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedMode
 
 
 __all__ = [
-    "Qwen3ForCausalLM",
+    "Qwen3_ForCausalLM",
     "Qwen3ForQuestionAnswering",
     "Qwen3PreTrainedModel",
-    "Qwen3Model",
+    "Qwen3_Model",
     "Qwen3ForSequenceClassification",
     "Qwen3ForTokenClassification",
 ]
