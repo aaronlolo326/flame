@@ -22,11 +22,11 @@
     "rope_scaling": null,
     "rope_theta": 1000000,
     "sliding_window": null,
-    "tie_word_embeddings": false,
+    "tie_word_embeddings": true,
     "torch_dtype": "bfloat16",
     "transformers_version": "5.0.0",
     "use_cache": true,
-    "use_sliding_window": false,
+    "use_sliding_window": true,
     "vocab_size": 151936,
 
     "fuse_cross_entropy": true,

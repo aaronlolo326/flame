@@ -274,8 +274,17 @@ class Qwen3Attention(nn.Module):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
+        # breakpoint()
+        # print (self.config._attn_implementation)
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # if self.layer_idx == 3:
+        #     print (attention_interface)
+        #     print (self.config._attn_implementation)
+        #     print (ALL_ATTENTION_FUNCTIONS)
+        #     print (self.config._attn_implementation in ALL_ATTENTION_FUNCTIONS)
+        #     print (attention_interface == eager_attention_forward)
+
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -458,7 +467,7 @@ class Qwen3_ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3Model(config)
+        self.model = Qwen3_Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -544,10 +553,10 @@ class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedMode
 
 
 __all__ = [
-    "Qwen3ForCausalLM",
+    "Qwen3_ForCausalLM",
     "Qwen3ForQuestionAnswering",
     "Qwen3PreTrainedModel",
-    "Qwen3Model",
+    "Qwen3_Model",
     "Qwen3ForSequenceClassification",
     "Qwen3ForTokenClassification",
 ]
