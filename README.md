@@ -1,3 +1,25 @@
+# Few-click Pretraining and Evaluation Setup (by Hei)
+
+To set up pretraining arguments:
+1. Edit `scripts/[run_name]/train.sh` and `scripts/[run_name]/var.sh`.
+
+To quickly see parameters count before training:
+1. `bash scripts/[run_name]/param_cnt.sh`
+
+To run pretraining:
+1. `export THISNODE=[your_node_number]` on respective training nodes. You may put this in ~/.bashrc for convenience.
+2. In `scripts/[run_name]/train.sh`, change `available_nodes` to `[list of your nodes]`, e.g., `(9 10)` for 2-node training, and `(9)` for 1-node
+3. If multi-node training, change `MASTER_ADDR` (and `MASTER_PORT` if necessary)
+4. `bash scripts/[run_name]/train.sh`
+
+To run eval:
+1. `bash scripts/[run_name]/lm_eval_mp.sh`
+2. `bash scripts/[run_name]/gen_results_csv.sh`
+3. Check out `results/`
+
+&nbsp;
+
+
 <div align="center">
 
 # 🔥 Flame: Flash Language Modeling Made Easy
