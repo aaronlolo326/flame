@@ -36,7 +36,7 @@ from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
-from flame.tools.utils import get_nparams_and_flops
+from flame.tools.utils import get_nparams_and_flops, get_parameter_counts
 
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
@@ -263,6 +263,17 @@ def main(job_config: JobConfig):
     model_param_count, num_flops_per_token = get_nparams_and_flops(
         model, model_config, job_config.training.context_len
     )
+    (
+        model_param_count_og,
+        model_trainable_param_count,
+        model_non_trainable_param_count,
+    ) = get_parameter_counts(model)
+    logger.info(
+        f"{color.green}Model parameters at init (before parallelism): "
+        f"total={model_param_count_og:,}, "
+        f"trainable={model_trainable_param_count:,}, "
+        f"non-trainable={model_non_trainable_param_count:,}{color.reset}"
+    )
 
     # move sharded model to CPU/GPU and initialize weights via DTensor
     if job_config.checkpoint.create_seed_checkpoint:
@@ -423,6 +434,9 @@ def main(job_config: JobConfig):
     )
     logger.info(
         f"{color.green}  Number of parameters = {model_param_count:,} {color.reset}"
+    )
+    logger.info(
+        f"{color.green}  Number of trainable parameters = {model_trainable_param_count:,} {color.reset}"
     )
 
     with (

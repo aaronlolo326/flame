@@ -4,14 +4,14 @@ export USERNAME=$(whoami)
 
 flame_dir="/work/mingze/flame"
 
-RUN_NAME=$(basename "$(dirname "$0")")_8k_lact_aligned
+RUN_NAME=$(basename "$(dirname "$0")")_swa_2k_chunk_1k
 
 
 
 cd ${flame_dir}
 
 MODEL_CONFIGS_DIR=configs
-MODEL_NAME=qwen3_lact_mlp_1B4
+MODEL_NAME=qwen3_e2e_340M
 MODEL_CONFIG_PATH=${MODEL_CONFIGS_DIR}/${MODEL_NAME}.json
 
 base_model_hfac="Qwen"
