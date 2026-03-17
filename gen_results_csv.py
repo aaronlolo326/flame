@@ -55,9 +55,17 @@ def load_data(run_name, data_set):
                     flattened_data[column_name] = None
 
     elif data_set == 'lm':
-        all_tasks = "gsm8k,winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,race,social_iqa,wikitext".split(",")
+        all_tasks = "gsm8k,winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,race,wikitext".split(",")
         sorted_tasks = sorted(all_tasks)
         # iterate over sorted task names so columns are added in order
+        for task in ['lambada_openai','wikitext']:
+            if task in results:
+                metrics = results[task]
+                column_name = task + "_ppl"
+                if "perplexity,none" in metrics:
+                    flattened_data[column_name] = metrics["perplexity,none"]
+                if "word_perplexity,none" in metrics:
+                    flattened_data[column_name] = metrics["word_perplexity,none"]
         for task in sorted_tasks:
             if task in results:
                 metrics = results[task]
@@ -70,12 +78,6 @@ def load_data(run_name, data_set):
                     if json_key in metrics:
                         flattened_data[column_name] = metrics[json_key] * 100
                         break
-                if task in ['wikitext', 'lambada_openai']:
-                    column_name = task + "_ppl"
-                    if "perplexity,none" in metrics:
-                        flattened_data[column_name] = metrics["perplexity,none"]
-                    if "word_perplexity,none" in metrics:
-                        flattened_data[column_name] = metrics["word_perplexity,none"]
             else:
                 flattened_data[task] = None
 

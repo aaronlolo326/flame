@@ -203,8 +203,10 @@ class LaCTPreTrainedModel(PreTrainedModel):
 
         if isinstance(module, LaCTSWIGLULayer):
             #### Initialize the parameters of the model
-            nn.init.ones_(module.qk_scale)
-            nn.init.zeros_(module.qk_offset)
+            if module.qk_scale is not None:
+                nn.init.ones_(module.qk_scale)
+            if module.qk_offset is not None:
+                nn.init.zeros_(module.qk_offset)
 
             # logger.info(
             #     f"in PreTrainedModel initialize fast weights for LaCTSWIGLULayer"

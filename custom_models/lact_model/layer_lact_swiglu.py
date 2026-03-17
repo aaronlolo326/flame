@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import math
 import warnings
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -39,6 +40,17 @@ except ImportError:
     flash_attn_func = None
 
 logger = logging.get_logger(__name__)
+
+
+def _get_int_env(var_name: str, default: int) -> int:
+    value = os.getenv(var_name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; fallback to %d", var_name, value, default)
+        return default
 
 
 def inv_softplus(x):
@@ -174,15 +186,16 @@ class LaCTSWIGLULayer(nn.Module):
         ### Fast Weight init
         self.use_muon = use_muon
         self.lact_chunk_size = lact_chunk_size
-        self.num_fw_heads = num_lact_heads
-        self.fw_head_dim = self.hidden_size // self.num_fw_heads if self.num_fw_heads != 0 else 0
+        self.num_fw_heads = int(num_lact_heads)
+        self.use_ttt = self.num_fw_heads > 0
+        self.fw_head_dim = self.hidden_size // self.num_fw_heads if self.use_ttt else 0
         self.qkv_silu = qkv_silu
         self.no_v_silu = no_v_silu
         self.ttt_prenorm = ttt_prenorm
         self.ttt_nope = ttt_nope
 
         d_in, d_out = self.fw_head_dim, self.fw_head_dim
-        d_h = int(d_in * inter_multi)
+        d_h = int(d_in * inter_multi) if self.use_ttt else 0
 
         self.d_h = d_h
         self.d_in = d_in
@@ -193,7 +206,7 @@ class LaCTSWIGLULayer(nn.Module):
         # Low Rank parameterization of the fast weights.
         # This is a compromise to keep the number of parameters low when comparing against baselines.
         # Idealy, low-rank parameterization always hurts the performance.
-        if self.w0_w2_low_rank > 0 and self.num_fw_heads > 0:
+        if self.use_ttt and self.w0_w2_low_rank > 0:
             self.w0 = LowRankFastWeight(
                 self.num_fw_heads,
                 d_h,
@@ -210,51 +223,189 @@ class LaCTSWIGLULayer(nn.Module):
                 init_gain=self.fw_init_gain,
                 add_identity=True,
             )
-        else:
+            self.w1 = nn.Parameter(
+                torch.randn(self.num_fw_heads, int(d_out), d_h) / math.sqrt(d_h)
+            )  # [num_fw_heads, d_out, d_h]
+        elif self.use_ttt:
             self.w0 = nn.Parameter(
                 torch.randn(self.num_fw_heads, int(d_h), d_in) / math.sqrt(d_in)
             )  # [num_fw_heads, d_h, d_in]
             self.w2 = nn.Parameter(
                 torch.randn(self.num_fw_heads, int(d_h), d_in) / math.sqrt(d_in)
             )  # [num_fw_heads, d_h, d_in]
-        self.w1 = nn.Parameter(
-            torch.randn(self.num_fw_heads, int(d_out), d_h) / math.sqrt(d_h)
-        )  # [num_fw_heads, d_out, d_h]
+            self.w1 = nn.Parameter(
+                torch.randn(self.num_fw_heads, int(d_out), d_h) / math.sqrt(d_h)
+            )  # [num_fw_heads, d_out, d_h]
+        else:
+            self.w0 = None
+            self.w2 = None
+            self.w1 = None
 
         #### Per-Token LR parameterization.
-        self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
-        self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
-        base_lr = 0.001
-        # Lr parameterization and initialization
-        if lr_parameterization.lower() == "mamba":
-            self.base_lr_inv = inv_softplus(base_lr)
+        self.lr_dim = int(lr_dim * 3 * self.num_fw_heads) if self.use_ttt else 0
+        if self.use_ttt:
+            self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
+            base_lr = 0.001
+            # Lr parameterization and initialization
+            if lr_parameterization.lower() == "mamba":
+                self.base_lr_inv = inv_softplus(base_lr)
+        else:
+            self.lr_proj = None
+            self.base_lr_inv = None
         self.lr_parameterization = lr_parameterization
 
         #### per-channel scaling and offset for Q, and K.
-        self.qk_scale = nn.Parameter(torch.ones(hidden_size, 2))
-        self.qk_offset = nn.Parameter(torch.zeros(hidden_size, 2))
-        self.learnable_ttt_scale = learnable_ttt_scale
+        if self.use_ttt:
+            self.qk_scale = nn.Parameter(torch.ones(hidden_size, 2))
+            self.qk_offset = nn.Parameter(torch.zeros(hidden_size, 2))
+        else:
+            self.qk_scale = None
+            self.qk_offset = None
+        self.learnable_ttt_scale = learnable_ttt_scale and self.use_ttt
         if self.learnable_ttt_scale:
             # per-head scaling.
             self.ttt_scale_proj = nn.Linear(hidden_size, self.num_fw_heads)
+        else:
+            self.ttt_scale_proj = None
 
         # ttt output norm per head.
-        self.ttt_norm = RMSNorm(self.fw_head_dim, elementwise_affine=True)
+        self.ttt_norm = (
+            RMSNorm(self.fw_head_dim, elementwise_affine=True) if self.use_ttt else None
+        )
 
-        self.use_momentum = use_momentum
+        self.use_momentum = use_momentum and self.use_ttt
         if self.use_momentum:
             self.momentum_proj = nn.Sequential(
                 nn.Linear(hidden_size, self.num_fw_heads),
                 nn.Sigmoid(),
             )
+        else:
+            self.momentum_proj = None
 
         self.ttt_loss_type = ttt_loss_type
         self.use_fused_kernel = use_fused_kernel
         self.fp32_states = fp32_states
+        self.log_chunk_diversity = os.getenv("LACT_LOG_CHUNK_DIVERSITY", "0") == "1"
+        self.log_chunk_diversity_every = max(_get_int_env("LACT_LOG_CHUNK_DIVERSITY_EVERY", 1), 1)
+        self.log_chunk_diversity_max_chunks = _get_int_env("LACT_LOG_CHUNK_DIVERSITY_MAX_CHUNKS", 0)
+        self._diversity_log_forward_calls = 0
+        if self.log_chunk_diversity:
+            logger.info(
+                "Enable LACT chunk diversity log for lact_model layer=%s every=%d max_chunks=%d",
+                self.layer_idx,
+                self.log_chunk_diversity_every,
+                self.log_chunk_diversity_max_chunks,
+            )
 
         assert self.ttt_loss_type in [
             "dot_product"
         ], f"Loss type {self.ttt_loss_type} not supported"
+
+    @torch.no_grad()
+    def _log_chunk_diversity(self, tensor: torch.Tensor, tensor_name: str, call_idx: int) -> None:
+        if tensor.ndim != 3:
+            return
+
+        chunk_size = max(int(self.lact_chunk_size), 1)
+        _, seq_len, feat_dim = tensor.shape
+        if seq_len == 0:
+            return
+
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        chunks_to_log = (
+            num_chunks
+            if self.log_chunk_diversity_max_chunks <= 0
+            else min(num_chunks, self.log_chunk_diversity_max_chunks)
+        )
+
+        for chunk_idx in range(chunks_to_log):
+            start = chunk_idx * chunk_size
+            end = min(seq_len, start + chunk_size)
+            chunk = tensor[:, start:end, :].detach().float().reshape(-1, feat_dim)
+            num_tokens = chunk.shape[0]
+
+            if num_tokens < 2:
+                logger.info(
+                    "[chunk_diversity][model=lact_model][layer=%s][call=%d][tensor=%s][chunk=%d/%d] "
+                    "tokens=%d (skip: <2 tokens)",
+                    self.layer_idx,
+                    call_idx,
+                    tensor_name,
+                    chunk_idx + 1,
+                    num_chunks,
+                    num_tokens,
+                )
+                continue
+
+            chunk_normed = chunk / chunk.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            sum_vec = chunk_normed.sum(dim=0)
+            offdiag_sum = (sum_vec * sum_vec).sum() - float(num_tokens)
+            mean_pairwise_cos = (offdiag_sum / float(num_tokens * (num_tokens - 1))).item()
+
+            token_var = chunk.var(dim=0, unbiased=False)
+            token_var_mean = token_var.mean().item()
+            token_var_max = token_var.max().item()
+
+            chunk_centered = chunk - chunk.mean(dim=0, keepdim=True)
+            cov_denom = float(max(num_tokens - 1, 1))
+            cov = (chunk_centered.transpose(0, 1) @ chunk_centered) / cov_denom
+            eigvals = torch.linalg.eigvalsh(cov).clamp_min(0.0)
+            eigvals = torch.flip(eigvals, dims=(0,))
+            eigvals_sum = float(eigvals.sum())
+
+            if eigvals_sum <= 0.0:
+                effective_rank = 0.0
+                top_singular_values = [0.0, 0.0, 0.0]
+            else:
+                probs = eigvals / eigvals_sum
+                entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum()
+                effective_rank = torch.exp(entropy).item()
+                topk = min(3, eigvals.shape[0])
+                singular_vals = torch.sqrt(eigvals[:topk] * cov_denom)
+                top_singular_values = [float(x) for x in singular_vals.tolist()]
+                if topk < 3:
+                    top_singular_values.extend([0.0] * (3 - topk))
+
+            logger.info(
+                "[chunk_diversity][model=lact_model][layer=%s][call=%d][tensor=%s][chunk=%d/%d] "
+                "tokens=%d mean_pairwise_cos=%.6f effective_rank=%.3f top_singular_values=%s "
+                "token_var_mean=%.6e token_var_max=%.6e",
+                self.layer_idx,
+                call_idx,
+                tensor_name,
+                chunk_idx + 1,
+                num_chunks,
+                num_tokens,
+                mean_pairwise_cos,
+                effective_rank,
+                [round(v, 6) for v in top_singular_values],
+                token_var_mean,
+                token_var_max,
+            )
+
+        if chunks_to_log < num_chunks:
+            logger.info(
+                "[chunk_diversity][model=lact_model][layer=%s][call=%d][tensor=%s] "
+                "skip remaining chunks: logged=%d total=%d",
+                self.layer_idx,
+                call_idx,
+                tensor_name,
+                chunks_to_log,
+                num_chunks,
+            )
+
+    @torch.no_grad()
+    def _log_fast_kv_chunk_diversity(self, fast_k: torch.Tensor, fast_v: torch.Tensor) -> None:
+        if not self.log_chunk_diversity:
+            return
+
+        self._diversity_log_forward_calls += 1
+        if self._diversity_log_forward_calls % self.log_chunk_diversity_every != 0:
+            return
+
+        call_idx = self._diversity_log_forward_calls
+        self._log_chunk_diversity(fast_k, "fast_k", call_idx)
+        self._log_chunk_diversity(fast_v, "fast_v", call_idx)
 
     def _rescale_qk(self, q, k):
         """
@@ -265,6 +416,8 @@ class LaCTSWIGLULayer(nn.Module):
             q: [b, s, d]
             k: [b, s, d]
         """
+        if self.qk_scale is None or self.qk_offset is None:
+            return q, k
         qk_scale = self.qk_scale.view(1, 1, -1, 2)
         qk_offset = self.qk_offset.view(1, 1, -1, 2)
         q = q * qk_scale[:, :, :, 0] + qk_offset[:, :, :, 0]
@@ -295,9 +448,10 @@ class LaCTSWIGLULayer(nn.Module):
         if self.attn_qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
-        # rescale and reshift the q, k for test-time training layer.
-        fast_q, fast_k = self._rescale_qk(q, k)
-        fast_v = v
+        if self.num_fw_heads > 0:
+            # rescale and reshift the q, k for test-time training layer.
+            fast_q, fast_k = self._rescale_qk(q, k)
+            fast_v = v
 
         q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
@@ -328,7 +482,6 @@ class LaCTSWIGLULayer(nn.Module):
             max_seqlen=max_seqlen,
             cu_seqlens=cu_seqlens,
         )
-
         if past_key_values is not None:
             cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
             k_cached, v_cached = past_key_values.update(
@@ -362,7 +515,7 @@ class LaCTSWIGLULayer(nn.Module):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
-                causal=True,
+                causal=(self.window_size is None),
                 window_size=(
                     (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
                 ),
@@ -377,7 +530,7 @@ class LaCTSWIGLULayer(nn.Module):
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
-                causal=True,
+                causal=(self.window_size is None),
                 window_size=(
                     (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
                 ),
@@ -387,13 +540,12 @@ class LaCTSWIGLULayer(nn.Module):
                 q,
                 k,
                 v,
-                causal=True,
+                causal=(self.window_size is None),
                 window_size=(
                     (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
                 ),
             )
         o = o.reshape(batch_size, q_len, -1)
-
         ##### TTT starts here.
         if self.num_fw_heads > 0:
             # Split heads then merge it to batch dimension
@@ -445,6 +597,8 @@ class LaCTSWIGLULayer(nn.Module):
                     fast_k, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
                 )
                 #### RoPE done. ####
+
+            self._log_fast_kv_chunk_diversity(fast_k, fast_v)
 
             if self.w0_w2_low_rank > 0:
                 fw_w0 = self.w0().repeat(batch_size, 1, 1)
@@ -566,7 +720,6 @@ class LaCTSWIGLULayer(nn.Module):
             ttt_x_normed = rearrange(
                 ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
             )
-
             o = o + ttt_x_normed
         ### TTT ends ###
         
