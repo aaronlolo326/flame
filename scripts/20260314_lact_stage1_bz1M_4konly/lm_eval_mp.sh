@@ -37,7 +37,7 @@ accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
    --device cuda \
    --trust_remote_code \
    --batch_size 1 \
-   --output_path $lm_eval_output_path \
+   --output_path $lm_eval_output_path/lm \
    --log_samples \
    --trust_remote_code
 
@@ -49,7 +49,7 @@ accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
    --device cuda \
    --num_fewshot 0 \
    --batch_size 1 \
-   --output_path $lm_eval_output_path \
+   --output_path $lm_eval_output_path/lb \
    --log_samples \
    --seed 1234
 
@@ -61,7 +61,7 @@ accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
    --device cuda \
    --trust_remote_code \
    --batch_size 1 \
-   --output_path $lm_eval_output_path \
+   --output_path $lm_eval_output_path/niah \
    --log_samples \
    --seed 1234
    # --gen_kwargs '{"max_new_tokens": 128}' \
