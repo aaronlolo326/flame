@@ -1,3 +1,7 @@
+# Environment
+
+`bash pip_installs.sh`
+
 # Few-click Pretraining and Evaluation Setup (by Hei)
 
 To set up pretraining arguments:
