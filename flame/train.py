@@ -165,7 +165,8 @@ def main(job_config: JobConfig):
         trust_remote_code=True,
         model_max_length=int(1e10),
     )
-    # logger.info(f"{tokenizer}")
+    tokenizer.eos_token_id = tokenizer.pad_token_id # for qwen3 base
+    logger.info(f"{tokenizer}")
 
     is_tokenized = False if job_config.training.tokenized_dataset_dir is None else True
 
