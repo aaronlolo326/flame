@@ -288,6 +288,12 @@ class JobConfig:
             help="Whether to truncate an instance via sampling if it is longer than the sequence length",
         )
         self.parser.add_argument(
+            "--training.add_eos_token_to_sample",
+            type=int,
+            default=0,
+            help="Whether to add an eos token at the end of each sample (after truncation if sample_trunc_seq is applied)",
+        )
+        self.parser.add_argument(
             "--training.gradient_accumulation_steps",
             type=int,
             default=1,

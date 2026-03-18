@@ -11,9 +11,9 @@ RUN_NAME=$(basename "$(dirname "$0")")
 cd ${flame_dir}
 
 MODEL_CONFIGS_DIR=configs
-MODEL_NAME=qwen3_e2e_1B4_v2
+MODEL_NAME=qwen3_lact_1B4
 MODEL_CONFIG_PATH=${MODEL_CONFIGS_DIR}/${MODEL_NAME}.json
-MODEL_TYPE="e2e"
+MODEL_TYPE="lact"
 
 base_model_hfac="Qwen"
 base_model_name="Qwen3-1.7B-Base"
@@ -22,4 +22,4 @@ TOKENIZER_PATH="${base_model_hfac}/${base_model_name}"
 lm_eval_output_path="/storage/backup/${USERNAME}/ttt/flame/results/${RUN_NAME}"
 dump_folder=/storage/backup/${USERNAME}/ttt/flame/exp/${RUN_NAME}
 
-seq_len=16384
+seq_len=4096

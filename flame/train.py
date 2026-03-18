@@ -209,6 +209,7 @@ def main(job_config: JobConfig):
         persistent_workers=job_config.training.persistent_workers,
         snapshot_every_n_steps=job_config.checkpoint.interval,
         sample_trunc_seq=job_config.training.sample_trunc_seq,
+        add_eos_token=job_config.training.add_eos_token_to_sample,
     )
     # breakpoint()
     # data_iterator = iter(dataloader)

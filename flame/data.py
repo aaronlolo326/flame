@@ -177,7 +177,8 @@ class OnlineTokenizedIterableDataset(IterableDataset):
         seq_len: int = 2048,
         rank: int = 0,
         world_size: int = 1,
-        sample_trunc_seq: int = 1
+        sample_trunc_seq: int = 1,
+        add_eos_token: int = 0,
     ) -> OnlineTokenizedIterableDataset:
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -189,6 +190,7 @@ class OnlineTokenizedIterableDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.sample_trunc_seq = sample_trunc_seq
+        self.add_eos_token = add_eos_token
 
         self.states = None
         self.tokens = []
@@ -216,6 +218,8 @@ class OnlineTokenizedIterableDataset(IterableDataset):
                 if self.sample_trunc_seq:
                     sample = sample_chunk(sample, self.seq_len)
                 self.tokens += sample
+                if self.add_eos_token:
+                    self.tokens.append(self.tokenizer.pad_token_id) # 151643 for qwen3 tokenizer
                 # logger.info(f"{self.tokens=}")
                 while len(self.tokens) >= self.seq_len:
                     input_ids = torch.tensor(self.tokens[:self.seq_len], dtype=torch.long)
@@ -542,6 +546,9 @@ class DataCollatorForLanguageModeling:
             # Create labels directly from input_ids, NO padding mask needed for varlen
             labels = batch['input_ids'].clone()
             batch['labels'] = labels
+        # # Save batch to file for debugging/inspection
+        # with open('batch.pkl', 'wb') as f:
+        #     pickle.dump(batch, f)
 
         return batch
 
@@ -867,10 +874,11 @@ def build_dataloader(
     pin_memory: bool = False,
     persistent_workers: bool = False,
     snapshot_every_n_steps: Optional[int] = 1,
-    sample_trunc_seq: int = 1
+    sample_trunc_seq: int = 1,
+    add_eos_token: int = 0,
 ):
     dataset = OnlineTokenizedIterableDataset(
-        dataset=dataset, tokenizer=tokenizer, is_tokenized=is_tokenized, seq_len=seq_len, rank=rank, world_size=world_size, sample_trunc_seq=sample_trunc_seq
+        dataset=dataset, tokenizer=tokenizer, is_tokenized=is_tokenized, seq_len=seq_len, rank=rank, world_size=world_size, sample_trunc_seq=sample_trunc_seq, add_eos_token=add_eos_token
     )
     return ParallelAwareDataLoader(
         rank=rank,

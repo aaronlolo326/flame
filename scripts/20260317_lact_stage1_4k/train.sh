@@ -22,7 +22,7 @@ fi
 echo $RUN_NAME
 
 
-batch_size=2
+batch_size=8
 grad_accum=2
 no_tokens=$(( 100 * 10**9 ))
 seed=42
@@ -56,11 +56,10 @@ if $profile; then
 fi
 
 ### Data; Make sure to check if an EOS token needs to be appended to each sample in the targetted datasets ###
+tokenized_dataset_dir="/storage/backup/hei/data/HuggingFaceFW___fineweb-edu___sample-350BT"
 add_eos_datasets=(
   "/storage/backup/hei/data/HuggingFaceFW___fineweb-edu___sample-350BT"
-) # tokenized_dataset_dir that requires eos append; Add more dataset paths to this array if needed
-
-tokenized_dataset_dir="/storage/backup/hei/data/qwen3-dclm-filter-16k_train,/storage/backup/hei/data/fineweb100bt-qwen3-tokenized-packed-16384_arrow/train"
+)
 add_eos_token_to_sample=0
 for dir in "${add_eos_datasets[@]}"; do
   if [[ "$tokenized_dataset_dir" == "$dir" ]]; then
@@ -119,7 +118,7 @@ NNODE=${NNODE} NGPU=${NGPU} LOG_RANK=${local_rank} bash train.sh \
   --experimental.context_parallel_degree 1 \
   --experimental.pipeline_parallel_degree 1 \
   --activation_checkpoint.mode selective \
-  --activation_checkpoint.selective_ac_option 1
+  --activation_checkpoint.selective_ac_option 4
 
   
 
