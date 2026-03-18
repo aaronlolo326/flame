@@ -147,6 +147,7 @@ class LaCTSWIGLULayer(nn.Module):
         fw_init_gain: float = 0.5,  # init the fast weights
         use_fused_kernel: bool = False,
         fp32_states: bool = False,
+        memory_update_phase: int = None,
     ):
         super().__init__()
 
@@ -251,10 +252,19 @@ class LaCTSWIGLULayer(nn.Module):
         self.ttt_loss_type = ttt_loss_type
         self.use_fused_kernel = use_fused_kernel
         self.fp32_states = fp32_states
+        self.memory_update_phase = memory_update_phase
 
         assert self.ttt_loss_type in [
             "dot_product"
         ], f"Loss type {self.ttt_loss_type} not supported"
+        if (
+            self.memory_update_phase is not None
+            and not 0 <= self.memory_update_phase < self.lact_chunk_size
+        ):
+            raise ValueError(
+                "memory_update_phase must be in [0, lact_chunk_size). "
+                f"Got {self.memory_update_phase} with lact_chunk_size={self.lact_chunk_size}."
+            )
 
     def _rescale_qk(self, q, k):
         """
@@ -489,9 +499,16 @@ class LaCTSWIGLULayer(nn.Module):
                 fw_w2 = fw_w2.to(torch.float32)
 
             # [b * nh, s, d_ttt_head]
+            use_fused_ttt = (
+                self.use_fused_kernel
+                and (
+                    self.memory_update_phase is None
+                    or self.memory_update_phase == self.lact_chunk_size - 1
+                )
+            )
             if self.ttt_prenorm:
                 # pre-norm version of ttt.   state = state + f(norm(state))
-                if self.use_fused_kernel:
+                if use_fused_ttt:
                     fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
                         fw_w0,
                         fw_w1,
@@ -518,12 +535,13 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr2,
                         fw_lr3,
                         chunk_size=self.lact_chunk_size,
+                        update_phase=self.memory_update_phase,
                         use_muon=self.use_muon,
                         momentum=momentum,
                     )
             else:
                 # post-norm version of ttt.   state = norm(state + f(state))
-                if self.use_fused_kernel:
+                if use_fused_ttt:
                     fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
                         fw_w0,
                         fw_w1,
@@ -550,6 +568,7 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr2,
                         fw_lr3,
                         chunk_size=self.lact_chunk_size,
+                        update_phase=self.memory_update_phase,
                         use_muon=self.use_muon,
                         momentum=momentum,
                     )

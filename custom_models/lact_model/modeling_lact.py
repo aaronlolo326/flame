@@ -69,6 +69,15 @@ class LaCTBlock(nn.Module):
                 else None
             )
 
+        memory_update_phase = None
+        if getattr(config, "memory_update_phases", None) is not None:
+            if layer_idx >= len(config.memory_update_phases):
+                raise ValueError(
+                    "memory_update_phases must provide one phase per layer. "
+                    f"Got {len(config.memory_update_phases)} phases for layer index {layer_idx}."
+                )
+            memory_update_phase = config.memory_update_phases[layer_idx]
+
         self.attn = LaCTSWIGLULayer(
             hidden_size=config.hidden_size,
             num_attn_heads=config.num_attn_heads,
@@ -95,6 +104,7 @@ class LaCTBlock(nn.Module):
             fw_init_gain=config.fw_init_gain,
             use_fused_kernel=config.use_fused_kernel,
             fp32_states=config.fp32_states,
+            memory_update_phase=memory_update_phase,
         )
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(

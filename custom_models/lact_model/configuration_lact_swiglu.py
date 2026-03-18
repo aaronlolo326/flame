@@ -41,6 +41,7 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         ttt_prenorm: bool = True,  # pre-norm or post-norm for ttt.
         # prenorm ttt:  state = state + f(norm(state))
         # postnorm ttt:  state = norm(state + f(state)
+        memory_update_phases: Optional[list] = None,
         ttt_nope: bool = False,  # if True, no positional encoding for query and key used in ttt.
         w0_w2_low_rank: int = -1,  # -1 means fully learnable.  > 1 means low rank parameterization of the initial learnable weights.
         window_size: int = 2048,
@@ -97,6 +98,7 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.lr_parameterization = lr_parameterization
         self.learnable_ttt_scale = learnable_ttt_scale
         self.ttt_prenorm = ttt_prenorm
+        self.memory_update_phases = memory_update_phases
         self.ttt_nope = ttt_nope
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings

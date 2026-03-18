@@ -3,6 +3,13 @@
 #     "qwen3_gdn": "qwen3_gdn"
 # }
 
+import warnings
+
 from .lact_model import *
-from .qwen3_ import *
+
+try:
+    from .qwen3_ import *
+except Exception as exc:
+    warnings.warn(f"Skipping qwen3_ custom model registration: {exc}")
+
 # from .qwen3_gdn import *

@@ -13,23 +13,40 @@
 # limitations under the License.
 """Qwen3 model configuration"""
 
-from transformers.configuration_utils import PreTrainedConfig, layer_type_validation
-from transformers.modeling_rope_utils import RopeParameters
+from typing import Any
+
+from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
+
+try:
+    from transformers.modeling_rope_utils import RopeParameters
+except ImportError:
+    RopeParameters = Any
+
+try:
+    from transformers.configuration_utils import layer_type_validation
+except ImportError:
+    def layer_type_validation(layer_types, num_hidden_layers):
+        if layer_types is None:
+            return
+        if len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                f"layer_types must have length {num_hidden_layers}, got {len(layer_types)}."
+            )
 
 
 logger = logging.get_logger(__name__)
 
 
-class Qwen3_Config(PreTrainedConfig):
+class Qwen3_Config(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3Model`]. It is used to instantiate a
     Qwen3 model according to the specified arguments, defining the model architecture. Instantiating a configuration
     with the defaults will yield a similar configuration to that of
     Qwen3-8B [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B).
 
-    Configuration objects inherit from [`PreTrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PreTrainedConfig`] for more information.
+    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
+    documentation from [`PretrainedConfig`] for more information.
 
 
     Args:

@@ -279,20 +279,20 @@ def load_qwen3_variant(variant: str) -> tuple[type, type, type, type | None]:
 
 
 def import_lact_modules() -> tuple[type, type, type]:
-    with prepend_sys_path(FLAME_ROOT):
-        import custom_models  # noqa: F401
-        from custom_models.lact_model.configuration_lact_swiglu import LaCTSWIGLUConfig
-        from custom_models.lact_model.layer_lact_swiglu import LaCTSWIGLULayer
-        from custom_models.lact_model.modeling_lact import LaCTForCausalLM
+    custom_models_root = FLAME_ROOT / "custom_models"
+    with prepend_sys_path(custom_models_root):
+        from lact_model.configuration_lact_swiglu import LaCTSWIGLUConfig
+        from lact_model.layer_lact_swiglu import LaCTSWIGLULayer
+        from lact_model.modeling_lact import LaCTForCausalLM
 
     return LaCTSWIGLUConfig, LaCTForCausalLM, LaCTSWIGLULayer
 
 
 def import_e2e_ttt_modules() -> tuple[type, type]:
-    with prepend_sys_path(FLAME_ROOT):
-        import custom_models  # noqa: F401
-        from custom_models.ttt_e2_lact_backbone.configuration_ttt_e2e import E2ETTTConfig
-        from custom_models.ttt_e2_lact_backbone.modeling_ttt_e2e import E2EForCausalLM
+    custom_models_root = FLAME_ROOT / "custom_models"
+    with prepend_sys_path(custom_models_root):
+        from ttt_e2_lact_backbone.configuration_ttt_e2e import E2ETTTConfig
+        from ttt_e2_lact_backbone.modeling_ttt_e2e import E2EForCausalLM
 
     return E2ETTTConfig, E2EForCausalLM
 
@@ -322,6 +322,7 @@ def build_whole_model(
     base_config_path: Path = DEFAULT_LACT_CONFIG,
     sliding_window: int | None = None,
     lact_chunk_size: int | None = None,
+    memory_update_phases: list[int] | None = None,
     num_attn_heads_override: int | None = None,
     num_lact_heads_override: int | None = None,
     use_fused_kernel: bool | None = None,
@@ -361,6 +362,8 @@ def build_whole_model(
         config_kwargs["use_cache"] = False
         config_kwargs["lact_chunk_size"] = chunk_size
         config_kwargs["window_size"] = window_size
+        if memory_update_phases is not None:
+            config_kwargs["memory_update_phases"] = list(memory_update_phases)
         if config_kwargs["hidden_size"] % int(config_kwargs["num_attn_heads"]) != 0:
             raise ValueError(
                 f"Invalid num_attn_heads={config_kwargs['num_attn_heads']} for hidden_size={config_kwargs['hidden_size']}. "
@@ -441,6 +444,8 @@ def build_whole_model(
         lact_config_kwargs["use_cache"] = False
         lact_config_kwargs["lact_chunk_size"] = chunk_size
         lact_config_kwargs["window_size"] = window_size
+        if memory_update_phases is not None:
+            lact_config_kwargs["memory_update_phases"] = list(memory_update_phases)
         if lact_config_kwargs["hidden_size"] % int(lact_config_kwargs["num_attn_heads"]) != 0:
             raise ValueError(
                 f"Invalid num_attn_heads={lact_config_kwargs['num_attn_heads']} for hidden_size={lact_config_kwargs['hidden_size']}. "
@@ -609,13 +614,14 @@ def build_kernel_module(
 
     if model_key in {"lact_full_layer", "lact_ttt_branch_only"}:
         config_cls, _, layer_cls = import_lact_modules()
-        with prepend_sys_path(FLAME_ROOT):
-            from custom_models.lact_model.layer_lact_swiglu import l2_norm
-            from custom_models.lact_model.ttt_operation import (
+        custom_models_root = FLAME_ROOT / "custom_models"
+        with prepend_sys_path(custom_models_root):
+            from lact_model.layer_lact_swiglu import l2_norm
+            from lact_model.ttt_operation import (
                 block_causal_lact_swiglu,
                 prenorm_block_causal_lact_swiglu,
             )
-            from custom_models.lact_model.ttt_operation_fused_kernel import (
+            from lact_model.ttt_operation_fused_kernel import (
                 postnorm_block_causal_lact_swiglu_fused_kernel_triton,
                 prenorm_block_causal_lact_swiglu_fused_kernel_triton,
             )

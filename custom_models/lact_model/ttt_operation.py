@@ -2,6 +2,27 @@ import torch.nn.functional as F
 import torch
 
 
+def _resolve_update_phase(chunk_size: int, update_phase: int | None) -> int:
+    if update_phase is None:
+        return chunk_size - 1
+    if not 0 <= update_phase < chunk_size:
+        raise ValueError(
+            f"update_phase must be in [0, {chunk_size}), got {update_phase}."
+        )
+    return update_phase
+
+
+def _iter_update_segments(seq_len: int, chunk_size: int, update_phase: int):
+    start = 0
+    update_end = update_phase + 1
+    while update_end < seq_len:
+        yield start, update_end, True
+        start = update_end
+        update_end += chunk_size
+    if start < seq_len:
+        yield start, seq_len, False
+
+
 @torch.compile()
 def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     """
@@ -79,6 +100,7 @@ def block_causal_lact_swiglu(
     lr1: torch.Tensor,
     lr2: torch.Tensor,
     chunk_size: int = 2048,  # test-time training chunk size
+    update_phase: int | None = None,
     use_muon: bool = False,
     momentum: torch.Tensor = None,  # [b, s, 1]
 ):
@@ -119,11 +141,11 @@ def block_causal_lact_swiglu(
 
     output = torch.zeros_like(v)
 
-    e_index = 0
     seq_len = k.shape[1]
-    for i in range(0, seq_len - chunk_size, chunk_size):
-        s_index = i
-        e_index = s_index + chunk_size
+    update_phase = _resolve_update_phase(chunk_size, update_phase)
+    for s_index, e_index, should_update in _iter_update_segments(
+        seq_len, chunk_size, update_phase
+    ):
 
         # [b, l, dk]
         ki = k[:, s_index:e_index, :]  # bf16
@@ -142,6 +164,9 @@ def block_causal_lact_swiglu(
         gate = F.silu(torch.bmm(w0, qi), inplace=True)
         # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
         output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
+
+        if not should_update:
+            continue
 
         # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
         gate_before_act = torch.bmm(w0, ki.transpose(1, 2))
@@ -199,18 +224,6 @@ def block_causal_lact_swiglu(
         w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
         w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
 
-    # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
-    s_index = e_index
-    e_index = seq_len
-
-    qi = q[:, :, s_index:e_index]
-    # use the last w0 and w1 to get the final output
-    # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
-    h = torch.bmm(w2, qi)
-    gate = F.silu(torch.bmm(w0, qi), inplace=True)
-    # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
-    output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
-
     return output.transpose(1, 2)
 
 
@@ -227,6 +240,7 @@ def prenorm_block_causal_lact_swiglu(
     lr1: torch.Tensor,
     lr2: torch.Tensor,
     chunk_size: int = 2048,  # test-time training chunk size
+    update_phase: int | None = None,
     use_muon: bool = False,
     momentum: torch.Tensor = None,  # [b, s, 1]
 ):
@@ -269,11 +283,11 @@ def prenorm_block_causal_lact_swiglu(
 
     output = torch.zeros_like(v)
 
-    e_index = 0
     seq_len = k.shape[1]
-    for i in range(0, seq_len - chunk_size, chunk_size):
-        s_index = i
-        e_index = s_index + chunk_size
+    update_phase = _resolve_update_phase(chunk_size, update_phase)
+    for s_index, e_index, should_update in _iter_update_segments(
+        seq_len, chunk_size, update_phase
+    ):
 
         # [b, l, dk]
         ki = k[:, s_index:e_index, :]  # bf16
@@ -292,6 +306,9 @@ def prenorm_block_causal_lact_swiglu(
         gate = F.silu(torch.bmm(w0, qi), inplace=True)
         # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
         output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
+
+        if not should_update:
+            continue
 
         # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
         gate_before_act = torch.bmm(w0, ki.transpose(1, 2))
@@ -348,17 +365,5 @@ def prenorm_block_causal_lact_swiglu(
         w0 = w0_main / (w0_main.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
         w1 = w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
         w2 = w2_main / (w2_main.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
-
-    # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
-    s_index = e_index
-    e_index = seq_len
-
-    qi = q[:, :, s_index:e_index]
-    # use the last w0 and w1 to get the final output
-    # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
-    h = torch.bmm(w2, qi)
-    gate = F.silu(torch.bmm(w0, qi), inplace=True)
-    # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
-    output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
     return output.transpose(1, 2)

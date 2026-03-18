@@ -34,6 +34,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sliding-window", type=int, default=None)
     parser.add_argument("--lact-chunk-size", type=int, default=None)
     parser.add_argument(
+        "--memory-update-phases",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Optional per-layer memory update phases for LaCT-backed whole-model runs. "
+            "Expected length equals num_hidden_layers."
+        ),
+    )
+    parser.add_argument(
         "--num-attn-heads",
         type=int,
         default=8,
@@ -142,6 +152,7 @@ def main() -> None:
                         base_config_path=args.base_config,
                         sliding_window=args.sliding_window,
                         lact_chunk_size=args.lact_chunk_size,
+                        memory_update_phases=args.memory_update_phases,
                         num_attn_heads_override=args.num_attn_heads,
                         num_lact_heads_override=args.num_lact_heads,
                         use_fused_kernel=args.use_fused_lact_kernel,
@@ -224,6 +235,7 @@ def main() -> None:
                             f"num_lact_heads={args.num_lact_heads}; "
                             f"lact_chunk_size={args.lact_chunk_size or 'config'}; "
                             f"sliding_window={args.sliding_window or 'config'}; "
+                            f"memory_update_phases={args.memory_update_phases or 'config'}; "
                             f"paper_lm_defaults={args.paper_lm_defaults}"
                         ),
                     )
