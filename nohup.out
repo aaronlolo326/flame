@@ -1,0 +1,389 @@
+20260217_tied
+steps=190734
+--job.config_file flame/models/fla_20260212.toml --job.dump_folder /work/mingze/flame/exp/20260217_tied --comm.init_timeout_seconds 3600 --comm.train_timeout_seconds 600 --model.config configs/qwen3_lact_1B7_tied.json --model.tokenizer_path Qwen/Qwen3-1.7B-Base --optimizer.name AdamW --optimizer.eps 1e-15 --optimizer.lr 3e-4 --lr_scheduler.warmup_steps 1024 --lr_scheduler.lr_min 0.1 --lr_scheduler.decay_type cosine --training.batch_size 8 --training.seq_len 2048 --training.context_len 2048 --training.gradient_accumulation_steps 2 --training.steps 190734 --training.max_norm 1.0 --training.skip_nan_inf --training.tokenized_dataset_dir /storage/backup/hei/data/HuggingFaceFW___fineweb-edu___sample-350BT --training.num_workers 32 --training.prefetch_factor 2 --training.seed 42 --training.compile --training.tensor_parallel_degree 1 --training.disable_loss_parallel --checkpoint.interval 2048 --checkpoint.load_step -1 --metrics.log_freq 1
+++ grep -oP '(?<=--job.dump_folder )[^ ]+'
++ path=/work/mingze/flame/exp/20260217_tied
+++ grep -oP '(?<=--training.steps )[^ ]+'
++ steps=190734
+++ grep -oP '(?<=--model.config )[^ ]+'
++ config=configs/qwen3_lact_1B7_tied.json
+++ grep -oP '(?<=--model.tokenizer_path )[^ ]+'
++ tokenizer=Qwen/Qwen3-1.7B-Base
++ true
++ NNODE=1
++ NGPU=8
++ LOG_RANK=0
++ [[ -z '' ]]
++ export MASTER_ADDR=localhost
++ MASTER_ADDR=localhost
++ [[ -z '' ]]
++ export MASTER_PORT=0
++ MASTER_PORT=0
++ : '
+  Usage:
+
+  bash train.sh -h
+
+  Training a 340M model:
+
+  NNODE=1 NGPU=8 LOG_RANK=0 bash train.sh \
+    --job.config_file flame/models/fla.toml \
+    --job.dump_folder exp/transformer-340M-10B/batch32.seqlen2048.warmup1024.update1.steps20480.lr3e-4 \
+    --model.config configs/transformer_340M.json \
+    --model.tokenizer_path fla-hub/transformer-1.3B-100B \
+    --optimizer.name AdamW \
+    --optimizer.eps 1e-15 \
+    --optimizer.lr 3e-4 \
+    --lr_scheduler.warmup_steps 1024 \
+    --lr_scheduler.lr_min 0.1 \
+    --lr_scheduler.decay_type cosine \
+    --training.batch_size 32 \
+    --training.seq_len 2048 \
+    --training.gradient_accumulation_steps 1 \
+    --training.steps 20480 \
+    --training.max_norm 1.0 \
+    --training.skip_nan_inf \
+    --training.dataset HuggingFaceFW/fineweb-edu \
+    --training.dataset_name default \
+    --training.dataset_split train \
+    --training.streaming \
+    --training.num_workers 32 \
+    --training.prefetch_factor 2 \
+    --training.seed 42 \
+    --training.compile \
+    --training.tensor_parallel_degree 1 \
+    --training.disable_loss_parallel \
+    --checkpoint.interval 2048 \
+    --checkpoint.load_step -1 \
+    --metrics.log_freq 1
+  '
++ echo 'Launching training...'
+Launching training...
+++ python -c 'import fla, sys; from transformers import AutoConfig; import custom_models; print(AutoConfig.from_pretrained(sys.argv[1]).to_json_string())' configs/qwen3_lact_1B7_tied.json
+++ jq -r .model_type
++ model=lact_swiglu
++ mkdir -p /work/mingze/flame/exp/20260217_tied
++ cp LICENSE README.md build configs custom_models exp flame flame.egg-info flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl lm-evaluation-harness logs nohup.out pip_install.sh pyproject.toml scripts setup.py tests train.sh utils /work/mingze/flame/exp/20260217_tied
+cp: -r not specified; omitting directory 'build'
+cp: -r not specified; omitting directory 'configs'
+cp: -r not specified; omitting directory 'custom_models'
+cp: -r not specified; omitting directory 'exp'
+cp: -r not specified; omitting directory 'flame'
+cp: -r not specified; omitting directory 'flame.egg-info'
+cp: -r not specified; omitting directory 'lm-evaluation-harness'
+cp: -r not specified; omitting directory 'logs'
+cp: -r not specified; omitting directory 'scripts'
+cp: -r not specified; omitting directory 'tests'
+cp: -r not specified; omitting directory 'utils'
++ cp -r configs /work/mingze/flame/exp/20260217_tied
++ cp -r flame /work/mingze/flame/exp/20260217_tied
++ cp -r 3rdparty/flash-linear-attention/fla /work/mingze/flame/exp/20260217_tied
+cp: cannot stat '3rdparty/flash-linear-attention/fla': No such file or directory
++ cp -r 3rdparty/torchtitan/torchtitan /work/mingze/flame/exp/20260217_tied
+cp: cannot stat '3rdparty/torchtitan/torchtitan': No such file or directory
++ '[' '' == '' ']'
+++ date +%Y%m%d%H%M
++ date=202603022224
+++ basename /work/mingze/flame/exp/20260217_tied
++ RUN_NAME=lact_swiglu-20260217_tied
++ export WANDB_RESUME=allow
++ WANDB_RESUME=allow
++ [[ -z '' ]]
++ export WANDB_PROJECT=fla
++ WANDB_PROJECT=fla
++ [[ -z '' ]]
++ export WANDB_NAME=lact_swiglu-20260217_tied
++ WANDB_NAME=lact_swiglu-20260217_tied
++ [[ -z '' ]]
++ export WANDB_RUN_ID=lact_swiglu-20260217_tied
++ WANDB_RUN_ID=lact_swiglu-20260217_tied
++ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
++ torchrun --nnodes=1 --nproc_per_node=8 --rdzv_backend c10d --rdzv_endpoint localhost:0 --local-ranks-filter 0 --role rank --tee 3 --log-dir /work/mingze/flame/exp/20260217_tied/logs -m flame.train --job.config_file flame/models/fla_20260212.toml --job.dump_folder /work/mingze/flame/exp/20260217_tied --comm.init_timeout_seconds 3600 --comm.train_timeout_seconds 600 --model.config configs/qwen3_lact_1B7_tied.json --model.tokenizer_path Qwen/Qwen3-1.7B-Base --optimizer.name AdamW --optimizer.eps 1e-15 --optimizer.lr 3e-4 --lr_scheduler.warmup_steps 1024 --lr_scheduler.lr_min 0.1 --lr_scheduler.decay_type cosine --training.batch_size 8 --training.seq_len 2048 --training.context_len 2048 --training.gradient_accumulation_steps 2 --training.steps 190734 --training.max_norm 1.0 --training.skip_nan_inf --training.tokenized_dataset_dir /storage/backup/hei/data/HuggingFaceFW___fineweb-edu___sample-350BT --training.num_workers 32 --training.prefetch_factor 2 --training.seed 42 --training.compile --training.tensor_parallel_degree 1 --training.disable_loss_parallel --checkpoint.interval 2048 --checkpoint.load_step -1 --metrics.log_freq 1
+W0302 22:24:10.116000 738609 site-packages/torch/distributed/run.py:792] 
+W0302 22:24:10.116000 738609 site-packages/torch/distributed/run.py:792] *****************************************
+W0302 22:24:10.116000 738609 site-packages/torch/distributed/run.py:792] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0302 22:24:10.116000 738609 site-packages/torch/distributed/run.py:792] *****************************************
+[rank0]:[titan] 2026-03-02 22:24:23,684 - root - INFO - train.py:67 - Starting job: default job
+[rank0]:[titan] 2026-03-02 22:24:23,684 - root - INFO - train.py:76 - [32m{
+[rank0]:  "activation_checkpoint": {
+[rank0]:    "mode": "none",
+[rank0]:    "selective_ac_option": "2"
+[rank0]:  },
+[rank0]:  "activation_offload": {
+[rank0]:    "mode": "none"
+[rank0]:  },
+[rank0]:  "checkpoint": {
+[rank0]:    "async_mode": "disabled",
+[rank0]:    "create_seed_checkpoint": false,
+[rank0]:    "enable_checkpoint": true,
+[rank0]:    "exclude_from_loading": [],
+[rank0]:    "export_dtype": "float32",
+[rank0]:    "folder": "checkpoint",
+[rank0]:    "initial_load_model_weights_only": true,
+[rank0]:    "initial_load_path": null,
+[rank0]:    "interval": 2048,
+[rank0]:    "interval_type": "steps",
+[rank0]:    "keep_latest_k": 0,
+[rank0]:    "last_save_model_weights_only": false,
+[rank0]:    "load_step": -1,
+[rank0]:    "model_weights_only": false
+[rank0]:  },
+[rank0]:  "comm": {
+[rank0]:    "init_timeout_seconds": 3600,
+[rank0]:    "trace_buf_size": 20000,
+[rank0]:    "train_timeout_seconds": 600
+[rank0]:  },
+[rank0]:  "experimental": {
+[rank0]:    "context_parallel_degree": 1,
+[rank0]:    "context_parallel_rotate_method": "allgather",
+[rank0]:    "custom_model_path": "",
+[rank0]:    "enable_async_tensor_parallel": false,
+[rank0]:    "enable_compiled_autograd": false,
+[rank0]:    "pipeline_parallel_degree": 1,
+[rank0]:    "pipeline_parallel_microbatches": null,
+[rank0]:    "pipeline_parallel_schedule": "1F1B",
+[rank0]:    "pipeline_parallel_schedule_csv": "",
+[rank0]:    "pipeline_parallel_split_points": []
+[rank0]:  },
+[rank0]:  "fault_tolerance": {
+[rank0]:    "enable": false,
+[rank0]:    "group_size": 0,
+[rank0]:    "min_replica_size": 1,
+[rank0]:    "replica_id": 0
+[rank0]:  },
+[rank0]:  "float8": {
+[rank0]:    "enable_fsdp_float8_all_gather": false,
+[rank0]:    "force_recompute_fp8_weight_in_bwd": false,
+[rank0]:    "precompute_float8_dynamic_scale_for_fsdp": false,
+[rank0]:    "recipe_name": null
+[rank0]:  },
+[rank0]:  "job": {
+[rank0]:    "config_file": "flame/models/fla_20260212.toml",
+[rank0]:    "description": "default job",
+[rank0]:    "dump_folder": "/work/mingze/flame/exp/20260217_tied",
+[rank0]:    "print_args": true,
+[rank0]:    "use_for_integration_test": false
+[rank0]:  },
+[rank0]:  "lr_scheduler": {
+[rank0]:    "decay_ratio": null,
+[rank0]:    "decay_type": "cosine",
+[rank0]:    "lr_min": 0.1,
+[rank0]:    "warmup_steps": 1024
+[rank0]:  },
+[rank0]:  "memory_estimation": {
+[rank0]:    "disable_fake_mode": false,
+[rank0]:    "enabled": false
+[rank0]:  },
+[rank0]:  "metrics": {
+[rank0]:    "disable_color_printing": false,
+[rank0]:    "enable_tensorboard": false,
+[rank0]:    "enable_wandb": true,
+[rank0]:    "log_freq": 1,
+[rank0]:    "save_for_all_ranks": false,
+[rank0]:    "save_tb_folder": "tb"
+[rank0]:  },
+[rank0]:  "model": {
+[rank0]:    "config": "configs/qwen3_lact_1B7_tied.json",
+[rank0]:    "converters": [],
+[rank0]:    "name": "fla",
+[rank0]:    "print_after_conversion": false,
+[rank0]:    "tokenizer_path": "Qwen/Qwen3-1.7B-Base"
+[rank0]:  },
+[rank0]:  "optimizer": {
+[rank0]:    "beta1": 0.9,
+[rank0]:    "beta2": 0.95,
+[rank0]:    "early_step_in_backward": false,
+[rank0]:    "eps": 1e-15,
+[rank0]:    "implementation": "fused",
+[rank0]:    "lr": 0.0003,
+[rank0]:    "name": "AdamW",
+[rank0]:    "weight_decay": 0.1
+[rank0]:  },
+[rank0]:  "profiling": {
+[rank0]:    "enable_memory_snapshot": false,
+[rank0]:    "enable_profiling": true,
+[rank0]:    "profile_freq": 512,
+[rank0]:    "save_memory_snapshot_folder": "memory_snapshot",
+[rank0]:    "save_traces_folder": "profile_trace"
+[rank0]:  },
+[rank0]:  "training": {
+[rank0]:    "batch_size": 8,
+[rank0]:    "compile": true,
+[rank0]:    "context_len": 2048,
+[rank0]:    "data_dir": null,
+[rank0]:    "data_files": null,
+[rank0]:    "data_parallel_replicate_degree": 1,
+[rank0]:    "data_parallel_shard_degree": -1,
+[rank0]:    "data_probs": null,
+[rank0]:    "dataset": null,
+[rank0]:    "dataset_name": null,
+[rank0]:    "dataset_split": null,
+[rank0]:    "deterministic": false,
+[rank0]:    "disable_loss_parallel": true,
+[rank0]:    "enable_cpu_offload": false,
+[rank0]:    "fsdp_reshard_after_forward": "default",
+[rank0]:    "gc_freq": 50,
+[rank0]:    "gradient_accumulation_steps": 2,
+[rank0]:    "max_norm": 1.0,
+[rank0]:    "mixed_precision_param": "bfloat16",
+[rank0]:    "mixed_precision_reduce": "float32",
+[rank0]:    "num_workers": 32,
+[rank0]:    "persistent_workers": false,
+[rank0]:    "pin_memory": false,
+[rank0]:    "prefetch_factor": 2,
+[rank0]:    "seed": 42,
+[rank0]:    "seq_len": 2048,
+[rank0]:    "skip_nan_inf": true,
+[rank0]:    "steps": 190734,
+[rank0]:    "streaming": false,
+[rank0]:    "tensor_parallel_degree": 1,
+[rank0]:    "tokenized_dataset_dir": "/storage/backup/hei/data/HuggingFaceFW___fineweb-edu___sample-350BT",
+[rank0]:    "varlen": false
+[rank0]:  }
+[rank0]:}[39m
+[rank0]:[titan] 2026-03-02 22:24:23,685 - root - INFO - utils.py:65 - [GC] Initial GC collection. 0.00 seconds.
+[rank0]:[titan] 2026-03-02 22:24:23,685 - root - WARNING - utils.py:233 - ENV[TORCH_NCCL_ASYNC_ERROR_HANDLING] = 1 will be overridden to 3 based on job config
+[rank0]:[titan] 2026-03-02 22:24:23,715 - root - INFO - metrics.py:99 - CUDA capacity: NVIDIA H100 80GB HBM3 with 79.10GiB memory
+[rank0]:[titan] 2026-03-02 22:24:23,823 - root - INFO - train.py:116 - Peak FLOPS used for computing MFU: 9.890e+14
+[rank0]:[titan] 2026-03-02 22:24:23,823 - root - INFO - parallel_dims.py:73 - Building 1-D device mesh with ['dp_shard'], [8]
+[rank0]:[titan] 2026-03-02 22:24:26,082 - root - INFO - train.py:147 - Loading tokenizer...
+[rank0]:[titan] 2026-03-02 22:24:26,239 - httpx - INFO - _client.py:1025 - HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-1.7B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+[rank0]:[titan] 2026-03-02 22:24:26,247 - httpx - INFO - _client.py:1025 - HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-1.7B-Base/ea980cb0a6c2ae4b936e82123acc929f1cec04c1/config.json "HTTP/1.1 200 OK"
+[rank0]:[titan] 2026-03-02 22:24:26,364 - httpx - INFO - _client.py:1025 - HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-1.7B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+[rank0]:[titan] 2026-03-02 22:24:26,371 - httpx - INFO - _client.py:1025 - HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-1.7B-Base/ea980cb0a6c2ae4b936e82123acc929f1cec04c1/tokenizer_config.json "HTTP/1.1 200 OK"
+[rank0]:[titan] 2026-03-02 22:24:26,486 - httpx - INFO - _client.py:1025 - HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-1.7B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+[rank0]:[titan] 2026-03-02 22:24:26,602 - httpx - INFO - _client.py:1025 - HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-1.7B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+[rank0]:[titan] 2026-03-02 22:24:27,155 - httpx - INFO - _client.py:1025 - HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-1.7B-Base "HTTP/1.1 200 OK"
+[rank0]:[titan] 2026-03-02 22:24:27,156 - root - INFO - train.py:153 - Qwen2Tokenizer(name_or_path='Qwen/Qwen3-1.7B-Base', vocab_size=151643, model_max_length=10000000000, padding_side='right', truncation_side='right', special_tokens={'eos_token': '<|endoftext|>', 'pad_token': '<|endoftext|>'}, added_tokens_decoder={
+[rank0]:	151643: AddedToken("<|endoftext|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151644: AddedToken("<|im_start|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151645: AddedToken("<|im_end|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151646: AddedToken("<|object_ref_start|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151647: AddedToken("<|object_ref_end|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151648: AddedToken("<|box_start|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151649: AddedToken("<|box_end|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151650: AddedToken("<|quad_start|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151651: AddedToken("<|quad_end|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151652: AddedToken("<|vision_start|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151653: AddedToken("<|vision_end|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151654: AddedToken("<|vision_pad|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151655: AddedToken("<|image_pad|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151656: AddedToken("<|video_pad|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+[rank0]:	151657: AddedToken("<tool_call>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151658: AddedToken("</tool_call>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151659: AddedToken("<|fim_prefix|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151660: AddedToken("<|fim_middle|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151661: AddedToken("<|fim_suffix|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151662: AddedToken("<|fim_pad|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151663: AddedToken("<|repo_name|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151664: AddedToken("<|file_sep|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151665: AddedToken("<tool_response>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151666: AddedToken("</tool_response>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151667: AddedToken("<think>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:	151668: AddedToken("</think>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+[rank0]:}
+[rank0]:)
+[rank0]:[titan] 2026-03-02 22:24:27,156 - root - INFO - train.py:157 - Loading pre-tokenized dataset /storage/backup/hei/data/HuggingFaceFW___fineweb-edu___sample-350BT
+[rank0]:[titan] 2026-03-02 22:24:52,335 - root - INFO - data.py:595 - Shuffling the dataset with seed 42
+[rank0]:[titan] 2026-03-02 22:24:53,919 - root - INFO - data.py:598 - to_iterable_dataset (min_num_shards=256)
+W0302 22:26:45.817000 738609 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 738683 closing signal SIGTERM
+W0302 22:26:45.818000 738609 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 738684 closing signal SIGTERM
+W0302 22:26:45.820000 738609 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 738686 closing signal SIGTERM
+W0302 22:26:45.822000 738609 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 738687 closing signal SIGTERM
+W0302 22:26:45.824000 738609 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 738688 closing signal SIGTERM
+W0302 22:26:45.826000 738609 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 738689 closing signal SIGTERM
+W0302 22:26:45.827000 738609 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 738690 closing signal SIGTERM
+E0302 22:26:49.623000 738609 site-packages/torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: -9) local_rank: 2 (pid: 738685) of binary: /work/mingze/miniconda3/envs/flame/bin/python3.11
+Traceback (most recent call last):
+  File "/work/mingze/miniconda3/envs/flame/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/run.py", line 918, in main
+    run(args)
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/run.py", line 909, in run
+    elastic_launch(
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+=======================================================
+flame.train FAILED
+-------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+-------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-03-02_22:26:45
+  host      : cudo-gpu-ai-2-cluster-8cdc05eb
+  rank      : 2 (local_rank: 2)
+  exitcode  : -9 (pid: 738685)
+  error_file: <N/A>
+  traceback : Signal 9 (SIGKILL) received by PID 738685
+=======================================================
++ echo 'TRAINING DONE!'
+TRAINING DONE!
++ true
++ echo 'Converting the DCP checkpoints to HF format...'
+Converting the DCP checkpoints to HF format...
++ python -m flame.utils.convert_dcp_to_hf --path /work/mingze/flame/exp/20260217_tied --step 190734 --config configs/qwen3_lact_1B7_tied.json --tokenizer Qwen/Qwen3-1.7B-Base
+[titan] 2026-03-02 22:26:59,321 - root - INFO - Loading the config from configs/qwen3_lact_1B7_tied.json
+[titan] 2026-03-02 22:26:59,322 - root - INFO - Saving the config to /work/mingze/flame/exp/20260217_tied
+[titan] 2026-03-02 22:26:59,322 - root - INFO - Loading the tokenizer from Qwen/Qwen3-1.7B-Base
+[titan] 2026-03-02 22:26:59,469 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-1.7B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+[titan] 2026-03-02 22:26:59,477 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-1.7B-Base/ea980cb0a6c2ae4b936e82123acc929f1cec04c1/config.json "HTTP/1.1 200 OK"
+[titan] 2026-03-02 22:26:59,595 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-1.7B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+[titan] 2026-03-02 22:26:59,603 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-1.7B-Base/ea980cb0a6c2ae4b936e82123acc929f1cec04c1/tokenizer_config.json "HTTP/1.1 200 OK"
+[titan] 2026-03-02 22:26:59,723 - httpx - INFO - HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-1.7B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+[titan] 2026-03-02 22:26:59,850 - httpx - INFO - HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-1.7B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+[titan] 2026-03-02 22:27:00,483 - httpx - INFO - HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-1.7B-Base "HTTP/1.1 200 OK"
+[titan] 2026-03-02 22:27:00,485 - root - INFO - Saving the tokenizer to /work/mingze/flame/exp/20260217_tied
+[titan] 2026-03-02 22:27:00,553 - root - INFO - Saving the distributed checkpoint to /tmp/tmp77rtad4w/checkpoint.pt
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/work/mingze/flame/flame/utils/convert_dcp_to_hf.py", line 65, in <module>
+    save_pretrained(args.path, args.step, args.config, args.tokenizer)
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/work/mingze/flame/flame/utils/convert_dcp_to_hf.py", line 41, in save_pretrained
+    dcp_to_torch_save(checkpoint, checkpoint_path)
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/checkpoint/format_utils.py", line 212, in dcp_to_torch_save
+    _load_state_dict(
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/checkpoint/state_dict_loader.py", line 229, in _load_state_dict
+    central_plan: LoadPlan = distW.reduce_scatter("plan", local_step, global_step)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/checkpoint/utils.py", line 191, in reduce_scatter
+    raise result
+torch.distributed.checkpoint.api.CheckpointException: CheckpointException ranks:dict_keys([0])
+Traceback (most recent call last): (RANK 0)
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/checkpoint/utils.py", line 164, in reduce_scatter
+    local_data = map_fun()
+                 ^^^^^^^^^
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/checkpoint/logger.py", line 83, in wrapper
+    result = func(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/checkpoint/state_dict_loader.py", line 214, in local_step
+    metadata = storage_reader.read_metadata()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/checkpoint/filesystem.py", line 679, in read_metadata
+    with self.fs.create_stream(path, "rb") as metadata_file:
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/site-packages/torch/distributed/checkpoint/filesystem.py", line 388, in create_stream
+    with cast(Path, path).open(mode) as stream:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/mingze/miniconda3/envs/flame/lib/python3.11/pathlib.py", line 1044, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/work/mingze/flame/exp/20260217_tied/checkpoint/step-190734/.metadata'
+
++ echo 'RUNNING DONE!'
+RUNNING DONE!

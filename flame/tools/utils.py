@@ -21,6 +21,26 @@ def get_total_embedding_params(model):
             
     return total_params
 
+def get_parameter_counts(model: nn.Module) -> tuple[int, int, int]:
+    total_params = 0
+    trainable_params = 0
+    seen_param_ids = set()
+
+    for param in model.parameters():
+        param_id = id(param)
+        if param_id in seen_param_ids:
+            continue
+        seen_param_ids.add(param_id)
+
+        param_count = param.numel()
+        total_params += param_count
+        if param.requires_grad:
+            trainable_params += param_count
+
+    non_trainable_params = total_params - trainable_params
+    return total_params, trainable_params, non_trainable_params
+
+
 def get_nparams_and_flops(model: nn.Module, model_config, seq_len: int) -> tuple[int, int]:
     nparams = sum(p.numel() for p in model.parameters())
     # logger.info(

@@ -12,7 +12,7 @@ from datetime import timedelta
 
 import fla  # noqa
 import torch
-# from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss # commented out for now as it is not used so far; also not available in flash-linear-attention 0.4.0
+from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss # commented out for now as it is not used so far; also not available in flash-linear-attention 0.4.0
 from fla.ops.utils import prepare_position_ids
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpoint import CheckpointManager
@@ -35,7 +35,7 @@ from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
-from flame.tools.utils import get_nparams_and_flops
+from flame.tools.utils import get_nparams_and_flops, get_parameter_counts
 
 import custom_models
 # torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
@@ -165,7 +165,8 @@ def main(job_config: JobConfig):
         trust_remote_code=True,
         model_max_length=int(1e10),
     )
-    # logger.info(f"{tokenizer}")
+    tokenizer.eos_token_id = tokenizer.pad_token_id # for qwen3 base
+    logger.info(f"{tokenizer}")
 
     is_tokenized = False if job_config.training.tokenized_dataset_dir is None else True
 
@@ -209,6 +210,7 @@ def main(job_config: JobConfig):
         persistent_workers=job_config.training.persistent_workers,
         snapshot_every_n_steps=job_config.checkpoint.interval,
         sample_trunc_seq=job_config.training.sample_trunc_seq,
+        add_eos_token=job_config.training.add_eos_token_to_sample,
     )
     # breakpoint()
     # data_iterator = iter(dataloader)
@@ -242,6 +244,25 @@ def main(job_config: JobConfig):
     logger.info(
         f"Building model from the config\n{color.green}{model_config}{color.reset}"
     )
+
+    # E2E-TTT performs inner-loop autograd.grad inside forward, then uses outer loss.backward.
+    # With torch.compile + donated buffers, AOT backward requires retain_graph=False/create_graph=False
+    # across all backward calls, which conflicts with this pattern. Disable donated buffers for stability.
+    if job_config.training.compile and bool(getattr(model_config, "use_e2e_ttt", False)):
+        try:
+            job_config.training.compile = False
+            if getattr(torch._functorch.config, "donated_buffer", False):
+                torch._functorch.config.donated_buffer = False
+
+                logger.info(
+                    "Disabled torch._functorch.config.donated_buffer for E2E-TTT inner-loop autograd compatibility."
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to set torch._functorch.config.donated_buffer=False ({e}). "
+                "If you hit donated buffer backward errors, disable it manually."
+            )
+
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(model_config)
         if (
@@ -270,6 +291,17 @@ def main(job_config: JobConfig):
     # calculate model size and flops per token
     model_param_count, nparams_embedding, num_flops_per_token = get_nparams_and_flops(
         model, model_config, job_config.training.context_len
+    )
+    (
+        model_param_count_og,
+        model_trainable_param_count,
+        model_non_trainable_param_count,
+    ) = get_parameter_counts(model)
+    logger.info(
+        f"{color.green}Model parameters at init (before parallelism): "
+        f"total={model_param_count_og:,}, "
+        f"trainable={model_trainable_param_count:,}, "
+        f"non-trainable={model_non_trainable_param_count:,}{color.reset}"
     )
 
     # move sharded model to CPU/GPU and initialize weights via DTensor

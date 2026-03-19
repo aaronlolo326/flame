@@ -55,18 +55,31 @@ def load_data(run_name, data_set):
                     flattened_data[column_name] = None
 
     elif data_set == 'lm':
-        all_tasks = "gsm8k,winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,race".split(",")
+        all_tasks = "gsm8k,winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,race,wikitext".split(",")
         sorted_tasks = sorted(all_tasks)
         # iterate over sorted task names so columns are added in order
+        for task in ['lambada_openai','wikitext']:
+            if task in results:
+                metrics = results[task]
+                column_name = task + "_ppl"
+                if "perplexity,none" in metrics:
+                    flattened_data[column_name] = metrics["perplexity,none"]
+                if "word_perplexity,none" in metrics:
+                    flattened_data[column_name] = metrics["word_perplexity,none"]
         for task in sorted_tasks:
             if task in results:
                 metrics = results[task]
                 column_name = task
-                json_keys = ["acc,none", "exact_match,strict-match"]
+                json_keys = [
+                    "acc,none" if task not in ["arc_challenge", "hellaswag"] else "acc_norm,none",
+                    "exact_match,strict-match",
+                ]
                 for json_key in json_keys:
                     if json_key in metrics:
                         flattened_data[column_name] = metrics[json_key] * 100
                         break
+            else:
+                flattened_data[task] = None
 
     elif data_set == 'lb':
         all_tasks = "2wikimqa,dureader,gov_report,hotpotqa,lcc,lsht,multi_news,multifieldqa_en,multifieldqa_zh,musique,narrativeqa,passage_count,passage_retrieval_en,passage_retrieval_zh,qasper,qmsum,repobench-p,samsum,trec,triviaqa,vcsum".split(",")
