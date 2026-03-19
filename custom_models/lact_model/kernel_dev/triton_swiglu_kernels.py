@@ -29,10 +29,11 @@ def get_autotune_configs(
 
 ########################################################
 # W0_W2: [B, 2M, K]
-# X: [B, N, K]
-# O: [B, M, N]
-
-# This kernel supports dynamic shapes for B and N(sequence length) if you remove B and N from the autotune key.
+# X: [B, N, K]  (batched)  or  [T, K]  (varlen)
+# O: [B, M, N]  (batched)  or  [T, M]  (varlen)
+#
+# IS_VARLEN=False: standard batched mode
+# IS_VARLEN=True:  packed varlen mode — eff_lens/bos_arr precomputed
 ########################################################
 
 
@@ -45,6 +46,8 @@ def _fused_two_mm_swiglu_kernel(
     W0_W2,
     X,
     O,
+    eff_lens,   # [G] per-doc effective token count (varlen), or dummy (batched)
+    bos_arr,    # [G] per-doc start offset in X (varlen), or dummy (batched)
     B,
     M: tl.constexpr,
     N,
@@ -58,24 +61,38 @@ def _fused_two_mm_swiglu_kernel(
     stride_o_b,
     stride_o_m,
     stride_o_n,
+    IS_VARLEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    # 3D launch grid: (m-tiles, n-tiles, batch)
+    # 3D launch grid: (m-tiles, n-tiles, batch/docs)
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     pid_b = tl.program_id(axis=2)
+
+    N_eff = N
+    if IS_VARLEN:
+        N_eff = tl.load(eff_lens + pid_b).to(tl.int32)
+        if pid_n * BLOCK_N >= N_eff:
+            return
+        bos = tl.load(bos_arr + pid_b).to(tl.int64)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
     offs_k = tl.arange(0, BLOCK_K)  # [BLOCK_K]
 
-    # Pointers base for this batch
+    mask_m = offs_m < M
+    mask_n = offs_n < N_eff
+
+    # Pointers base for this batch/doc
     w0_batch = W0_W2 + pid_b * stride_w_b
     w2_batch = W0_W2 + pid_b * stride_w_b + M * stride_w_m
-    x_batch = X + pid_b * stride_x_b
-    o_batch = O + pid_b * stride_o_b
+
+    if IS_VARLEN:
+        x_base = X + bos * stride_x_n
+    else:
+        x_base = X + pid_b * stride_x_b
 
     # Accumulators in fp32
     acc0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -94,11 +111,11 @@ def _fused_two_mm_swiglu_kernel(
             w2_batch + (offs_m[:, None] * stride_w_m) + (k_ids[None, :] * stride_w_k)
         )
         x_ptrs = (
-            x_batch + (offs_n[:, None] * stride_x_n) + (k_ids[None, :] * stride_x_k)
+            x_base + (offs_n[:, None] * stride_x_n) + (k_ids[None, :] * stride_x_k)
         )
 
-        w_mask = (offs_m[:, None] < M) & k_mask[None, :]
-        x_mask = (offs_n[:, None] < N) & k_mask[None, :]
+        w_mask = mask_m[:, None] & k_mask[None, :]
+        x_mask = mask_n[:, None] & k_mask[None, :]
 
         w0 = tl.load(w0_ptrs, mask=w_mask, other=0).to(tl.bfloat16)
         w2 = tl.load(w2_ptrs, mask=w_mask, other=0).to(tl.bfloat16)
@@ -115,9 +132,15 @@ def _fused_two_mm_swiglu_kernel(
     out = y2 * (y0 * tl.sigmoid(y0))
 
     # Store to bf16
-    o_ptrs = o_batch + (offs_m[:, None] * stride_o_m) + (offs_n[None, :] * stride_o_n)
-    o_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(o_ptrs, out.to(tl.bfloat16), mask=o_mask)
+    if IS_VARLEN:
+        # result is [BLOCK_M, BLOCK_N], output is [T, M] — store transposed
+        glob_n = bos + offs_n.to(tl.int64)
+        o_ptrs = O + glob_n[:, None] * stride_o_n + offs_m[None, :] * stride_o_m
+        tl.store(o_ptrs, tl.trans(out).to(tl.bfloat16), mask=mask_n[:, None] & mask_m[None, :])
+    else:
+        o_batch = O + pid_b * stride_o_b
+        o_ptrs = o_batch + (offs_m[:, None] * stride_o_m) + (offs_n[None, :] * stride_o_n)
+        tl.store(o_ptrs, out.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
 
 
 def fused_two_mm_swiglu_triton(
@@ -140,6 +163,7 @@ def fused_two_mm_swiglu_triton(
     M = M_times_2 // 2
 
     O = torch.empty((B, M, N), device=X.device, dtype=torch.bfloat16)
+    _dummy = torch.empty(0, dtype=torch.int32, device=X.device)
 
     # Strides (PyTorch: element strides)
     stride_w_b, stride_w_m, stride_w_k = W0_W2.stride()
@@ -150,29 +174,71 @@ def fused_two_mm_swiglu_triton(
         return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]), B)
 
     _fused_two_mm_swiglu_kernel[grid](
-        W0_W2,
-        X,
-        O,
-        B,
-        M,
-        N,
-        K,
-        stride_w_b,
-        stride_w_m,
-        stride_w_k,
-        stride_x_b,
-        stride_x_n,
-        stride_x_k,
-        stride_o_b,
-        stride_o_m,
-        stride_o_n,
-        # BLOCK_M=BLOCK_M,
-        # BLOCK_N=BLOCK_N,
-        # BLOCK_K=BLOCK_K,
-        # num_warps=num_warps,
-        # num_stages=num_stages,
+        W0_W2, X, O, _dummy, _dummy,
+        B, M, N, K,
+        stride_w_b, stride_w_m, stride_w_k,
+        stride_x_b, stride_x_n, stride_x_k,
+        stride_o_b, stride_o_m, stride_o_n,
+        IS_VARLEN=False,
     )
     return O
+
+
+def fused_two_mm_swiglu_varlen_triton(
+    W0_W2: torch.Tensor,
+    X: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_size: int = 0,
+    chunk_idx: int = 0,
+    eff_lens: torch.Tensor = None,
+    bos_arr: torch.Tensor = None,
+    max_sl: int = 0,
+    out: torch.Tensor = None,
+):
+    """
+    Varlen variant. Shapes:
+      W0_W2 : [G, 2M, K]  (bf16) — per-doc weights
+      X     : [T, K]       (bf16) — packed tokens
+      cu_seqlens: [G+1]    (int32)
+      eff_lens, bos_arr, max_sl: precomputed (if None, computed from cu_seqlens + chunk params)
+      out   : optional [T, M] output buffer (writes in-place, no alloc)
+      returns O: [T, M]    (bf16) — packed output
+    """
+    assert W0_W2.dtype == torch.bfloat16 and X.dtype == torch.bfloat16
+    assert W0_W2.is_contiguous() and X.is_contiguous()
+
+    G, M2, K = W0_W2.shape
+    T, Kx = X.shape
+    assert Kx == K
+    M = M2 // 2
+
+    O = out if out is not None else torch.empty((T, M), device=X.device, dtype=torch.bfloat16)
+
+    if eff_lens is None:
+        eff_lens, bos_arr, max_sl = compute_varlen_args(cu_seqlens, chunk_size, chunk_idx)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(max_sl, meta["BLOCK_N"]),
+            G,
+        )
+
+    _fused_two_mm_swiglu_kernel[grid](
+        W0_W2, X, O, eff_lens, bos_arr,
+        G, M, max_sl, K,
+        W0_W2.stride(0), W0_W2.stride(1), W0_W2.stride(2),
+        0, X.stride(0), X.stride(1),          # stride_x_b=0, stride_x_n, stride_x_k
+        0, O.stride(1), O.stride(0),          # stride_o_b=0, stride_o_m, stride_o_n
+        IS_VARLEN=True,
+    )
+    return O
+
+
+try:
+    from utils import compute_varlen_args
+except ImportError:
+    from .utils import compute_varlen_args
 
 
 # -------------------------
@@ -220,5 +286,99 @@ def check_correctness():
     report_error(O_ref, O_triton, "triton_swiglu_kernel")
 
 
+def _reference_varlen_padded(W0_W2, X, cu_seqlens):
+    """Pad -> batched Triton kernel -> unpack. Same precision as varlen kernel."""
+    from grouped_gemm import _pack_to_padded, _padded_to_pack
+
+    G = cu_seqlens.shape[0] - 1
+    T = X.shape[0]
+    doc_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    max_len = doc_lens.max().item()
+
+    X_pad = _pack_to_padded(X, cu_seqlens, max_len)  # [G, max_len, K]
+    O_batched = fused_two_mm_swiglu_triton(W0_W2, X_pad)  # [G, M, max_len]
+    O_padded = O_batched.transpose(1, 2)  # [G, max_len, M]
+    return _padded_to_pack(O_padded, cu_seqlens, T)
+
+
 if __name__ == "__main__":
-    check_correctness()
+    import argparse
+    from kernel_test_utils import test_correctness, benchmark, get_chunk_info
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    device = "cuda"
+    num_docs = 4
+    doc_lens = [4096, 3072, 2048, 1024]
+    d, dh = 512, 512
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(doc_lens), 0).tolist()),
+        dtype=torch.int32, device=device,
+    )
+    packed_len = cu_seqlens[-1].item()
+
+    W0_W2 = torch.randn(num_docs, 2 * dh, d, device=device, dtype=torch.bfloat16)
+    X = torch.randn(packed_len, d, device=device, dtype=torch.bfloat16)
+
+    print(f"Config: {num_docs=}, {doc_lens=}, {d=}, {dh=}, {packed_len=}")
+    print()
+
+    # ===== Correctness vs padded batched kernel (same precision) =====
+    print("=" * 60)
+    print("Varlen correctness vs padded batched Triton kernel")
+    print("=" * 60)
+
+    test_correctness(
+        fused_two_mm_swiglu_varlen_triton,
+        _reference_varlen_padded,
+        (W0_W2, X, cu_seqlens),
+        (W0_W2, X, cu_seqlens),
+        debug=args.debug, atol=1e-2, rtol=1e-2,
+    )
+
+    # ===== Benchmark vs padded batched kernel =====
+    print()
+    print("=" * 60)
+    print("Varlen benchmark vs padded batched kernel")
+    print("=" * 60)
+
+    from grouped_gemm import _pack_to_padded
+    max_len = max(doc_lens)
+    X_pad = _pack_to_padded(X, cu_seqlens, max_len)
+
+    # Precompute varlen args so benchmark measures only the kernel launch
+    eff_lens, bos_arr, max_sl_val = compute_varlen_args(cu_seqlens)
+
+    benchmark(
+        lambda W0_W2, X, cu_seqlens: fused_two_mm_swiglu_varlen_triton(
+            W0_W2, X, cu_seqlens, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val,
+        ),
+        lambda W0_W2, X_pad: fused_two_mm_swiglu_triton(W0_W2, X_pad),
+        (W0_W2, X, cu_seqlens),
+        (W0_W2, X_pad),
+    )
+
+    # ===== Chunk correctness =====
+    chunk_size = 2048
+    _, _, max_chunks = get_chunk_info(cu_seqlens, chunk_size, 0)
+
+    print()
+    print("=" * 60)
+    print(f"Chunk correctness (chunk_size={chunk_size})")
+    print("=" * 60)
+
+    for chunk_index in range(max_chunks):
+        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
+        if len(idx) == 0:
+            break
+        # Reference: gather chunk tokens, call base varlen kernel
+        ref_out = fused_two_mm_swiglu_varlen_triton(W0_W2, X[idx], chunk_cu)
+        # Test: call chunk kernel on full buffer
+        test_out = fused_two_mm_swiglu_varlen_triton(W0_W2, X, cu_seqlens, chunk_size=chunk_size, chunk_idx=chunk_index)
+        diff = (test_out[idx] - ref_out).abs().max().item()
+        print(f"  chunk_idx={chunk_index}: max_diff={diff:.2e}, n_tokens={len(idx)}")
+        assert diff == 0.0, f"chunk_idx={chunk_index} not exact match!"
+
+    print("✓ PASS (exact match)")

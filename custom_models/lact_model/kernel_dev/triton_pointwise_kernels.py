@@ -39,7 +39,8 @@ def _swiglu_bwd_bwd_fused_kernel(
     OUT_GRAD_LR2,
     OUT_DX0X2,  # *[B, 2D, L] or [T, 2D]
     OUT_HIDDEN_LR1,  # *[B, D, L] or [T, D]
-    cu_seqlens,
+    eff_lens,
+    bos_arr,
     # ---- sizes ----
     B,
     D: tl.constexpr,
@@ -75,14 +76,13 @@ def _swiglu_bwd_bwd_fused_kernel(
     pid_l = tl.program_id(1)
     pid_d = tl.program_id(2)
 
-    # --- varlen: compute bos and effective L ---
+    # --- varlen: load precomputed eff_len and bos ---
     L_eff = L
     if IS_VARLEN:
-        bos = tl.load(cu_seqlens + pid_b).to(tl.int64)
-        eos = tl.load(cu_seqlens + pid_b + 1).to(tl.int64)
-        L_eff = eos - bos
+        L_eff = tl.load(eff_lens + pid_b).to(tl.int32)
         if pid_l * BLOCK_L >= L_eff:
             return
+        bos = tl.load(bos_arr + pid_b).to(tl.int64)
 
     # --- base pointers: bos*token_stride (varlen) or pid_b*batch_stride (batched) ---
     if IS_VARLEN:
@@ -319,7 +319,7 @@ def triton_swiglu_bwd_bwd_fused_cat_inp_out(
             triton.cdiv(D, meta["BLOCK_D"]),
         )
 
-    _dummy_cu = torch.empty(0, dtype=torch.int32, device=device)
+    _dummy = torch.empty(0, dtype=torch.int32, device=device)
 
     _swiglu_bwd_bwd_fused_kernel[grid](
         # inputs
@@ -338,7 +338,8 @@ def triton_swiglu_bwd_bwd_fused_cat_inp_out(
         grad_lr2,
         dx0_x2,
         hidden_lr1,
-        _dummy_cu,
+        _dummy,
+        _dummy,
         # sizes
         B,
         D,
@@ -384,11 +385,23 @@ def triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(
     grad_dx0_dx2: torch.Tensor,  # [T, 2D]
     grad_hidden_lr1: torch.Tensor,  # [T, D]
     cu_seqlens: torch.Tensor,    # [G+1]
+    chunk_size: int = 0,
+    chunk_idx: int = 0,
+    eff_lens: torch.Tensor = None,
+    bos_arr: torch.Tensor = None,
+    max_sl: int = 0,
 ):
     """Varlen variant. All 2D tensors are [T, feat] packed, lr/grad_lr are [T]."""
+    try:
+        from utils import compute_varlen_args
+    except ImportError:
+        from .utils import compute_varlen_args
+
     T, D = dh.shape
     G = cu_seqlens.shape[0] - 1
-    max_sl = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+
+    if eff_lens is None:
+        eff_lens, bos_arr, max_sl = compute_varlen_args(cu_seqlens, chunk_size, chunk_idx)
 
     device = dh.device
     x_dtype = x0_x2.dtype
@@ -415,7 +428,7 @@ def triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(
     _swiglu_bwd_bwd_fused_kernel[grid](
         dh, x0_x2, lr0, lr1, lr2, grad_dx0_dx2, grad_hidden_lr1,
         grad_dh, grad_x0_x2, grad_lr0, grad_lr1, grad_lr2, dx0_x2, hidden_lr1,
-        cu_seqlens,
+        eff_lens, bos_arr,
         G, D, max_sl,
         0, s_dh_d, s_dh_l,                # s_dh_b=0, s_dh_d, s_dh_l
         0, s_x0x2_d, s_x0x2_l,            # s_x0x2_b=0
@@ -606,7 +619,7 @@ def _reference_varlen_padded(dh, x0_x2, lr0, lr1, lr2, grad_dx0_dx2, grad_hidden
 
 if __name__ == "__main__":
     import argparse
-    from kernel_test_utils import test_correctness, benchmark
+    from kernel_test_utils import test_correctness, benchmark, get_chunk_info
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
@@ -651,8 +664,64 @@ if __name__ == "__main__":
     print("Varlen benchmark vs padded batched kernel")
     print("=" * 60)
 
+    from grouped_gemm import _pack_to_padded
+    max_len = max(doc_lens)
+    # Pre-pad for fair benchmark: [T, feat] -> [G, feat, max_len] (batched kernel layout)
+    dh_p = _pack_to_padded(dh, cu_seqlens, max_len).transpose(1, 2).contiguous()
+    x0_x2_p = _pack_to_padded(x0_x2, cu_seqlens, max_len).transpose(1, 2).contiguous()
+    gdx_p = _pack_to_padded(gdx, cu_seqlens, max_len).transpose(1, 2).contiguous()
+    gh_p = _pack_to_padded(gh, cu_seqlens, max_len).transpose(1, 2).contiguous()
+    lr0_p = _pack_to_padded(lr0.unsqueeze(1), cu_seqlens, max_len).squeeze(2).contiguous()
+    lr1_p = _pack_to_padded(lr1.unsqueeze(1), cu_seqlens, max_len).squeeze(2).contiguous()
+    lr2_p = _pack_to_padded(lr2.unsqueeze(1), cu_seqlens, max_len).squeeze(2).contiguous()
+
+    ref_bench_args = (dh_p, x0_x2_p, lr0_p, lr1_p, lr2_p, gdx_p, gh_p)
+
+    try:
+        from utils import compute_varlen_args
+    except ImportError:
+        from .utils import compute_varlen_args
+    eff_lens, bos_arr, max_sl_val = compute_varlen_args(cu_seqlens)
+
     benchmark(
-        lambda *a: triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(*a),
-        lambda *a: _reference_varlen_padded(*a),
-        triton_args, triton_args,
+        lambda *a: triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(
+            *a, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val,
+        ),
+        lambda *a: triton_swiglu_bwd_bwd_fused_cat_inp_out(*a),
+        triton_args, ref_bench_args,
     )
+
+    # ===== Chunk correctness =====
+    chunk_size = 2048
+    _, _, max_chunks = get_chunk_info(cu_seqlens, chunk_size, 0)
+
+    print()
+    print("=" * 60)
+    print(f"Chunk correctness (chunk_size={chunk_size})")
+    print("=" * 60)
+
+    for chunk_index in range(max_chunks):
+        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
+        if len(idx) == 0:
+            break
+        # Reference: gather chunk tokens, call base varlen kernel
+        ref_out = triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(
+            dh[idx], x0_x2[idx], lr0[idx], lr1[idx], lr2[idx], gdx[idx], gh[idx], chunk_cu,
+        )
+        # Test: call chunk kernel on full buffer
+        test_out = triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(
+            dh, x0_x2, lr0, lr1, lr2, gdx, gh, cu_seqlens,
+            chunk_size=chunk_size, chunk_idx=chunk_index,
+        )
+        # 7 outputs: grad_dh[T,D], grad_x0_x2[T,2D], grad_lr0[T], grad_lr1[T], grad_lr2[T], dx0_x2[T,2D], hidden_lr1[T,D]
+        names = ["grad_dh", "grad_x0_x2", "grad_lr0", "grad_lr1", "grad_lr2", "dx0_x2", "hidden_lr1"]
+        diffs = []
+        for name, t, r in zip(names, test_out, ref_out):
+            d = (t[idx] - r).abs().max().item()
+            diffs.append(d)
+        max_d = max(diffs)
+        print(f"  chunk_idx={chunk_index}: max_diff={max_d:.2e}, n_tokens={len(idx)}")
+        # grad_lr outputs use atomic_add — ordering differs between chunk and full, so allow tolerance
+        assert max_d < 1e-4, f"chunk_idx={chunk_index} mismatch! diffs={dict(zip(names, diffs))}"
+
+    print("✓ PASS")

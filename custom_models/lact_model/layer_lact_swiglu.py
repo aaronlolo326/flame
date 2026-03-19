@@ -17,6 +17,8 @@ import torch.nn.functional as F
 import torch.nn as nn
 from einops import rearrange, repeat
 
+from .profiling_utils import profile_range
+
 from .ttt_operation import (
     block_causal_lact_swiglu,
     prenorm_block_causal_lact_swiglu,
@@ -289,132 +291,143 @@ class LaCTSWIGLULayer(nn.Module):
 
         batch_size, q_len, _ = hidden_states.size()
 
-        q, k, v = self.qkv(hidden_states).chunk(3, dim=-1)
+        with profile_range("qkv_proj"):
+            q, k, v = self.qkv(hidden_states).chunk(3, dim=-1)
+
         #### compute window attention first, then do ttt. ####
 
-        if self.attn_qk_norm:
-            q, k = self.q_norm(q), self.k_norm(k)
+        with profile_range("qk_norm"):
+            if self.attn_qk_norm:
+                q, k = self.q_norm(q), self.k_norm(k)
 
-        # rescale and reshift the q, k for test-time training layer.
-        fast_q, fast_k = self._rescale_qk(q, k)
-        fast_v = v
+        with profile_range("rescale_qk"):
+            # rescale and reshift the q, k for test-time training layer.
+            fast_q, fast_k = self._rescale_qk(q, k)
+            fast_v = v
 
-        q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
-        k = rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
-        v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
+        with profile_range("rope"):
+            q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
+            k = rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
+            v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
-        # WARNING: current implementation ignores cu_seqlens for ttt-layer.
-        cu_seqlens = kwargs.get("cu_seqlens", None)
+            # WARNING: current implementation ignores cu_seqlens for ttt-layer.
+            cu_seqlens = kwargs.get("cu_seqlens", None)
 
-        seqlen_offset, max_seqlen = 0, q_len
-        if past_key_values is not None:
-            seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
-            max_seqlen = q.shape[1] + seqlen_offset
+            seqlen_offset, max_seqlen = 0, q_len
+            if past_key_values is not None:
+                seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
+                max_seqlen = q.shape[1] + seqlen_offset
 
-            if attention_mask is not None:
-                # to deliminate the offsets of padding tokens
-                seqlen_offset = (
-                    seqlen_offset + attention_mask.sum(-1) - attention_mask.shape[-1]
-                )
-                max_seqlen = q.shape[1] + max(seqlen_offset)
+                if attention_mask is not None:
+                    # to deliminate the offsets of padding tokens
+                    seqlen_offset = (
+                        seqlen_offset + attention_mask.sum(-1) - attention_mask.shape[-1]
+                    )
+                    max_seqlen = q.shape[1] + max(seqlen_offset)
 
-        if self.max_position_embeddings is not None:
-            max_seqlen = max(max_seqlen, self.max_position_embeddings)
-        # [b, s, n_h, d]
-        q, k = self.rotary(
-            q,
-            k,
-            seqlen_offset=seqlen_offset,
-            max_seqlen=max_seqlen,
-            cu_seqlens=cu_seqlens,
-        )
+            if self.max_position_embeddings is not None:
+                max_seqlen = max(max_seqlen, self.max_position_embeddings)
+            # [b, s, n_h, d]
+            q, k = self.rotary(
+                q,
+                k,
+                seqlen_offset=seqlen_offset,
+                max_seqlen=max_seqlen,
+                cu_seqlens=cu_seqlens,
+            )
 
-        if past_key_values is not None:
-            cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
-            k_cached, v_cached = past_key_values.update(
-                attn_state=(k.flatten(-2, -1), v.flatten(-2, -1)),
-                layer_idx=self.layer_idx,
-                offset=q_len,
-                cache_kwargs=dict(window_size=self.window_size),
-            )["attn_state"]
-            if cache_has_content:
-                k, v = k_cached, v_cached
-                k = rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
-                v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
+            if past_key_values is not None:
+                cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
+                k_cached, v_cached = past_key_values.update(
+                    attn_state=(k.flatten(-2, -1), v.flatten(-2, -1)),
+                    layer_idx=self.layer_idx,
+                    offset=q_len,
+                    cache_kwargs=dict(window_size=self.window_size),
+                )["attn_state"]
+                if cache_has_content:
+                    k, v = k_cached, v_cached
+                    k = rearrange(k, "... (h d) -> ... h d", d=self.head_dim)
+                    v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
         if flash_attn_func is None:
             raise ImportError(
                 "Please install Flash Attention via `pip install flash-attn --no-build-isolation` first"
             )
 
-        # Contains at least one padding token in the sequence
-        if attention_mask is not None:
-            q, k, v, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                q, k, v, attention_mask, q_len
-            )
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_q, max_seqlen_k = max_seq_lens
-            o = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                causal=True,
-                window_size=(
-                    (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
-                ),
-            )
-            o = pad_input(o, indices_q, batch_size, q_len)
-        elif cu_seqlens is not None:
-            o = flash_attn_varlen_func(
-                q.squeeze(0),
-                k.squeeze(0),
-                v.squeeze(0),
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                causal=True,
-                window_size=(
-                    (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
-                ),
-            ).unsqueeze(0)
-        else:
-            o = flash_attn_func(
-                q,
-                k,
-                v,
-                causal=True,
-                window_size=(
-                    (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
-                ),
-            )
-        o = o.reshape(batch_size, q_len, -1)
+        with profile_range("flash_attn"):
+            # Contains at least one padding token in the sequence
+            if attention_mask is not None:
+                q, k, v, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+                    q, k, v, attention_mask, q_len
+                )
+                cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+                max_seqlen_q, max_seqlen_k = max_seq_lens
+                o = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    causal=True,
+                    window_size=(
+                        (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
+                    ),
+                )
+                o = pad_input(o, indices_q, batch_size, q_len)
+            elif cu_seqlens is not None:
+                o = flash_attn_varlen_func(
+                    q.squeeze(0),
+                    k.squeeze(0),
+                    v.squeeze(0),
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    causal=True,
+                    window_size=(
+                        (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
+                    ),
+                ).unsqueeze(0)
+            else:
+                o = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    causal=True,
+                    window_size=(
+                        (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
+                    ),
+                )
+            o = o.reshape(batch_size, q_len, -1)
 
         ##### TTT starts here.
         if self.num_fw_heads > 0:
-            # Split heads then merge it to batch dimension
-            fast_q = rearrange(fast_q, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
-            fast_k = rearrange(fast_k, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
-            fast_v = rearrange(fast_v, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
+          with profile_range("ttt"):
+            with profile_range("head_split"):
+                # Split heads then merge it to batch dimension
+                fast_q = rearrange(fast_q, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
+                fast_k = rearrange(fast_k, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
+                fast_v = rearrange(fast_v, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads)
 
-            if self.qkv_silu:
-                if self.no_v_silu:
-                    fast_q = F.silu(fast_q)
-                    fast_k = F.silu(fast_k)
-                else:
-                    fast_q = F.silu(fast_q)
-                    fast_k = F.silu(fast_k)
-                    fast_v = F.silu(fast_v)
+            with profile_range("activations"):
+                if self.qkv_silu:
+                    if self.no_v_silu:
+                        fast_q = F.silu(fast_q)
+                        fast_k = F.silu(fast_k)
+                    else:
+                        fast_q = F.silu(fast_q)
+                        fast_k = F.silu(fast_k)
+                        fast_v = F.silu(fast_v)
 
-            # per head l2 norm for fast_q, fast_k.
-            fast_q = l2_norm(fast_q)
-            fast_k = l2_norm(fast_k)
+            with profile_range("l2_norm"):
+                # per head l2 norm for fast_q, fast_k.
+                fast_q = l2_norm(fast_q)
+                fast_k = l2_norm(fast_k)
 
             if not self.ttt_nope:
+              with profile_range("rope"):
                 #### Apply rotary embedding.  Here we use the same rope as the attention layer.
                 # I observed that using NoPE for ttt (No positional encoding) here also works.
                 fast_q = rearrange(
@@ -446,52 +459,55 @@ class LaCTSWIGLULayer(nn.Module):
                 )
                 #### RoPE done. ####
 
-            if self.w0_w2_low_rank > 0:
-                fw_w0 = self.w0().repeat(batch_size, 1, 1)
-                fw_w2 = self.w2().repeat(batch_size, 1, 1)
-            else:
-                fw_w0 = self.w0.repeat(
+            with profile_range("fw_prepare"):
+                if self.w0_w2_low_rank > 0:
+                    fw_w0 = self.w0().repeat(batch_size, 1, 1)
+                    fw_w2 = self.w2().repeat(batch_size, 1, 1)
+                else:
+                    fw_w0 = self.w0.repeat(
+                        batch_size, 1, 1
+                    )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
+                    fw_w2 = self.w2.repeat(
+                        batch_size, 1, 1
+                    )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
+
+                fw_w1 = self.w1.repeat(
                     batch_size, 1, 1
-                )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
-                fw_w2 = self.w2.repeat(
-                    batch_size, 1, 1
-                )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
+                )  # [nh, d_out, d_h] -> [b*nh, d_out, d_h]
 
-            fw_w1 = self.w1.repeat(
-                batch_size, 1, 1
-            )  # [nh, d_out, d_h] -> [b*nh, d_out, d_h]
-
-            lr = self.lr_proj(hidden_states)  # [b, s, num_heads * lr_dim_per_head]
-            if self.lr_parameterization == "mamba":
-                lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
-            else:
-                raise NotImplementedError(
-                    f"LR parameterization {self.lr_parameterization} not implemented"
+            with profile_range("lr_proj"):
+                lr = self.lr_proj(hidden_states)  # [b, s, num_heads * lr_dim_per_head]
+                if self.lr_parameterization == "mamba":
+                    lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
+                else:
+                    raise NotImplementedError(
+                        f"LR parameterization {self.lr_parameterization} not implemented"
+                    )
+                fw_lr = rearrange(
+                    lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=self.num_fw_heads
                 )
-            fw_lr = rearrange(
-                lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=self.num_fw_heads
-            )
-            fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
+                fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
 
-            if self.use_momentum:
-                momentum = self.momentum_proj(hidden_states).float()  # [b, s, nh]
-                momentum = rearrange(
-                    momentum, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
-                )
-            else:
-                momentum = None
+                if self.use_momentum:
+                    momentum = self.momentum_proj(hidden_states).float()  # [b, s, nh]
+                    momentum = rearrange(
+                        momentum, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
+                    )
+                else:
+                    momentum = None
 
-            if self.fp32_states:
-                # here we cast the fast weights to fp32, but all matmuls are still in bf16
-                # only fast weight updates are in fp32.  This is similar to bf16 training of slow weights.
-                fw_w0 = fw_w0.to(torch.float32)
-                fw_w1 = fw_w1.to(torch.float32)
-                fw_w2 = fw_w2.to(torch.float32)
+                if self.fp32_states:
+                    # here we cast the fast weights to fp32, but all matmuls are still in bf16
+                    # only fast weight updates are in fp32.  This is similar to bf16 training of slow weights.
+                    fw_w0 = fw_w0.to(torch.float32)
+                    fw_w1 = fw_w1.to(torch.float32)
+                    fw_w2 = fw_w2.to(torch.float32)
 
             # [b * nh, s, d_ttt_head]
             if self.ttt_prenorm:
                 # pre-norm version of ttt.   state = state + f(norm(state))
                 if self.use_fused_kernel:
+                  with profile_range("prenorm_fused"):
                     fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
                         fw_w0,
                         fw_w1,
@@ -507,6 +523,7 @@ class LaCTSWIGLULayer(nn.Module):
                         momentum=momentum,
                     )
                 else:
+                  with profile_range("prenorm"):
                     fw_x = prenorm_block_causal_lact_swiglu(
                         fw_w0,
                         fw_w1,
@@ -524,6 +541,7 @@ class LaCTSWIGLULayer(nn.Module):
             else:
                 # post-norm version of ttt.   state = norm(state + f(state))
                 if self.use_fused_kernel:
+                  with profile_range("postnorm_fused"):
                     fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
                         fw_w0,
                         fw_w1,
@@ -539,6 +557,7 @@ class LaCTSWIGLULayer(nn.Module):
                         momentum=momentum,
                     )
                 else:
+                  with profile_range("postnorm"):
                     fw_x = block_causal_lact_swiglu(
                         fw_w0,
                         fw_w1,
@@ -554,23 +573,25 @@ class LaCTSWIGLULayer(nn.Module):
                         momentum=momentum,
                     )
 
-            # per-head output norm for ttt layer.
-            ttt_x_normed = self.ttt_norm(fw_x)
-            if self.learnable_ttt_scale:
-                ttt_scale = F.silu(self.ttt_scale_proj(hidden_states), inplace=False)
-                ttt_scale = rearrange(
-                    ttt_scale, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
-                )
-                ttt_x_normed = ttt_x_normed * ttt_scale
+            with profile_range("output_norm"):
+                # per-head output norm for ttt layer.
+                ttt_x_normed = self.ttt_norm(fw_x)
+                if self.learnable_ttt_scale:
+                    ttt_scale = F.silu(self.ttt_scale_proj(hidden_states), inplace=False)
+                    ttt_scale = rearrange(
+                        ttt_scale, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
+                    )
+                    ttt_x_normed = ttt_x_normed * ttt_scale
 
-            ttt_x_normed = rearrange(
-                ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
-            )
+                ttt_x_normed = rearrange(
+                    ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
+                )
 
             o = o + ttt_x_normed
         ### TTT ends ###
         
-        o = self.o_proj(o)
+        with profile_range("o_proj"):
+            o = self.o_proj(o)
 
         if not output_attentions:
             attentions = None

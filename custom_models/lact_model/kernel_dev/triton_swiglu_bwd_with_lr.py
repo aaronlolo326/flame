@@ -27,6 +27,20 @@ def get_autotune_configs(
     return configs
 
 
+########################################################
+# Three fused GEMMs (W0@X.T, W2@X.T, W1.T@V.T) with
+# SiLU backward epilogue + per-token lr scaling.
+#
+# IS_VARLEN=False: batched mode
+#   W0_W2: [B, 2M, K], W1: [B, K, M], X/V: [B, N, K], lr: [B, N]
+#   → DY0_DY2: [B, 2M, N], Hidden: [B, M, N]
+#
+# IS_VARLEN=True: packed varlen mode
+#   W0_W2: [G, 2M, K], W1: [G, K, M], X/V: [T, K], lr: [T]
+#   → DY0_DY2: [T, 2M], Hidden: [T, M]
+########################################################
+
+
 @triton.autotune(configs=get_autotune_configs(), key=["B", "M", "N", "K"])
 @triton.jit
 def _swiglu_three_bmm_with_lr_kernel(
@@ -40,6 +54,8 @@ def _swiglu_three_bmm_with_lr_kernel(
     # outputs
     dy0_dy2_ptr,
     hidden_ptr,
+    eff_lens,
+    bos_arr,
     B,
     M: tl.constexpr,
     N,
@@ -52,22 +68,23 @@ def _swiglu_three_bmm_with_lr_kernel(
     s_w1_b,
     s_w1_k,
     s_w1_m,
-    # strides for X and V [B, N, K]
+    # strides for X and V [B, N, K] or [T, K]
     s_x_b,
     s_x_n,
     s_x_k,
-    # NEW: strides for lr* [B, N]
+    # strides for lr* [B, N] or unused for varlen (lr is [T], stride=1)
     s_lr_b,
     s_lr_n,
-    # strides for dy0_dy2 [B, 2M, N]
+    # strides for dy0_dy2 [B, 2M, N] or [T, 2M]
     s_dy0_dy2_b,
     s_dy0_dy2_m,
     s_dy0_dy2_n,
-    # strides for Hidden [B, M, N]
+    # strides for Hidden [B, M, N] or [T, M]
     s_h_b,
     s_h_m,
     s_h_n,
     out_dtype: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
     # meta
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -77,25 +94,37 @@ def _swiglu_three_bmm_with_lr_kernel(
     pid_n = tl.program_id(1)
     pid_b = tl.program_id(2)
 
+    N_eff = N
+    if IS_VARLEN:
+        N_eff = tl.load(eff_lens + pid_b).to(tl.int32)
+        if pid_n * BLOCK_N >= N_eff:
+            return
+        bos = tl.load(bos_arr + pid_b).to(tl.int64)
+
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
     # Masks for ragged tiles
     mask_m = offs_m < M
-    mask_n = offs_n < N
+    mask_n = offs_n < N_eff
 
     # FP32 accumulators
     acc_y0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     acc_y2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     acc_dh = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Bases for this batch
+    # Bases for this batch/doc (weights always [B/G, ...])
     w0_batch = w0_w2_ptr + pid_b * s_w0w2_b
     w2_batch = w0_w2_ptr + pid_b * s_w0w2_b + M * s_w0w2_m
     w1_batch = w1_ptr + pid_b * s_w1_b
-    x_batch = x_ptr + pid_b * s_x_b
-    v_batch = v_ptr + pid_b * s_x_b
+
+    if IS_VARLEN:
+        x_base = x_ptr + bos * s_x_n
+        v_base = v_ptr + bos * s_x_n
+    else:
+        x_base = x_ptr + pid_b * s_x_b
+        v_base = v_ptr + pid_b * s_x_b
 
     # --- K loop ---
     num_k_tiles = tl.cdiv(K, BLOCK_K)
@@ -117,11 +146,11 @@ def _swiglu_three_bmm_with_lr_kernel(
         a1 = tl.load(a1_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
 
         # Bx = X^T[k_ids, offs_n] = X[offs_n, k_ids] -> [K, N]
-        bx_ptrs = x_batch + (offs_n[None, :] * s_x_n + k_ids[:, None] * s_x_k)
+        bx_ptrs = x_base + (offs_n[None, :] * s_x_n + k_ids[:, None] * s_x_k)
         bx = tl.load(bx_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
 
         # Bv = V^T[k_ids, offs_n] -> [K, N]
-        bv_ptrs = v_batch + (offs_n[None, :] * s_x_n + k_ids[:, None] * s_x_k)
+        bv_ptrs = v_base + (offs_n[None, :] * s_x_n + k_ids[:, None] * s_x_k)
         bv = tl.load(bv_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
 
         # Three GEMMs (FP32 accumulate)
@@ -130,9 +159,6 @@ def _swiglu_three_bmm_with_lr_kernel(
         acc_dh += tl.dot(a1, bv, out_dtype=tl.float32)
 
     # --- Epilogue on fragments (FP32 math) ---
-    # Hidden = swish(y0) * y2
-    # DY0 = sigmoid(y0) * y2 * dh * (1 + y0 * (1 - sigmoid(y0)))
-    # DY2 = swish(y0) * dh
     y0 = acc_y0
     y2 = acc_y2
     dh = acc_dh
@@ -144,20 +170,20 @@ def _swiglu_three_bmm_with_lr_kernel(
     dy0_tile = sigma * y2 * dh * (1.0 + y0 * (1.0 - sigma))
     dy2_tile = swish * dh
 
-    # --- Load per-(B, N) scaling vectors (once per tile), cast to fp32 ---
-    lr0_batch = lr0_ptr + pid_b * s_lr_b
-    lr1_batch = lr1_ptr + pid_b * s_lr_b
-    lr2_batch = lr2_ptr + pid_b * s_lr_b
-
-    lr0_vec = tl.load(lr0_batch + offs_n * s_lr_n, mask=mask_n, other=0.0).to(
-        tl.float32
-    )
-    lr1_vec = tl.load(lr1_batch + offs_n * s_lr_n, mask=mask_n, other=0.0).to(
-        tl.float32
-    )
-    lr2_vec = tl.load(lr2_batch + offs_n * s_lr_n, mask=mask_n, other=0.0).to(
-        tl.float32
-    )
+    # --- Load per-token scaling vectors, cast to fp32 ---
+    if IS_VARLEN:
+        # lr is packed [T], load via global token indices
+        glob_n = bos + offs_n.to(tl.int64)
+        lr0_vec = tl.load(lr0_ptr + glob_n, mask=mask_n, other=0.0).to(tl.float32)
+        lr1_vec = tl.load(lr1_ptr + glob_n, mask=mask_n, other=0.0).to(tl.float32)
+        lr2_vec = tl.load(lr2_ptr + glob_n, mask=mask_n, other=0.0).to(tl.float32)
+    else:
+        lr0_batch = lr0_ptr + pid_b * s_lr_b
+        lr1_batch = lr1_ptr + pid_b * s_lr_b
+        lr2_batch = lr2_ptr + pid_b * s_lr_b
+        lr0_vec = tl.load(lr0_batch + offs_n * s_lr_n, mask=mask_n, other=0.0).to(tl.float32)
+        lr1_vec = tl.load(lr1_batch + offs_n * s_lr_n, mask=mask_n, other=0.0).to(tl.float32)
+        lr2_vec = tl.load(lr2_batch + offs_n * s_lr_n, mask=mask_n, other=0.0).to(tl.float32)
 
     # Broadcast to [BLOCK_M, BLOCK_N] and scale.
     dy0_tile *= lr0_vec[None, :]
@@ -171,44 +197,47 @@ def _swiglu_three_bmm_with_lr_kernel(
         else tl.bfloat16 if out_dtype == "bf16" else tl.float32
     )
 
-    # Store with Casting
-    # [B, 2M, N]
-    dy0_ptrs = (
-        dy0_dy2_ptr
-        + pid_b * s_dy0_dy2_b
-        + (offs_m[:, None] * s_dy0_dy2_m + offs_n[None, :] * s_dy0_dy2_n)
-    )
-    dy2_ptrs = (
-        dy0_dy2_ptr
-        + pid_b * s_dy0_dy2_b
-        + M * s_dy0_dy2_m
-        + (offs_m[:, None] * s_dy0_dy2_m + offs_n[None, :] * s_dy0_dy2_n)
-    )
-    hid_ptrs = (
-        hidden_ptr + pid_b * s_h_b + (offs_m[:, None] * s_h_m + offs_n[None, :] * s_h_n)
-    )
+    if IS_VARLEN:
+        # Store transposed to packed [T, 2M] and [T, M]
+        mask_out_T = mask_n[:, None] & mask_m[None, :]
 
-    mask_out = mask_m[:, None] & mask_n[None, :]
-    tl.store(dy0_ptrs, dy0_tile.to(out_dtype_tl), mask=mask_out)
-    tl.store(dy2_ptrs, dy2_tile.to(out_dtype_tl), mask=mask_out)
-    tl.store(hid_ptrs, hidden_tile.to(out_dtype_tl), mask=mask_out)
+        dy0_ptrs = dy0_dy2_ptr + glob_n[:, None] * s_dy0_dy2_n + offs_m[None, :] * s_dy0_dy2_m
+        tl.store(dy0_ptrs, tl.trans(dy0_tile).to(out_dtype_tl), mask=mask_out_T)
+
+        dy2_ptrs = dy0_dy2_ptr + glob_n[:, None] * s_dy0_dy2_n + (offs_m[None, :] + M) * s_dy0_dy2_m
+        tl.store(dy2_ptrs, tl.trans(dy2_tile).to(out_dtype_tl), mask=mask_out_T)
+
+        hid_ptrs = hidden_ptr + glob_n[:, None] * s_h_n + offs_m[None, :] * s_h_m
+        tl.store(hid_ptrs, tl.trans(hidden_tile).to(out_dtype_tl), mask=mask_out_T)
+    else:
+        # [B, 2M, N]
+        dy0_ptrs = (
+            dy0_dy2_ptr
+            + pid_b * s_dy0_dy2_b
+            + (offs_m[:, None] * s_dy0_dy2_m + offs_n[None, :] * s_dy0_dy2_n)
+        )
+        dy2_ptrs = (
+            dy0_dy2_ptr
+            + pid_b * s_dy0_dy2_b
+            + M * s_dy0_dy2_m
+            + (offs_m[:, None] * s_dy0_dy2_m + offs_n[None, :] * s_dy0_dy2_n)
+        )
+        hid_ptrs = (
+            hidden_ptr + pid_b * s_h_b + (offs_m[:, None] * s_h_m + offs_n[None, :] * s_h_n)
+        )
+
+        mask_out = mask_m[:, None] & mask_n[None, :]
+        tl.store(dy0_ptrs, dy0_tile.to(out_dtype_tl), mask=mask_out)
+        tl.store(dy2_ptrs, dy2_tile.to(out_dtype_tl), mask=mask_out)
+        tl.store(hid_ptrs, hidden_tile.to(out_dtype_tl), mask=mask_out)
 
 
 def swiglu_backward_three_bmm_with_lr_triton(W0_W2, W1, X, V, lr0, lr1, lr2):
     """
     Args:
-        W0: [B, M, K] - [B, Hidden, D]
-        W1: [B, K, M] - [B, D, Hidden]
-        W2: [B, M, K] - [B, Hidden, D]
-        X: [B, N, K] - [B, num_tokens, D]
-        V: [B, N, K] - [B, num_tokens, D]
-        lr0: [B, N] - [B, num_tokens]  bf16 or fp32
-        lr1: [B, N] - [B, num_tokens]  bf16 or fp32
-        lr2: [B, N] - [B, num_tokens]  bf16 or fp32
+        W0_W2: [B, 2M, K], W1: [B, K, M], X/V: [B, N, K], lr0/lr1/lr2: [B, N]
     Returns:
-        DY0: [B, M, N] in other words [B, Hidden, num_tokens]
-        DY2: [B, M, N] in other words [B, Hidden, num_tokens]
-        Hidden: [B, M, N] in other words [B, Hidden, num_tokens]
+        DY0_DY2: [B, 2M, N], Hidden: [B, M, N]
     """
     B, M_times_2, K = W0_W2.shape
     M = M_times_2 // 2
@@ -238,6 +267,7 @@ def swiglu_backward_three_bmm_with_lr_triton(W0_W2, W1, X, V, lr0, lr1, lr2):
     # Allocate outputs (compute dtype)
     Hidden = torch.empty((B, M, N), device=X.device, dtype=X.dtype)
     DY0_DY2 = torch.empty((B, M_times_2, N), device=X.device, dtype=X.dtype)
+    _dummy = torch.empty(0, dtype=torch.int32, device=X.device)
 
     # Make the store dtype match the destination tensors (robust if W0.dtype != X.dtype)
     out_dtype_str = (
@@ -250,40 +280,83 @@ def swiglu_backward_three_bmm_with_lr_triton(W0_W2, W1, X, V, lr0, lr1, lr2):
         return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]), B)
 
     _swiglu_three_bmm_with_lr_kernel[grid](
-        W0_W2,
-        W1,
-        X,
-        V,
-        lr0,
-        lr1,
-        lr2,
-        DY0_DY2,
-        Hidden,
-        B,
-        M,
-        N,
-        K,
-        # strides (element strides)
-        s_w0w2_b,
-        s_w0w2_m,
-        s_w0w2_k,
-        s_w1_b,
-        s_w1_k,
-        s_w1_m,
-        s_x_b,
-        s_x_n,
-        s_x_k,
-        s_lr_b,
-        s_lr_n,
-        s_dy0_dy2_b,
-        s_dy0_dy2_m,
-        s_dy0_dy2_n,
-        s_h_b,
-        s_h_m,
-        s_h_n,
+        W0_W2, W1, X, V, lr0, lr1, lr2,
+        DY0_DY2, Hidden, _dummy, _dummy,
+        B, M, N, K,
+        s_w0w2_b, s_w0w2_m, s_w0w2_k,
+        s_w1_b, s_w1_k, s_w1_m,
+        s_x_b, s_x_n, s_x_k,
+        s_lr_b, s_lr_n,
+        s_dy0_dy2_b, s_dy0_dy2_m, s_dy0_dy2_n,
+        s_h_b, s_h_m, s_h_n,
         out_dtype=out_dtype_str,
+        IS_VARLEN=False,
     )
 
+    return DY0_DY2, Hidden
+
+
+def swiglu_backward_three_bmm_with_lr_varlen_triton(
+    W0_W2, W1, X, V, lr0, lr1, lr2, cu_seqlens,
+    chunk_size=0, chunk_idx=0,
+    eff_lens=None, bos_arr=None, max_sl=0,
+):
+    """
+    Varlen variant. Shapes:
+      W0_W2 : [G, 2M, K]  (bf16) — per-doc weights
+      W1    : [G, K, M]   (bf16) — per-doc weights
+      X, V  : [T, K]      (bf16) — packed tokens
+      lr0, lr1, lr2: [T]  (fp32) — per-token learning rates
+      cu_seqlens: [G+1]   (int32)
+      eff_lens, bos_arr, max_sl: precomputed (if None, computed from cu_seqlens + chunk params)
+    Returns:
+      DY0_DY2: [T, 2M] (bf16) — packed, lr-scaled
+      Hidden:  [T, M]  (bf16) — packed, lr-scaled
+    """
+    try:
+        from utils import compute_varlen_args
+    except ImportError:
+        from .utils import compute_varlen_args
+
+    assert W0_W2.dtype == torch.bfloat16 and V.dtype == torch.bfloat16
+    assert W0_W2.is_contiguous() and W1.is_contiguous()
+    assert X.is_contiguous() and V.is_contiguous()
+
+    G, M2, K = W0_W2.shape
+    M = M2 // 2
+    T = X.shape[0]
+
+    DY0_DY2 = torch.empty((T, M2), device=X.device, dtype=X.dtype)
+    Hidden = torch.empty((T, M), device=X.device, dtype=X.dtype)
+
+    out_dtype_str = (
+        "float32" if Hidden.dtype == torch.float32
+        else "bf16" if Hidden.dtype == torch.bfloat16 else "fp16"
+    )
+
+    if eff_lens is None:
+        eff_lens, bos_arr, max_sl = compute_varlen_args(cu_seqlens, chunk_size, chunk_idx)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(max_sl, meta["BLOCK_N"]),
+            G,
+        )
+
+    _swiglu_three_bmm_with_lr_kernel[grid](
+        W0_W2, W1, X, V, lr0, lr1, lr2,
+        DY0_DY2, Hidden, eff_lens, bos_arr,
+        G, M, max_sl, K,
+        W0_W2.stride(0), W0_W2.stride(1), W0_W2.stride(2),
+        W1.stride(0), W1.stride(1), W1.stride(2),
+        0, X.stride(0), X.stride(1),                           # s_x_b=0, s_x_n, s_x_k
+        0, 1,                                                   # s_lr_b=0, s_lr_n=1 (unused)
+        0, DY0_DY2.stride(1), DY0_DY2.stride(0),              # s_dy_b=0, s_dy_m, s_dy_n
+        0, Hidden.stride(1), Hidden.stride(0),                  # s_h_b=0, s_h_m, s_h_n
+        out_dtype=out_dtype_str,
+        IS_VARLEN=True,
+    )
     return DY0_DY2, Hidden
 
 
@@ -360,5 +433,128 @@ def check_correctness():
     report_error(Hidden_ref, Hidden, "Hidden")
 
 
+def _reference_varlen_padded(W0_W2, W1, X, V, lr0, lr1, lr2, cu_seqlens):
+    """Pad -> batched Triton kernel -> unpack. Same precision as varlen kernel."""
+    from grouped_gemm import _pack_to_padded, _padded_to_pack
+
+    G = cu_seqlens.shape[0] - 1
+    T = X.shape[0]
+    max_len = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+
+    X_pad = _pack_to_padded(X, cu_seqlens, max_len)
+    V_pad = _pack_to_padded(V, cu_seqlens, max_len)
+    lr0_pad = _pack_to_padded(lr0.unsqueeze(1), cu_seqlens, max_len).squeeze(2)
+    lr1_pad = _pack_to_padded(lr1.unsqueeze(1), cu_seqlens, max_len).squeeze(2)
+    lr2_pad = _pack_to_padded(lr2.unsqueeze(1), cu_seqlens, max_len).squeeze(2)
+
+    DY0_DY2_b, Hidden_b = swiglu_backward_three_bmm_with_lr_triton(
+        W0_W2, W1, X_pad, V_pad, lr0_pad, lr1_pad, lr2_pad,
+    )
+    # [G, 2M, max_len] -> [G, max_len, 2M] -> packed [T, 2M]
+    return (
+        _padded_to_pack(DY0_DY2_b.transpose(1, 2), cu_seqlens, T),
+        _padded_to_pack(Hidden_b.transpose(1, 2), cu_seqlens, T),
+    )
+
+
 if __name__ == "__main__":
-    check_correctness()
+    import argparse
+    from kernel_test_utils import test_correctness, benchmark, get_chunk_info
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    device = "cuda"
+    num_docs = 4
+    doc_lens = [4096, 3072, 2048, 1024]
+    d, dh = 512, 512
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(doc_lens), 0).tolist()),
+        dtype=torch.int32, device=device,
+    )
+    packed_len = cu_seqlens[-1].item()
+
+    W0_W2 = torch.randn(num_docs, 2 * dh, d, device=device, dtype=torch.bfloat16)
+    W1 = torch.randn(num_docs, d, dh, device=device, dtype=torch.bfloat16)
+    X = torch.randn(packed_len, d, device=device, dtype=torch.bfloat16)
+    V = torch.randn(packed_len, d, device=device, dtype=torch.bfloat16)
+    lr0 = torch.randn(packed_len, device=device, dtype=torch.float32) * 0.01
+    lr1 = torch.randn(packed_len, device=device, dtype=torch.float32) * 0.01
+    lr2 = torch.randn(packed_len, device=device, dtype=torch.float32) * 0.01
+
+    print(f"Config: {num_docs=}, {doc_lens=}, {d=}, {dh=}, {packed_len=}")
+    print()
+
+    # ===== Correctness vs padded batched kernel =====
+    print("=" * 60)
+    print("Varlen correctness vs padded batched Triton kernel")
+    print("=" * 60)
+
+    triton_args = (W0_W2, W1, X, V, lr0, lr1, lr2, cu_seqlens)
+
+    test_correctness(
+        lambda *a: swiglu_backward_three_bmm_with_lr_varlen_triton(*a),
+        lambda *a: _reference_varlen_padded(*a),
+        triton_args, triton_args,
+        debug=args.debug, atol=1e-2, rtol=1e-2,
+    )
+
+    # ===== Benchmark =====
+    print()
+    print("=" * 60)
+    print("Varlen benchmark vs padded batched kernel")
+    print("=" * 60)
+
+    from grouped_gemm import _pack_to_padded
+    max_len = max(doc_lens)
+    X_pad = _pack_to_padded(X, cu_seqlens, max_len)
+    V_pad = _pack_to_padded(V, cu_seqlens, max_len)
+    lr0_pad = _pack_to_padded(lr0.unsqueeze(1), cu_seqlens, max_len).squeeze(2)
+    lr1_pad = _pack_to_padded(lr1.unsqueeze(1), cu_seqlens, max_len).squeeze(2)
+    lr2_pad = _pack_to_padded(lr2.unsqueeze(1), cu_seqlens, max_len).squeeze(2)
+
+    ref_bench_args = (W0_W2, W1, X_pad, V_pad, lr0_pad, lr1_pad, lr2_pad)
+
+    try:
+        from utils import compute_varlen_args
+    except ImportError:
+        from .utils import compute_varlen_args
+    eff_lens, bos_arr, max_sl_val = compute_varlen_args(cu_seqlens)
+
+    benchmark(
+        lambda *a: swiglu_backward_three_bmm_with_lr_varlen_triton(
+            *a, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val,
+        ),
+        lambda *a: swiglu_backward_three_bmm_with_lr_triton(*a),
+        triton_args, ref_bench_args,
+    )
+
+    # ===== Chunk correctness =====
+    chunk_size = 2048
+    _, _, max_chunks = get_chunk_info(cu_seqlens, chunk_size, 0)
+
+    print()
+    print("=" * 60)
+    print(f"Chunk correctness (chunk_size={chunk_size})")
+    print("=" * 60)
+
+    for chunk_index in range(max_chunks):
+        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
+        if len(idx) == 0:
+            break
+        # Reference: gather chunk tokens, call base varlen kernel
+        ref_dy, ref_h = swiglu_backward_three_bmm_with_lr_varlen_triton(
+            W0_W2, W1, X[idx], V[idx], lr0[idx], lr1[idx], lr2[idx], chunk_cu,
+        )
+        # Test: call chunk kernel on full buffer
+        test_dy, test_h = swiglu_backward_three_bmm_with_lr_varlen_triton(
+            W0_W2, W1, X, V, lr0, lr1, lr2, cu_seqlens,
+            chunk_size=chunk_size, chunk_idx=chunk_index,
+        )
+        diff_dy = (test_dy[idx] - ref_dy).abs().max().item()
+        diff_h = (test_h[idx] - ref_h).abs().max().item()
+        print(f"  chunk_idx={chunk_index}: DY0_DY2 max_diff={diff_dy:.2e}, Hidden max_diff={diff_h:.2e}, n_tokens={len(idx)}")
+        assert diff_dy == 0.0 and diff_h == 0.0, f"chunk_idx={chunk_index} not exact match!"
+
+    print("✓ PASS (exact match)")

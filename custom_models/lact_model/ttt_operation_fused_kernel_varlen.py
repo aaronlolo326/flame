@@ -14,6 +14,7 @@ try:
     )
 
     from .kernel_dev.l2norm_triton_kernels import l2_norm_add_fused
+    from .kernel_dev.utils import compute_varlen_args
     from .profiling_utils import profile_range
 except ImportError:
 
@@ -24,10 +25,29 @@ except ImportError:
     )
 
     from kernel_dev.l2norm_triton_kernels import l2_norm_add_fused
+    from kernel_dev.utils import compute_varlen_args
     from profiling_utils import profile_range
 
 _PROFILING = bool(os.environ.get("PROFILE_MODE", ""))
 _maybe_compile = (lambda fn: fn) if _PROFILING else torch.compile()
+
+
+@_maybe_compile
+def _prenorm_update(w0_w2_main, w1_main, dw0_w2, dw1, w0_w2_norm, w1_norm):
+    w0_w2_main = w0_w2_main + dw0_w2
+    w1_main = w1_main + dw1
+    w0_w2_bf16 = (w0_w2_main / (w0_w2_main.norm(dim=3, keepdim=True) + 1e-5) * w0_w2_norm).to(torch.bfloat16)
+    w1_bf16 = (w1_main / (w1_main.norm(dim=3, keepdim=True) + 1e-5) * w1_norm).to(torch.bfloat16)
+    return w0_w2_main, w1_main, w0_w2_bf16, w1_bf16
+
+
+@_maybe_compile
+def _momentum_and_mask(dw0_w2, dw1, dw0_mom, dw1_mom, m_mean, grad_mask):
+    dw0_w2 = dw0_w2 + dw0_mom * m_mean
+    dw1 = dw1 + dw1_mom * m_mean
+    dw0_w2 = dw0_w2 * grad_mask
+    dw1 = dw1 * grad_mask
+    return dw0_w2, dw1
 
 
 @_maybe_compile
@@ -205,25 +225,30 @@ def postnorm_block_causal_lact_swiglu_fused_kernel_triton(
     output = rearrange(output, "n b c d -> b (n c) d")
 
     return output[:, :q_original_length]
+
 def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
     w0: torch.Tensor,  # [nh, dh, d], fp32 or b16
     w1: torch.Tensor,  # [nh, d, dh], fp32 or b16
     w2: torch.Tensor,  # [nh, dh, d], fp32 or b16
-    q: torch.Tensor,  # [nh, l, d], bf16
-    k: torch.Tensor,  # [nh, l, d], bf16
-    v: torch.Tensor,  # [nh, l, d], bf16
-    lr0: torch.Tensor,  # [nh, l, 1], fp32
-    lr1: torch.Tensor,  # [nh, l, 1], fp32
-    lr2: torch.Tensor,  # [nh, l, 1], fp32
+    q: torch.Tensor,  # [nh, packed_len, d], bf16
+    k: torch.Tensor,  # [nh, packed_len, d], bf16
+    v: torch.Tensor,  # [nh, packed_len, d], bf16
+    lr0: torch.Tensor,  # [nh, packed_len, 1], fp32
+    lr1: torch.Tensor,  # [nh, packed_len, 1], fp32
+    lr2: torch.Tensor,  # [nh, packed_len, 1], fp32
     chunk_size: int = 2048,  # test-time training chunk size
     use_muon: bool = False,
-    momentum: torch.Tensor = None,  # [nh, l, 1], fp32 or bf16
+    momentum: torch.Tensor = None,  # [nh, packed_len, 1], fp32 or bf16
     cu_seqlens: torch.Tensor = None,  # [num_docs + 1], int32
+    num_chunks: int = None,  # total chunks (seq_len // chunk_size), avoids .item() for torch.compile
 ):
     """
-    Block causal LaCT with SwiGLU fast weight function.
+    Varlen block causal LaCT with SwiGLU fast weight function.
         Apply then Update => Shifted Block Causal LaCT
     w0, w1, w2 are the fast weights. f(x) =  w1 @ (silu(w0 @ x) * (w2 @ x))
+
+    Each document (delimited by cu_seqlens) gets fresh fast weights.
+    Documents of different lengths are processed in parallel without padding.
 
     About precision:
         w0, w1, w2 are recommended to be fp32.
@@ -239,113 +264,129 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
         Forward with Query: 6 * D * H * L * B
         Total: 18 * D * H * L * B
 
-    cu_seqlens: optional 1D int32 tensor of shape [num_sequences + 1], cumulative
+    cu_seqlens: 1D int32 tensor of shape [num_docs + 1], cumulative
         sequence lengths following the flash_attn_varlen_func convention.
         E.g. for 3 sequences of lengths 3, 4, 3: cu_seqlens = [0, 3, 7, 10].
-        When provided, each sequence gets fresh fast weights and padding beyond
-        cu_seqlens[-1] is skipped. If None, the entire input is one sequence.
+        Each sequence gets fresh fast weights.
 
     Outputs:
-        o: [b, l, d]
+        o: [nh, packed_len, d]
     """
-    
-    w0_w2 = torch.cat([w0, w2], dim=1).contiguous()
-    w0_w2_norm = w0_w2.norm(dim=2, keepdim=True)
-    w1_norm = w1.norm(dim=2, keepdim=True)
 
-    w0_w2_main = w0_w2
-    w1_main = w1
-    w0_w2 = w0_w2.to(torch.bfloat16)
-    w1 = w1.to(torch.bfloat16)
+    nh = w0.shape[0]
+    d = w0.shape[2]
+    dh = w0.shape[1]
+    num_docs = cu_seqlens.shape[0] - 1
+    device = w0.device
+    packed_len = q.shape[1]
+    G = nh * num_docs
+    flat_len = nh * packed_len
+
+    doc_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    doc_nchunks = (doc_lens + chunk_size - 1) // chunk_size
+    max_chunks = num_chunks if num_chunks is not None else doc_nchunks.max().item()
+    # [nh, num_docs, 1, 1] mask: True for groups that need grad at chunk ci
+    nchunks_g = doc_nchunks.unsqueeze(0).expand(nh, -1)
+
+    # Flat views: [nh, packed_len, d] -> [nh * packed_len, d]  (free reshape)
+    Q = q.reshape(flat_len, d)
+    K = k.reshape(flat_len, d)
+    V = v.reshape(flat_len, d)
+    LR0 = lr0[:, :, 0].reshape(flat_len)
+    LR1 = lr1[:, :, 0].reshape(flat_len)
+    LR2 = lr2[:, :, 0].reshape(flat_len)
+    M_flat = momentum[:, :, 0].reshape(flat_len) if momentum is not None else None
+
+    # Flat cu_seqlens: [G+1] for G = nh * num_docs groups
+    head_off = torch.arange(nh, device=device, dtype=torch.int32) * packed_len
+    flat_cu = (cu_seqlens[:-1].unsqueeze(0) + head_off.unsqueeze(1)).reshape(-1)
+    flat_cu = torch.cat([flat_cu, (head_off[-1:] + cu_seqlens[-1:])]).int()
+
+    # Per-(head, doc) weights: [nh, num_docs, ...]
+    w0_w2 = torch.cat([w0, w2], dim=1).contiguous()
+    w0_w2_norm = w0_w2.norm(dim=2, keepdim=True).unsqueeze(1).expand(-1, num_docs, -1, -1).contiguous()
+    w1_norm = w1.norm(dim=2, keepdim=True).unsqueeze(1).expand(-1, num_docs, -1, -1).contiguous()
+    w0_w2_main = w0_w2.unsqueeze(1).expand(-1, num_docs, -1, -1).contiguous()
+    w1_main = w1.unsqueeze(1).expand(-1, num_docs, -1, -1).contiguous()
 
     if momentum is not None:
-        # same dtype as w0_w2_main and w1_main, recommended to be fp32
         dw0_dw2_momentum = torch.zeros_like(w0_w2_main)
         dw1_momentum = torch.zeros_like(w1_main)
 
-    q_original_length = q.shape[1]
-    ### Padding the inputs to make the length a multiple of chunk_size
-    k = F.pad(k, (0, 0, 0, -k.shape[1] % chunk_size))
-    v = F.pad(v, (0, 0, 0, -v.shape[1] % chunk_size))
-    q = F.pad(q, (0, 0, 0, -q.shape[1] % chunk_size))
-    lr0 = F.pad(lr0, (0, 0, 0, -lr0.shape[1] % chunk_size))
-    lr1 = F.pad(lr1, (0, 0, 0, -lr1.shape[1] % chunk_size))
-    lr2 = F.pad(lr2, (0, 0, 0, -lr2.shape[1] % chunk_size))
+    w0_w2_bf16 = w0_w2_main.to(torch.bfloat16)
+    w1_bf16 = w1_main.to(torch.bfloat16)
+
+    output = torch.zeros(flat_len, d, device=device, dtype=q.dtype)
+
+    # Precompute per-chunk args
+    chunk_args = []
+    for ci in range(max_chunks):
+        el, ba, ms = compute_varlen_args(flat_cu, chunk_size, ci)
+        chunk_args.append(dict(eff_lens=el, bos_arr=ba, max_sl=ms))
+
+    # Precompute grad masks and momentum means
+    grad_masks = [(nchunks_g > ci + 1).unsqueeze(-1).unsqueeze(-1) for ci in range(max_chunks - 1)]
     if momentum is not None:
-        momentum = F.pad(momentum, (0, 0, 0, -momentum.shape[1] % chunk_size))
-    num_chunks = (q.shape[1] + chunk_size - 1) // chunk_size
+        rng_cs = torch.arange(chunk_size, device=device)
+        m_means = []
+        for ci in range(max_chunks - 1):
+            bos = chunk_args[ci]['bos_arr']
+            m_idx = bos.long().unsqueeze(1) + rng_cs.unsqueeze(0)
+            m_idx = m_idx.clamp(max=flat_len - 1)
+            m_means.append(M_flat[m_idx].mean(dim=1).reshape(nh, num_docs, 1, 1))
 
-    k = rearrange(k, "b (n c) d -> n b c d", n=num_chunks)
-    v = rearrange(v, "b (n c) d -> n b c d", n=num_chunks)
-    q = rearrange(q, "b (n c) d -> n b c d", n=num_chunks)
-    lr0 = rearrange(lr0, "b (n c) d -> n b (c d)", n=num_chunks, d=1)
-    lr1 = rearrange(lr1, "b (n c) d -> n b (c d)", n=num_chunks, d=1)
-    lr2 = rearrange(lr2, "b (n c) d -> n b (c d)", n=num_chunks, d=1)
-    if momentum is not None:
-        momentum = rearrange(momentum, "b (n c) 1 -> n b c 1", n=num_chunks)
-    output = torch.zeros_like(q)
+    # Main loop: apply + grad + update (all chunks except last)
+    for ci in range(max_chunks - 1):
+        ckw = chunk_args[ci]
 
-    e_index = 0
-    seq_len = k.shape[1]
-    for chunk_idx in range(num_chunks - 1):
-
-        # [b, l, dk]
-        ki = k[chunk_idx].contiguous()  # bf16
-        # [b, l, dv]
-        vi = v[chunk_idx].contiguous()  # bf16
-        # [b, dh, l]
-        qi = q[chunk_idx].contiguous()
-        # [b, l, d/1] fp32
-        lr1i = lr1[chunk_idx].contiguous()  # [b, l, d/1] fp32
-        lr2i = lr2[chunk_idx].contiguous()  # [b, l, d/1] fp32
-        lr0i = lr0[chunk_idx].contiguous()  # [b, l, d/1] fp32
-
-        # apply first, perform swiglu ffn forward pass with the qi.
         with profile_range("ttt_apply"):
-            output[chunk_idx] = fused_swiglu_ffn_fwd(w0_w2, w1, qi)
+            fwd_out = fused_swiglu_ffn_fwd(
+                w0_w2_bf16.reshape(G, 2 * dh, d), w1_bf16.reshape(G, d, dh),
+                Q, cu_seqlens=flat_cu, **ckw,
+                # out=output,  # TODO: use out= when not training (no grad needed)
+            )
+            output = output + fwd_out
 
-        # then, compute test-time training gradients for w0, w1, w2. under negative dot product loss.
         with profile_range("ttt_grad"):
             dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
-                w0_w2.to(torch.bfloat16), w1.to(torch.bfloat16), ki, vi, lr0i, lr1i, lr2i
+                w0_w2_bf16.reshape(G, 2 * dh, d), w1_bf16.reshape(G, d, dh),
+                K, V, LR0, LR1, LR2, cu_seqlens=flat_cu, **ckw,
             )
+
+        dw0_w2 = dw0_w2.reshape(nh, num_docs, 2 * dh, d)
+        dw1 = dw1.reshape(nh, num_docs, d, dh)
+
+        grad_mask = grad_masks[ci]
+        dw0_w2 = dw0_w2 * grad_mask
+        dw1 = dw1 * grad_mask
 
         if momentum is not None:
           with profile_range("ttt_momentum"):
-            m_i = momentum[chunk_idx].contiguous()
-            m_i = m_i.mean(dim=1, keepdim=True)  # [b, 1, 1]
-
-            dw0_w2 = dw0_w2 + dw0_dw2_momentum * m_i
-            dw1 = dw1 + dw1_momentum * m_i
+            m_mean = m_means[ci]
+            dw0_w2, dw1 = _momentum_and_mask(dw0_w2, dw1, dw0_dw2_momentum, dw1_momentum, m_mean, grad_mask)
             dw0_dw2_momentum = dw0_w2
             dw1_momentum = dw1
 
         if use_muon:
           with profile_range("ttt_muon"):
-            dw1 = zeropower_via_newtonschulz5(dw1)
-            dw0_w2 = zeropower_via_newtonschulz5(dw0_w2)
+            dw1 = zeropower_via_newtonschulz5(dw1.reshape(G, d, dh)).reshape(nh, num_docs, d, dh)
+            dw0_w2 = zeropower_via_newtonschulz5(dw0_w2.reshape(G, 2 * dh, d)).reshape(nh, num_docs, 2 * dh, d)
 
         with profile_range("ttt_update"):
-            w0_w2_main = w0_w2_main + dw0_w2
-            w1_main = w1_main + dw1
-
-            # cast to bf16
-            w0_w2 = (
-                w0_w2_main / (w0_w2_main.norm(dim=2, keepdim=True) + 1e-5) * w0_w2_norm
-            ).to(torch.bfloat16)
-            w1 = (w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm).to(
-                torch.bfloat16
+            w0_w2_main, w1_main, w0_w2_bf16, w1_bf16 = _prenorm_update(
+                w0_w2_main, w1_main, dw0_w2, dw1, w0_w2_norm, w1_norm,
             )
 
-    # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
-    qi = q[-1].contiguous()
+    # Last chunk: apply only
+    with profile_range("ttt_apply"):
+        fwd_out = fused_swiglu_ffn_fwd(
+            w0_w2_bf16.reshape(G, 2 * dh, d), w1_bf16.reshape(G, d, dh),
+            Q, cu_seqlens=flat_cu, **chunk_args[max_chunks - 1],
+            # out=output,  # TODO: use out= when not training (no grad needed)
+        )
+        output = output + fwd_out
 
-    with profile_range("ttt_apply_last"):
-        output[-1] = fused_swiglu_ffn_fwd(w0_w2, w1, qi)
-
-    output = rearrange(output, "n b c d -> b (n c) d")
-
-    return output[:, :q_original_length]
+    return output.reshape(nh, packed_len, d)
 
 
 
@@ -412,7 +453,9 @@ if __name__ == "__main__":
     lr1 = torch.sigmoid(torch.randn(nh, packed_len, 1, device=device)) * 0.01
     lr2 = torch.sigmoid(torch.randn(nh, packed_len, 1, device=device)) * 0.01
     momentum = torch.sigmoid(torch.randn(nh, packed_len, 1, device=device)) * 0.9
-    kwargs = dict(chunk_size=chunk_size, use_muon=False, momentum=momentum)
+    _num_chunks = max_doc_len // chunk_size
+    kwargs = dict(chunk_size=chunk_size, use_muon=False)
+    varlen_kw = dict(**kwargs, num_chunks=_num_chunks)
 
     # ---- Reference 1 (loop): per-doc with fresh weights ----
     print("\n--- ref_loop: per-doc loop ---")
@@ -449,8 +492,327 @@ if __name__ == "__main__":
     print("\n--- varlen (our implementation) ---")
     varlen_output = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
         w0.clone(), w1.clone(), w2.clone(),
-        q, k, v, lr0, lr1, lr2, **kwargs, cu_seqlens=cu_seqlens,
+        q, k, v, lr0, lr1, lr2, **varlen_kw, momentum=momentum, cu_seqlens=cu_seqlens,
     )
 
     _compare("ref_loop", ref_loop, "varlen", varlen_output, cu_seqlens)
     _compare("ref_padded", ref_padded, "varlen", varlen_output, cu_seqlens)
+
+    # ---- Benchmark: varlen vs padded batch ----
+    from kernel_dev.kernel_test_utils import benchmark
+
+    print("\n" + "=" * 60)
+    print("Benchmark: varlen vs padded batch")
+    print("=" * 60)
+
+    def varlen_fn():
+        return prenorm_block_causal_lact_swiglu_fused_kernel_triton(
+            w0.clone(), w1.clone(), w2.clone(),
+            q, k, v, lr0, lr1, lr2, **varlen_kw, momentum=momentum, cu_seqlens=cu_seqlens,
+        )
+
+    def ref_padded_fn():
+        w0_pad = w0.repeat_interleave(num_docs, 0)
+        w1_pad = w1.repeat_interleave(num_docs, 0)
+        w2_pad = w2.repeat_interleave(num_docs, 0)
+        q_pad = up(q).reshape(B, max_doc_len, d)
+        k_pad = up(k).reshape(B, max_doc_len, d)
+        v_pad = up(v).reshape(B, max_doc_len, d)
+        lr0_pad = up(lr0).reshape(B, max_doc_len, 1)
+        lr1_pad = up(lr1).reshape(B, max_doc_len, 1)
+        lr2_pad = up(lr2).reshape(B, max_doc_len, 1)
+        m_pad = up(momentum).reshape(B, max_doc_len, 1)
+        out_pad = reference_fn(
+            w0_pad, w1_pad, w2_pad,
+            q_pad, k_pad, v_pad, lr0_pad, lr1_pad, lr2_pad,
+            **kwargs, momentum=m_pad,
+        ).reshape(nh, num_docs, max_doc_len, d)
+        return _repack(out_pad, cu_seqlens, packed_len)
+
+    benchmark(varlen_fn, ref_padded_fn, (), (), enable_grad=True)
+
+    # ---- Benchmark fwd+bwd ----
+    print("\n" + "=" * 60)
+    print("Benchmark fwd+bwd: varlen vs padded batch")
+    print("=" * 60)
+
+    grad_out_varlen = torch.randn(nh, packed_len, d, device=device, dtype=q.dtype)
+    grad_out_ref = torch.randn(B, max_doc_len, d, device=device, dtype=q.dtype)
+
+    def varlen_fwd_bwd():
+        _w0 = w0.clone().requires_grad_()
+        _w1 = w1.clone().requires_grad_()
+        _w2 = w2.clone().requires_grad_()
+        out = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
+            _w0, _w1, _w2,
+            q, k, v, lr0, lr1, lr2, **varlen_kw, momentum=momentum, cu_seqlens=cu_seqlens,
+        )
+        out.backward(grad_out_varlen)
+
+    def ref_padded_fwd_bwd():
+        _w0p = w0.repeat_interleave(num_docs, 0).requires_grad_()
+        _w1p = w1.repeat_interleave(num_docs, 0).requires_grad_()
+        _w2p = w2.repeat_interleave(num_docs, 0).requires_grad_()
+        out = reference_fn(
+            _w0p, _w1p, _w2p,
+            up(q).reshape(B, max_doc_len, d), up(k).reshape(B, max_doc_len, d),
+            up(v).reshape(B, max_doc_len, d),
+            up(lr0).reshape(B, max_doc_len, 1), up(lr1).reshape(B, max_doc_len, 1),
+            up(lr2).reshape(B, max_doc_len, 1),
+            **kwargs, momentum=up(momentum).reshape(B, max_doc_len, 1),
+        )
+        out.backward(grad_out_ref)
+
+    benchmark(varlen_fwd_bwd, ref_padded_fwd_bwd, (), (), enable_grad=True)
+
+    # ---- Profile each part of the varlen chunk loop ----
+    print("\n" + "=" * 60)
+    print("Profiling varlen chunk loop parts")
+    print("=" * 60)
+
+    import torch.nn.functional as Fp
+    from kernel_dev.utils import compute_varlen_args as _cva
+
+    num_runs = 20
+    timings = {}
+
+    def timed(name):
+        class _T:
+            def __enter__(self_):
+                self_.start = torch.cuda.Event(enable_timing=True)
+                self_.end = torch.cuda.Event(enable_timing=True)
+                self_.start.record()
+                return self_
+            def __exit__(self_, *a):
+                self_.end.record()
+                torch.cuda.synchronize()
+                ms = self_.start.elapsed_time(self_.end)
+                timings.setdefault(name, []).append(ms)
+        return _T()
+
+    warmup_varlen = 5
+    for run_idx in range(warmup_varlen + num_runs):
+        if run_idx == warmup_varlen:
+            timings.clear()
+
+        _w0, _w1, _w2 = w0.clone(), w1.clone(), w2.clone()
+        _nh, _d, _dh = _w0.shape[0], _w0.shape[2], _w0.shape[1]
+        _num_docs = cu_seqlens.shape[0] - 1
+        _packed_len = cu_seqlens[-1].item()
+        _G = _nh * _num_docs
+        _flat_len = _nh * _packed_len
+
+        _doc_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        _doc_nchunks = (_doc_lens + chunk_size - 1) // chunk_size
+        _max_chunks = _doc_nchunks.max().item()
+        _nchunks_g = _doc_nchunks.unsqueeze(0).expand(_nh, -1)
+
+        _Q = q.reshape(_flat_len, _d)
+        _K = k.reshape(_flat_len, _d)
+        _V = v.reshape(_flat_len, _d)
+        _LR0 = lr0[:, :, 0].reshape(_flat_len)
+        _LR1 = lr1[:, :, 0].reshape(_flat_len)
+        _LR2 = lr2[:, :, 0].reshape(_flat_len)
+        _M_flat = momentum[:, :, 0].reshape(_flat_len)
+
+        _head_off = torch.arange(_nh, device=device, dtype=torch.int32) * _packed_len
+        _flat_cu = (cu_seqlens[:-1].unsqueeze(0) + _head_off.unsqueeze(1)).reshape(-1)
+        _flat_cu = torch.cat([_flat_cu, (_head_off[-1:] + cu_seqlens[-1:])]).int()
+
+        _w0_w2 = torch.cat([_w0, _w2], dim=1).contiguous()
+        _w0_w2_norm = _w0_w2.norm(dim=2, keepdim=True).unsqueeze(1).expand(-1, _num_docs, -1, -1).contiguous()
+        _w1_norm = _w1.norm(dim=2, keepdim=True).unsqueeze(1).expand(-1, _num_docs, -1, -1).contiguous()
+        _w0_w2_main = _w0_w2.unsqueeze(1).expand(-1, _num_docs, -1, -1).contiguous()
+        _w1_main = _w1.unsqueeze(1).expand(-1, _num_docs, -1, -1).contiguous()
+        _dw0_mom = torch.zeros_like(_w0_w2_main)
+        _dw1_mom = torch.zeros_like(_w1_main)
+        _w0_w2_bf16 = _w0_w2_main.to(torch.bfloat16)
+        _w1_bf16 = _w1_main.to(torch.bfloat16)
+        _output = torch.zeros(_flat_len, _d, device=device, dtype=q.dtype)
+
+        # Precompute chunk args, grad masks, momentum means
+        _chunk_args = [dict(zip(('eff_lens', 'bos_arr', 'max_sl'), _cva(_flat_cu, chunk_size, ci))) for ci in range(_max_chunks)]
+        _grad_masks = [(_nchunks_g > ci + 1).unsqueeze(-1).unsqueeze(-1) for ci in range(_max_chunks - 1)]
+        _rng_cs = torch.arange(chunk_size, device=device)
+        _m_means = []
+        for ci in range(_max_chunks - 1):
+            _bos = _chunk_args[ci]['bos_arr']
+            _mi = _bos.long().unsqueeze(1) + _rng_cs.unsqueeze(0)
+            _mi = _mi.clamp(max=_flat_len - 1)
+            _m_means.append(_M_flat[_mi].mean(dim=1).reshape(_nh, _num_docs, 1, 1))
+
+        for ci in range(_max_chunks - 1):
+            ckw = _chunk_args[ci]
+
+            with timed("ttt_apply"):
+                fused_swiglu_ffn_fwd(
+                    _w0_w2_bf16.reshape(_G, 2 * _dh, _d), _w1_bf16.reshape(_G, _d, _dh),
+                    _Q, cu_seqlens=_flat_cu, out=_output, **ckw,
+                )
+
+            with timed("ttt_grad"):
+                dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
+                    _w0_w2_bf16.reshape(_G, 2 * _dh, _d), _w1_bf16.reshape(_G, _d, _dh),
+                    _K, _V, _LR0, _LR1, _LR2, cu_seqlens=_flat_cu, **ckw,
+                )
+
+            with timed("grad_mask"):
+                dw0_w2 = dw0_w2.reshape(_nh, _num_docs, 2 * _dh, _d)
+                dw1 = dw1.reshape(_nh, _num_docs, _d, _dh)
+                grad_mask = _grad_masks[ci]
+                dw0_w2 = dw0_w2 * grad_mask
+                dw1 = dw1 * grad_mask
+
+            with timed("momentum"):
+                m_mean = _m_means[ci]
+                dw0_w2 = dw0_w2 + _dw0_mom * m_mean
+                dw1 = dw1 + _dw1_mom * m_mean
+                dw0_w2 = dw0_w2 * grad_mask
+                dw1 = dw1 * grad_mask
+                _dw0_mom = dw0_w2
+                _dw1_mom = dw1
+
+            with timed("ttt_update"):
+                _w0_w2_main = _w0_w2_main + dw0_w2
+                _w1_main = _w1_main + dw1
+                _w0_w2_bf16 = (_w0_w2_main / (_w0_w2_main.norm(dim=3, keepdim=True) + 1e-5) * _w0_w2_norm).to(torch.bfloat16)
+                _w1_bf16 = (_w1_main / (_w1_main.norm(dim=3, keepdim=True) + 1e-5) * _w1_norm).to(torch.bfloat16)
+
+        # Last chunk: apply only
+        with timed("ttt_apply"):
+            fused_swiglu_ffn_fwd(
+                _w0_w2_bf16.reshape(_G, 2 * _dh, _d), _w1_bf16.reshape(_G, _d, _dh),
+                _Q, cu_seqlens=_flat_cu, out=_output, **_chunk_args[_max_chunks - 1],
+            )
+
+    print(f"\n{'Section':<20} {'Mean (ms)':>10} {'Total (ms)':>10} {'Calls':>6}")
+    print("-" * 50)
+    total_all = 0
+    for name in ["ttt_apply", "ttt_grad", "grad_mask", "momentum", "ttt_update"]:
+        if name in timings:
+            vals = timings[name]
+            mean_ms = sum(vals) / len(vals)
+            total_ms = sum(vals)
+            total_all += total_ms
+            print(f"{name:<20} {mean_ms:>10.4f} {total_ms:>10.2f} {len(vals):>6}")
+    print(f"{'TOTAL':<20} {total_all/num_runs:>10.4f} {total_all:>10.2f}")
+
+    # ---- Profile reference (padded batch) chunk loop ----
+    print("\n" + "=" * 60)
+    print("Profiling REFERENCE (padded batch) chunk loop parts")
+    print("=" * 60)
+
+    from einops import rearrange as rearr
+    from ttt_operation_fused_kernel import fused_swiglu_ffn_fwd as ref_fused_swiglu_ffn_fwd
+    from ttt_operation_fused_kernel import fused_lact_swiglu_ffn_fast_weight_grads as ref_fused_lact_grads
+
+    ref_timings = {}
+    def ref_timed(name):
+        class _T:
+            def __enter__(self_):
+                self_.start = torch.cuda.Event(enable_timing=True)
+                self_.end = torch.cuda.Event(enable_timing=True)
+                self_.start.record()
+                return self_
+            def __exit__(self_, *a):
+                self_.end.record()
+                torch.cuda.synchronize()
+                ms = self_.start.elapsed_time(self_.end)
+                ref_timings.setdefault(name, []).append(ms)
+        return _T()
+
+    # Pre-compute padded inputs for reference profiling
+    w0_pad = w0.repeat_interleave(num_docs, 0)
+    w1_pad = w1.repeat_interleave(num_docs, 0)
+    w2_pad = w2.repeat_interleave(num_docs, 0)
+    q_pad = up(q).reshape(B, max_doc_len, d)
+    k_pad = up(k).reshape(B, max_doc_len, d)
+    v_pad = up(v).reshape(B, max_doc_len, d)
+    lr0_pad = up(lr0).reshape(B, max_doc_len, 1)
+    lr1_pad = up(lr1).reshape(B, max_doc_len, 1)
+    lr2_pad = up(lr2).reshape(B, max_doc_len, 1)
+    m_pad = up(momentum).reshape(B, max_doc_len, 1)
+
+    warmup_ref = 5
+    for run_idx in range(warmup_ref + num_runs):
+        if run_idx == warmup_ref:
+            ref_timings.clear()
+        _w0r, _w1r, _w2r = w0_pad.clone(), w1_pad.clone(), w2_pad.clone()
+        _B = _w0r.shape[0]  # nh * num_docs
+        _d = _w0r.shape[2]
+
+        _w0_w2r = torch.cat([_w0r, _w2r], dim=1).contiguous()
+        _w0_w2_normr = _w0_w2r.norm(dim=2, keepdim=True)
+        _w1_normr = _w1r.norm(dim=2, keepdim=True)
+        _w0_w2_mainr = _w0_w2r
+        _w1_mainr = _w1r
+        _w0_w2r_bf16 = _w0_w2r.to(torch.bfloat16)
+        _w1r_bf16 = _w1r.to(torch.bfloat16)
+
+        _dw0_dw2_momr = torch.zeros_like(_w0_w2_mainr)
+        _dw1_momr = torch.zeros_like(_w1_mainr)
+
+        _qr = Fp.pad(q_pad, (0, 0, 0, -q_pad.shape[1] % chunk_size))
+        _kr = Fp.pad(k_pad, (0, 0, 0, -k_pad.shape[1] % chunk_size))
+        _vr = Fp.pad(v_pad, (0, 0, 0, -v_pad.shape[1] % chunk_size))
+        _lr0r = Fp.pad(lr0_pad, (0, 0, 0, -lr0_pad.shape[1] % chunk_size))
+        _lr1r = Fp.pad(lr1_pad, (0, 0, 0, -lr1_pad.shape[1] % chunk_size))
+        _lr2r = Fp.pad(lr2_pad, (0, 0, 0, -lr2_pad.shape[1] % chunk_size))
+        _mr = Fp.pad(m_pad, (0, 0, 0, -m_pad.shape[1] % chunk_size))
+        _num_chunks = (_qr.shape[1] + chunk_size - 1) // chunk_size
+
+        _kr = rearr(_kr, "b (n c) d -> n b c d", n=_num_chunks)
+        _vr = rearr(_vr, "b (n c) d -> n b c d", n=_num_chunks)
+        _qr = rearr(_qr, "b (n c) d -> n b c d", n=_num_chunks)
+        _lr0r = rearr(_lr0r, "b (n c) d -> n b (c d)", n=_num_chunks, d=1)
+        _lr1r = rearr(_lr1r, "b (n c) d -> n b (c d)", n=_num_chunks, d=1)
+        _lr2r = rearr(_lr2r, "b (n c) d -> n b (c d)", n=_num_chunks, d=1)
+        _mr = rearr(_mr, "b (n c) 1 -> n b c 1", n=_num_chunks)
+        _outr = torch.zeros_like(_qr)
+
+        for chunk_idx in range(_num_chunks - 1):
+            with ref_timed("slice"):
+                ki = _kr[chunk_idx].contiguous()
+                vi = _vr[chunk_idx].contiguous()
+                qi = _qr[chunk_idx].contiguous()
+                lr1i = _lr1r[chunk_idx].contiguous()
+                lr2i = _lr2r[chunk_idx].contiguous()
+                lr0i = _lr0r[chunk_idx].contiguous()
+
+            with ref_timed("ttt_apply"):
+                _outr[chunk_idx] = ref_fused_swiglu_ffn_fwd(_w0_w2r_bf16, _w1r_bf16, qi)
+
+            with ref_timed("ttt_grad"):
+                dw0_w2, dw1 = ref_fused_lact_grads(
+                    _w0_w2r_bf16, _w1r_bf16, ki, vi, lr0i, lr1i, lr2i
+                )
+
+            with ref_timed("momentum"):
+                m_i = _mr[chunk_idx].contiguous()
+                m_i = m_i.mean(dim=1, keepdim=True)
+                dw0_w2 = dw0_w2 + _dw0_dw2_momr * m_i
+                dw1 = dw1 + _dw1_momr * m_i
+                _dw0_dw2_momr = dw0_w2
+                _dw1_momr = dw1
+
+            with ref_timed("ttt_update"):
+                _w0_w2_mainr = _w0_w2_mainr + dw0_w2
+                _w1_mainr = _w1_mainr + dw1
+                _w0_w2r_bf16 = (_w0_w2_mainr / (_w0_w2_mainr.norm(dim=2, keepdim=True) + 1e-5) * _w0_w2_normr).to(torch.bfloat16)
+                _w1r_bf16 = (_w1_mainr / (_w1_mainr.norm(dim=2, keepdim=True) + 1e-5) * _w1_normr).to(torch.bfloat16)
+
+        # last chunk
+        with ref_timed("ttt_apply"):
+            _outr[-1] = ref_fused_swiglu_ffn_fwd(_w0_w2r_bf16, _w1r_bf16, _qr[-1].contiguous())
+
+    print(f"\n{'Section':<20} {'Mean (ms)':>10} {'Total (ms)':>10} {'Calls':>6}")
+    print("-" * 50)
+    ref_total_all = 0
+    for name in ["slice", "ttt_apply", "ttt_grad", "momentum", "ttt_update"]:
+        if name in ref_timings:
+            vals = ref_timings[name]
+            mean_ms = sum(vals) / len(vals)
+            total_ms = sum(vals)
+            ref_total_all += total_ms
+            print(f"{name:<20} {mean_ms:>10.4f} {total_ms:>10.2f} {len(vals):>6}")
+    print(f"{'TOTAL':<20} {ref_total_all/num_runs:>10.4f} {ref_total_all:>10.2f}")
