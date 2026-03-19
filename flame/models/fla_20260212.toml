@@ -37,7 +37,7 @@ export_dtype = "float32"
 async_mode = "disabled"    # ["disabled", "async", "async_with_pinned_mem"]
 
 [profiling]
-enable_profiling = true
+enable_profiling = false
 save_traces_folder = "profile_trace"
 profile_freq = 512
 

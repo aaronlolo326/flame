@@ -58,6 +58,7 @@ NNODE=1 NGPU=${NGPU} LOG_RANK=0 bash train.sh \
   --training.disable_loss_parallel \
   --checkpoint.interval 2048 \
   --checkpoint.load_step -1 \
+  --checkpoint.exclude_from_loading optimizer,lr_scheduler \
   --metrics.log_freq 1
   # --profiling.enable_memory_snapshot \
   # --profiling.profile_freq 4
@@ -70,4 +71,3 @@ NNODE=1 NGPU=${NGPU} LOG_RANK=0 bash train.sh \
    # --training.dataset arrow \
   # --training.dataset_split train \
   # --training.data_dir /nfs-export/hei/.cache/huggingface/datasets/HuggingFaceFW___fineweb-edu/sample-350BT \
-  
