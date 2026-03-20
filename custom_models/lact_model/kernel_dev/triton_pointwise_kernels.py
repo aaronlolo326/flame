@@ -627,7 +627,9 @@ if __name__ == "__main__":
 
     device = "cuda"
     num_docs = 4
-    doc_lens = [4096, 3072, 2048, 1024]
+    # doc_lens = [4096, 3072, 2048, 1024]
+    doc_lens=[1, 4213, 1906, 295, 537, 1580, 213, 475, 743, 659, 1414, 230, 1520, 116, 745, 327, 181, 193, 187, 96, 110, 303, 340]
+
     D = 512
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(doc_lens), 0).tolist()),

@@ -45,7 +45,7 @@ def get_autotune_configs(
 #
 # IS_VARLEN: W has packed tokens in M axis, X is per-doc, O is packed.
 ########################################################
-@triton.autotune(configs=get_autotune_configs(), key=["B", "M", "N", "K"])
+@triton.autotune(configs=get_autotune_configs(), key=["M", "N", "K"])
 @triton.jit
 def fused_two_mm_wT_xT_kernel(
     W0,
@@ -164,7 +164,7 @@ def fused_two_mm_wT_xT_kernel(
 # X0 and X1 of shape [B, K, N]  (per-doc for varlen)
 # O of shape [B, M, N]          ([T, N] packed for varlen)
 ########################################################
-@triton.autotune(configs=get_autotune_configs(), key=["B", "M", "N", "K"])
+@triton.autotune(configs=get_autotune_configs(), key=["M", "N", "K"])
 @triton.jit
 def fused_two_mm_wT_x_kernel(
     W0,
@@ -308,7 +308,7 @@ def fused_two_mm_wT_x_kernel(
         tl.store(o_ptrs, acc, mask=mask_o)
 
 
-@triton.autotune(configs=get_autotune_configs(), key=["B", "M", "N", "K"])
+@triton.autotune(configs=get_autotune_configs(), key=["M", "N", "K"])
 @triton.jit
 def fused_four_mm_wT_x_kernel(
     W0,
@@ -596,7 +596,7 @@ def fused_two_mm_same_out_wT_xT_varlen_triton(
     G = cu_seqlens.shape[0] - 1
     N = X0T.shape[1]
 
-    out = torch.empty((T, N), device=W0.device, dtype=X0T.dtype)
+    out = torch.zeros((T, N), device=W0.device, dtype=X0T.dtype)
 
     if eff_lens is None:
         eff_lens, bos_arr, max_sl = compute_varlen_args(cu_seqlens, chunk_size, chunk_idx)
@@ -738,7 +738,7 @@ def fused_two_mm_same_out_wT_x_varlen_triton(
     G = cu_seqlens.shape[0] - 1
     N = X0.shape[2]
 
-    out = torch.empty((T, N), device=W0.device, dtype=X0.dtype)
+    out = torch.zeros((T, N), device=W0.device, dtype=X0.dtype)
 
     if eff_lens is None:
         eff_lens, bos_arr, max_sl = compute_varlen_args(cu_seqlens, chunk_size, chunk_idx)

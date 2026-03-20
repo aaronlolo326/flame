@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -13,6 +14,7 @@ try:
     )
 
     from .lact_triton_kernels.l2norm_triton_kernels import l2_norm_add_fused
+    from .profiling_utils import profile_range
 except ImportError:
 
     from lact_triton_kernels.lact_swiglu_ffn import fused_swiglu_ffn_fwd
@@ -22,9 +24,13 @@ except ImportError:
     )
 
     from lact_triton_kernels.l2norm_triton_kernels import l2_norm_add_fused
+    from profiling_utils import profile_range
+
+_PROFILING = bool(os.environ.get("PROFILE_MODE", ""))
+_maybe_compile = (lambda fn: fn) if _PROFILING else torch.compile()
 
 
-@torch.compile()
+@_maybe_compile
 def zeropower_via_newtonschulz5(G):
     """
     This is an updated version of the zeropower_via_newtonschulz5 function in here:
@@ -72,7 +78,7 @@ def zeropower_via_newtonschulz5(G):
     return X
 
 
-@torch.compile()
+@_maybe_compile
 def postnorm_block_causal_lact_swiglu_fused_kernel_triton(
     w0: torch.Tensor,  # [b, dh, d], fp32 or b16
     w1: torch.Tensor,  # [b, d, dh], fp32 or b16
@@ -157,16 +163,19 @@ def postnorm_block_causal_lact_swiglu_fused_kernel_triton(
         lr0i = lr0[chunk_idx].contiguous()  # [b, l, d/1] fp32
 
         # apply first, perform swiglu ffn forward pass with the qi.
-        w0_w2_bf16 = w0_w2.to(torch.bfloat16)
-        w1_bf16 = w1.to(torch.bfloat16)
-        output[chunk_idx] = fused_swiglu_ffn_fwd(w0_w2_bf16, w1_bf16, qi)
+        with profile_range("ttt_apply"):
+            w0_w2_bf16 = w0_w2.to(torch.bfloat16)
+            w1_bf16 = w1.to(torch.bfloat16)
+            output[chunk_idx] = fused_swiglu_ffn_fwd(w0_w2_bf16, w1_bf16, qi)
 
         # then, compute test-time training gradients for w0, w1, w2. under negative dot product loss.
-        dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
-            w0_w2_bf16, w1_bf16, ki, vi, lr0i, lr1i, lr2i
-        )
+        with profile_range("ttt_grad"):
+            dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
+                w0_w2_bf16, w1_bf16, ki, vi, lr0i, lr1i, lr2i
+            )
 
         if momentum is not None:
+          with profile_range("ttt_momentum"):
             m_i = momentum[chunk_idx].contiguous()
             m_i = m_i.mean(dim=1, keepdim=True)  # [b, 1, 1]
 
@@ -176,26 +185,29 @@ def postnorm_block_causal_lact_swiglu_fused_kernel_triton(
             dw1_momentum = dw1
 
         if use_muon:
+          with profile_range("ttt_muon"):
             dw1 = zeropower_via_newtonschulz5(dw1)
             dw0_w2 = zeropower_via_newtonschulz5(dw0_w2)
 
-        w0_w2 = l2_norm_add_fused(w0_w2, dw0_w2, w0_w2_norm, eps=1e-5)
-        w1 = l2_norm_add_fused(w1, dw1, w1_norm, eps=1e-5)
+        with profile_range("ttt_update"):
+            w0_w2 = l2_norm_add_fused(w0_w2, dw0_w2, w0_w2_norm, eps=1e-5)
+            w1 = l2_norm_add_fused(w1, dw1, w1_norm, eps=1e-5)
 
     # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
 
     qi = q[-1].contiguous()
 
-    output[-1] = fused_swiglu_ffn_fwd(
-        w0_w2.to(torch.bfloat16), w1.to(torch.bfloat16), qi
-    )
+    with profile_range("ttt_apply_last"):
+        output[-1] = fused_swiglu_ffn_fwd(
+            w0_w2.to(torch.bfloat16), w1.to(torch.bfloat16), qi
+        )
 
     output = rearrange(output, "n b c d -> b (n c) d")
 
     return output[:, :q_original_length]
 
 
-@torch.compile()
+@_maybe_compile
 def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
     w0: torch.Tensor,  # [b, dh, d], fp32 or b16
     w1: torch.Tensor,  # [b, d, dh], fp32 or b16
@@ -209,6 +221,7 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
     chunk_size: int = 2048,  # test-time training chunk size
     use_muon: bool = False,
     momentum: torch.Tensor = None,  # [b, s, 1], fp32 or bf16
+    cu_seqlens = None
 ):
     """
     Block causal LaCT with SwiGLU fast weight function.
@@ -231,7 +244,6 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
     Outputs:
         o: [b, l, d]
     """
-
     w0_w2 = torch.cat([w0, w2], dim=1).contiguous()
     w0_w2_norm = w0_w2.norm(dim=2, keepdim=True)
     w1_norm = w1.norm(dim=2, keepdim=True)
@@ -284,14 +296,17 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
         lr0i = lr0[chunk_idx].contiguous()  # [b, l, d/1] fp32
 
         # apply first, perform swiglu ffn forward pass with the qi.
-        output[chunk_idx] = fused_swiglu_ffn_fwd(w0_w2, w1, qi)
+        with profile_range("ttt_apply"):
+            output[chunk_idx] = fused_swiglu_ffn_fwd(w0_w2, w1, qi)
 
         # then, compute test-time training gradients for w0, w1, w2. under negative dot product loss.
-        dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
-            w0_w2.to(torch.bfloat16), w1.to(torch.bfloat16), ki, vi, lr0i, lr1i, lr2i
-        )
+        with profile_range("ttt_grad"):
+            dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
+                w0_w2.to(torch.bfloat16), w1.to(torch.bfloat16), ki, vi, lr0i, lr1i, lr2i
+            )
 
         if momentum is not None:
+          with profile_range("ttt_momentum"):
             m_i = momentum[chunk_idx].contiguous()
             m_i = m_i.mean(dim=1, keepdim=True)  # [b, 1, 1]
 
@@ -301,24 +316,27 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
             dw1_momentum = dw1
 
         if use_muon:
+          with profile_range("ttt_muon"):
             dw1 = zeropower_via_newtonschulz5(dw1)
             dw0_w2 = zeropower_via_newtonschulz5(dw0_w2)
 
-        w0_w2_main = w0_w2_main + dw0_w2
-        w1_main = w1_main + dw1
+        with profile_range("ttt_update"):
+            w0_w2_main = w0_w2_main + dw0_w2
+            w1_main = w1_main + dw1
 
-        # cast to bf16
-        w0_w2 = (
-            w0_w2_main / (w0_w2_main.norm(dim=2, keepdim=True) + 1e-5) * w0_w2_norm
-        ).to(torch.bfloat16)
-        w1 = (w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm).to(
-            torch.bfloat16
-        )
+            # cast to bf16
+            w0_w2 = (
+                w0_w2_main / (w0_w2_main.norm(dim=2, keepdim=True) + 1e-5) * w0_w2_norm
+            ).to(torch.bfloat16)
+            w1 = (w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm).to(
+                torch.bfloat16
+            )
 
     # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
     qi = q[-1].contiguous()
 
-    output[-1] = fused_swiglu_ffn_fwd(w0_w2, w1, qi)
+    with profile_range("ttt_apply_last"):
+        output[-1] = fused_swiglu_ffn_fwd(w0_w2, w1, qi)
 
     output = rearrange(output, "n b c d -> b (n c) d")
 

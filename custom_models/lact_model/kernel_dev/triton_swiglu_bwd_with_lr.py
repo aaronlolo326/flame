@@ -41,7 +41,7 @@ def get_autotune_configs(
 ########################################################
 
 
-@triton.autotune(configs=get_autotune_configs(), key=["B", "M", "N", "K"])
+@triton.autotune(configs=get_autotune_configs(), key=["M", "N", "K"])
 @triton.jit
 def _swiglu_three_bmm_with_lr_kernel(
     w0_w2_ptr,

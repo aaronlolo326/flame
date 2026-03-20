@@ -25,7 +25,17 @@ from .ttt_operation import (
     l2_norm,
 )
 
-from .ttt_operation_fused_kernel import (
+# from .ttt_operation_fused_kernel import (
+#     postnorm_block_causal_lact_swiglu_fused_kernel_triton,
+#     prenorm_block_causal_lact_swiglu_fused_kernel_triton,
+# )
+
+# from .ttt_operation_fused_kernel_padded import (
+#     postnorm_block_causal_lact_swiglu_fused_kernel_triton,
+#     prenorm_block_causal_lact_swiglu_fused_kernel_triton,
+# )
+
+from .ttt_operation_fused_kernel_varlen import (
     postnorm_block_causal_lact_swiglu_fused_kernel_triton,
     prenorm_block_causal_lact_swiglu_fused_kernel_triton,
 )
@@ -521,6 +531,7 @@ class LaCTSWIGLULayer(nn.Module):
                         chunk_size=self.lact_chunk_size,
                         use_muon=self.use_muon,
                         momentum=momentum,
+                        cu_seqlens=cu_seqlens,
                     )
                 else:
                   with profile_range("prenorm"):

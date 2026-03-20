@@ -226,6 +226,8 @@ def postnorm_block_causal_lact_swiglu_fused_kernel_triton(
 
     return output[:, :q_original_length]
 
+@torch._dynamo.disable
+# @_maybe_compile
 def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
     w0: torch.Tensor,  # [nh, dh, d], fp32 or b16
     w1: torch.Tensor,  # [nh, d, dh], fp32 or b16
@@ -284,7 +286,26 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
 
     doc_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     doc_nchunks = (doc_lens + chunk_size - 1) // chunk_size
-    max_chunks = num_chunks if num_chunks is not None else doc_nchunks.max().item()
+    max_chunks = num_chunks if num_chunks is not None else (packed_len + chunk_size - 1) // chunk_size
+
+    # Zero lr at each doc's last-chunk positions (apply-only, no grad+update)
+    tok_idx = torch.arange(packed_len, device=device)
+    tok_doc = torch.searchsorted(cu_seqlens[1:].long(), tok_idx.long(), right=True)
+    tok_pos = tok_idx - cu_seqlens[tok_doc]
+    last_chunk_start = (doc_nchunks - 1) * chunk_size
+    lr_mask = (tok_pos < last_chunk_start[tok_doc]).float()[None, :, None]  # [1, packed_len, 1]
+    lr0 = lr0 * lr_mask
+    lr1 = lr1 * lr_mask
+    lr2 = lr2 * lr_mask
+
+    # Memory logging
+    # _mem_alloc = torch.cuda.memory_allocated(device) / (1024 ** 3)
+    # _mem_reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+    # print(f"[varlen_kernel] nh={nh}, d={d}, dh={dh}, num_docs={num_docs}, packed_len={packed_len}, "
+    #       f"max_chunks={max_chunks}, chunk_size={chunk_size}, G={G}, flat_len={flat_len}")
+    # print(f"[varlen_kernel] doc_lens={doc_lens.tolist()}")
+    # print(f"[varlen_kernel] CUDA memory before weight expand: alloc={_mem_alloc:.2f}GiB, reserved={_mem_reserved:.2f}GiB")
+
     # [nh, num_docs, 1, 1] mask: True for groups that need grad at chunk ci
     nchunks_g = doc_nchunks.unsqueeze(0).expand(nh, -1)
 
@@ -304,6 +325,16 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
 
     # Per-(head, doc) weights: [nh, num_docs, ...]
     w0_w2 = torch.cat([w0, w2], dim=1).contiguous()
+
+    # _w0_w2_expand_bytes = nh * num_docs * 2 * dh * d * 4  # fp32
+    # _w1_expand_bytes = nh * num_docs * d * dh * 4
+    # _total_expand_bytes = 2 * _w0_w2_expand_bytes + 2 * _w1_expand_bytes  # main + bf16 copies
+    # if momentum is not None:
+    #     _total_expand_bytes += _w0_w2_expand_bytes + _w1_expand_bytes  # momentum zeros
+    # print(f"[varlen_kernel] weight expand will allocate ~{_total_expand_bytes / (1024**3):.2f}GiB "
+    #       f"(w0_w2_main: [nh={nh}, num_docs={num_docs}, 2*dh={2*dh}, d={d}], "
+    #       f"w1_main: [nh={nh}, num_docs={num_docs}, d={d}, dh={dh}])")
+
     w0_w2_norm = w0_w2.norm(dim=2, keepdim=True).unsqueeze(1).expand(-1, num_docs, -1, -1).contiguous()
     w1_norm = w1.norm(dim=2, keepdim=True).unsqueeze(1).expand(-1, num_docs, -1, -1).contiguous()
     w0_w2_main = w0_w2.unsqueeze(1).expand(-1, num_docs, -1, -1).contiguous()
@@ -315,6 +346,11 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
 
     w0_w2_bf16 = w0_w2_main.to(torch.bfloat16)
     w1_bf16 = w1_main.to(torch.bfloat16)
+
+    # _mem_alloc2 = torch.cuda.memory_allocated(device) / (1024 ** 3)
+    # _mem_reserved2 = torch.cuda.memory_reserved(device) / (1024 ** 3)
+    # print(f"[varlen_kernel] CUDA memory after weight expand: alloc={_mem_alloc2:.2f}GiB, reserved={_mem_reserved2:.2f}GiB "
+    #       f"(delta={_mem_alloc2 - _mem_alloc:.2f}GiB)")
 
     output = torch.zeros(flat_len, d, device=device, dtype=q.dtype)
 
@@ -432,7 +468,8 @@ if __name__ == "__main__":
 
     device = "cuda"
     nh, d, dh, chunk_size = 4, 512, 512, 2048
-    doc_lens = [4096, 3072, 2048, 1024]
+    # doc_lens = [4096, 3072, 2048, 1024]
+    doc_lens=[1, 4213, 1906, 295, 537, 1580, 213, 475, 743, 659, 1414, 230, 1520, 116, 745, 327, 181, 193, 187, 96, 110, 303, 340]
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(doc_lens), dim=0).tolist()),
         dtype=torch.int32, device=device,
@@ -453,7 +490,7 @@ if __name__ == "__main__":
     lr1 = torch.sigmoid(torch.randn(nh, packed_len, 1, device=device)) * 0.01
     lr2 = torch.sigmoid(torch.randn(nh, packed_len, 1, device=device)) * 0.01
     momentum = torch.sigmoid(torch.randn(nh, packed_len, 1, device=device)) * 0.9
-    _num_chunks = max_doc_len // chunk_size
+    _num_chunks = (max_doc_len + chunk_size - 1) // chunk_size
     kwargs = dict(chunk_size=chunk_size, use_muon=False)
     varlen_kw = dict(**kwargs, num_chunks=_num_chunks)
 

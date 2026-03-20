@@ -578,6 +578,23 @@ def main(job_config: JobConfig):
         while train_state.step < job_config.training.steps:
             train_state.step += 1
 
+
+            if train_state.step == 25:
+                torch.cuda.cudart().cudaProfilerStart()
+                if os.environ.get("PROFILE_MODE") == "record_function":
+                    _rf_profiler = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                        with_stack=True,
+                    )
+                    _rf_profiler.__enter__()
+            if train_state.step == 30:
+                torch.cuda.cudart().cudaProfilerStop()
+                if os.environ.get("PROFILE_MODE") == "record_function" and '_rf_profiler' in dir():
+                    _rf_profiler.__exit__(None, None, None)
+                    if torch.distributed.get_rank() == 0:
+                        logger.info("\n" + _rf_profiler.key_averages(group_by_stack_n=3).table(sort_by="self_device_time_total", row_limit=200))
+
+
             gc_handler.run(train_state.step)
 
             optimizers.zero_grad()

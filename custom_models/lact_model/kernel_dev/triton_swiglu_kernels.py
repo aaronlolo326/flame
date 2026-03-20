@@ -39,7 +39,7 @@ def get_autotune_configs(
 
 @triton.autotune(
     configs=get_autotune_configs(),
-    key=["B", "M", "N", "K"],
+    key=["M", "N", "K"],
 )
 @triton.jit
 def _fused_two_mm_swiglu_kernel(

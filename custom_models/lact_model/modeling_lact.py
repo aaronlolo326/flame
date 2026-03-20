@@ -26,6 +26,7 @@ import torch.nn as nn
 
 from .layer_lact_swiglu import LaCTSWIGLULayer
 from .configuration_lact_swiglu import LaCTSWIGLUConfig
+from .profiling_utils import profile_range
 
 logger = logging.get_logger(__name__)
 
@@ -120,23 +121,28 @@ class LaCTBlock(nn.Module):
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
 
+      with profile_range(f"block_{self.layer_idx}"):
         residual = hidden_states
-        hidden_states = self.attn_norm(hidden_states)
-        hidden_states, attentions, past_key_values = self.attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            **kwargs,
-        )
-        if self.config.fuse_norm:
-            hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
-        else:
-            hidden_states = residual + hidden_states
-            residual = hidden_states
-            hidden_states = self.mlp_norm(hidden_states)
-        hidden_states = self.mlp(hidden_states, **kwargs)
+        with profile_range("attn_norm"):
+            hidden_states = self.attn_norm(hidden_states)
+        with profile_range("attn"):
+            hidden_states, attentions, past_key_values = self.attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                **kwargs,
+            )
+        with profile_range("mlp_norm"):
+            if self.config.fuse_norm:
+                hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+            else:
+                hidden_states = residual + hidden_states
+                residual = hidden_states
+                hidden_states = self.mlp_norm(hidden_states)
+        with profile_range("mlp"):
+            hidden_states = self.mlp(hidden_states, **kwargs)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -305,8 +311,9 @@ class LaCTModel(LaCTPreTrainedModel):
         if use_cache and not isinstance(past_key_values, Cache):
             past_key_values = Cache.from_legacy_cache(past_key_values)
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embeddings(input_ids)
+        with profile_range("embed"):
+            if inputs_embeds is None:
+                inputs_embeds = self.embeddings(input_ids)
 
         # embed positions
         hidden_states = inputs_embeds
@@ -354,7 +361,8 @@ class LaCTModel(LaCTPreTrainedModel):
             if output_attentions:
                 all_attns += (layer_outputs[1],)
 
-        hidden_states = self.norm(hidden_states)
+        with profile_range("final_norm"):
+            hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -474,28 +482,31 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs,
-        )
+        with profile_range("model"):
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs,
+            )
 
         hidden_states = outputs[0]
         fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
-        logits = (
-            None
-            if fuse_linear_and_cross_entropy
-            else self.lm_head(hidden_states[:, -logits_to_keep:])
-        )
+        with profile_range("lm_head"):
+            logits = (
+                None
+                if fuse_linear_and_cross_entropy
+                else self.lm_head(hidden_states[:, -logits_to_keep:])
+            )
 
         loss = None
         if labels is not None:
+          with profile_range("loss"):
             if getattr(self, "criterion", None) is None:
                 if fuse_linear_and_cross_entropy:
                     criterion = FusedLinearCrossEntropyLoss()
