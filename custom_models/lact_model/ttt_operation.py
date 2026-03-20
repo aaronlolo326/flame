@@ -1,5 +1,11 @@
-import torch.nn.functional as F
 import torch
+import torch.nn.functional as F
+import os
+
+
+_LOG_VARLEN_SEG_STATS = os.getenv("LACT_LOG_VARLEN_SEG_STATS", "0") == "1"
+_LOG_VARLEN_SEG_STATS_EVERY = max(int(os.getenv("LACT_LOG_VARLEN_SEG_STATS_EVERY", "1")), 1)
+_varlen_seg_stats_calls = 0
 
 
 @torch.compile()
@@ -362,3 +368,419 @@ def prenorm_block_causal_lact_swiglu(
     output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
     return output.transpose(1, 2)
+
+######################### NAIVE IMPLEMENTATION #########################
+
+# @torch._dynamo.disable()
+# def prenorm_block_causal_lact_swiglu_varlen(
+#     w0: torch.Tensor,
+#     w1: torch.Tensor,
+#     w2: torch.Tensor,
+#     q: torch.Tensor,          # [bh, total_len, d]
+#     k: torch.Tensor,          # [bh, total_len, d]
+#     v: torch.Tensor,          # [bh, total_len, d]
+#     lr0: torch.Tensor,        # [bh, total_len, lr_dim]
+#     lr1: torch.Tensor,        # [bh, total_len, lr_dim]
+#     lr2: torch.Tensor,        # [bh, total_len, lr_dim]
+#     cu_seqlens: torch.Tensor, # [n_seq + 1]
+#     chunk_size: int = 2048,
+#     use_muon: bool = False,
+#     momentum: torch.Tensor = None,  # [bh, total_len, 1] or None
+# ):
+#     """
+#     Segment-aware wrapper for packed varlen training.
+
+#     Semantics:
+#       - Each segment [cu_seqlens[i], cu_seqlens[i+1]) is isolated.
+#       - Fast weights / momentum are reset per segment.
+#       - If seg_len > chunk_size: do real TTT update path.
+#       - If seg_len <= chunk_size: do apply-only path, and attach zero-anchor
+#         to lr/momentum so DDP does not see unused parameters.
+#     """
+#     if cu_seqlens.dim() != 1:
+#         raise ValueError(f"cu_seqlens must be 1D, got {tuple(cu_seqlens.shape)}")
+
+#     total_len = q.shape[1]
+#     if int(cu_seqlens[-1].item()) != total_len:
+#         raise ValueError(
+#             f"cu_seqlens[-1] ({int(cu_seqlens[-1].item())}) != total_len ({total_len})"
+#         )
+
+#     out = torch.zeros_like(v)
+#     zero_anchor = q.new_zeros((), dtype=torch.float32)
+#     num_update_seg = 0
+#     num_apply_only_seg = 0
+#     num_empty_seg = 0
+
+#     n_seg = cu_seqlens.numel() - 1
+#     for seg_idx in range(n_seg):
+#         s = int(cu_seqlens[seg_idx].item())
+#         e = int(cu_seqlens[seg_idx + 1].item())
+#         if e <= s:
+#             num_empty_seg += 1
+#             continue
+
+#         seg_len = e - s
+
+#         # Reset fast weights per segment
+#         seg_w0 = w0.clone()
+#         seg_w1 = w1.clone()
+#         seg_w2 = w2.clone()
+
+#         if seg_len > chunk_size:
+#             num_update_seg += 1
+#             # Real update path: lr/momentum are genuinely used
+#             seg_out = prenorm_block_causal_lact_swiglu(
+#                 w0=seg_w0,
+#                 w1=seg_w1,
+#                 w2=seg_w2,
+#                 q=q[:, s:e, :],
+#                 k=k[:, s:e, :],
+#                 v=v[:, s:e, :],
+#                 lr0=lr0[:, s:e, :],
+#                 lr1=lr1[:, s:e, :],
+#                 lr2=lr2[:, s:e, :],
+#                 chunk_size=chunk_size,
+#                 use_muon=use_muon,
+#                 momentum=None if momentum is None else momentum[:, s:e, :],
+#             )
+#         else:
+#             num_apply_only_seg += 1
+#             # Apply-only path: no update should happen for this segment
+#             seg_out = prenorm_block_causal_lact_swiglu_apply_only(
+#                 w0=seg_w0,
+#                 w1=seg_w1,
+#                 w2=seg_w2,
+#                 q=q[:, s:e, :],
+#             )
+
+#             # DDP-safe zero anchor: keep lr/momentum connected to graph
+#             zero_anchor = zero_anchor + lr0[:, s:e, :].float().sum() * 0.0
+#             zero_anchor = zero_anchor + lr1[:, s:e, :].float().sum() * 0.0
+#             zero_anchor = zero_anchor + lr2[:, s:e, :].float().sum() * 0.0
+#             if momentum is not None:
+#                 zero_anchor = zero_anchor + momentum[:, s:e, :].float().sum() * 0.0
+
+#         out[:, s:e, :] = seg_out
+
+#     global _varlen_seg_stats_calls
+#     _varlen_seg_stats_calls += 1
+#     if _LOG_VARLEN_SEG_STATS and _varlen_seg_stats_calls % _LOG_VARLEN_SEG_STATS_EVERY == 0:
+#         should_log = True
+#         if torch.distributed.is_available() and torch.distributed.is_initialized():
+#             should_log = torch.distributed.get_rank() == 0
+#         if should_log:
+#             cs = cu_seqlens.detach().reshape(-1).to(torch.int64).cpu()
+#             cs_list = cs.tolist()
+#             if len(cs_list) <= 16:
+#                 cs_preview = cs_list
+#             else:
+#                 cs_preview = cs_list[:8] + ["..."] + cs_list[-8:]
+#             print(
+#                 "[LaCT varlen seg stats] "
+#                 f"call={_varlen_seg_stats_calls} "
+#                 f"chunk_size={chunk_size} total_seg={n_seg} "
+#                 f"update_seg={num_update_seg} apply_only_seg={num_apply_only_seg} empty_seg={num_empty_seg} "
+#                 f"cu_seqlens_n={len(cs_list)} cu_seqlens={cs_preview}"
+#             )
+
+#     return out + zero_anchor.to(dtype=out.dtype)
+
+    
+
+# @torch.compile()
+# @torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16)
+# def prenorm_block_causal_lact_swiglu_apply_only(
+#     w0: torch.Tensor,
+#     w1: torch.Tensor,
+#     w2: torch.Tensor,
+#     q: torch.Tensor,   # [bh, s, d]
+# ):
+#     q_t = q.transpose(1, 2)  # [bh, d, s]
+
+#     h = torch.bmm(w2, q_t)
+#     gate = F.silu(torch.bmm(w0, q_t), inplace=True)
+#     out = torch.bmm(w1, gate * h)  # [bh, d, s]
+
+#     return out.transpose(1, 2)     # [bh, s, d]
+
+######################### BUCKET WAY IMPLEMENTATION #########################
+
+
+from collections import defaultdict
+from typing import List, Tuple, Optional
+
+
+# def _round_up_to_multiple(x: int, multiple: int) -> int:
+#     if multiple <= 1:
+#         return x
+#     return ((x + multiple - 1) // multiple) * multiple
+
+
+def _repeat_fast_weights_per_segment(w: torch.Tensor, n_seg: int) -> torch.Tensor:
+    """
+    w: [bh, ..., ...]
+    return: [n_seg * bh, ..., ...]
+    """
+    if n_seg == 1:
+        return w.clone()
+    return w.repeat(n_seg, 1, 1)
+
+
+def _pack_varlen_segments_dense(
+    x: torch.Tensor,  # [bh, total_len, d]
+    seg_meta: List[Tuple[int, int, int]],
+    pad_len: int,
+) -> torch.Tensor:
+    """
+    Pack a list of segments into a dense tensor.
+
+    Args:
+        x: [bh, total_len, d]
+        seg_meta: list of (s, e, seg_len)
+        pad_len: padded sequence length for this bucket
+
+    Returns:
+        packed: [n_seg * bh, pad_len, d]
+    """
+    bh, _, d = x.shape
+    n_seg = len(seg_meta)
+
+    packed = x.new_zeros((n_seg, bh, pad_len, d))
+    for i, (s, e, seg_len) in enumerate(seg_meta):
+        packed[i, :, :seg_len, :] = x[:, s:e, :]
+
+    return packed.reshape(n_seg * bh, pad_len, d)
+
+
+def _scatter_varlen_segments_dense(
+    out: torch.Tensor,         # [bh, total_len, d]
+    packed_out: torch.Tensor,  # [n_seg * bh, pad_len, d]
+    seg_meta: List[Tuple[int, int, int]],
+) -> None:
+    bh, _, d = out.shape
+    n_seg = len(seg_meta)
+    pad_len = packed_out.shape[1]
+
+    packed_out = packed_out.view(n_seg, bh, pad_len, d)
+    for i, (s, e, seg_len) in enumerate(seg_meta):
+        out[:, s:e, :] = packed_out[i, :, :seg_len, :]
+
+
+def _iter_bucket_minibatches(
+    seg_meta: List[Tuple[int, int, int]],
+    max_segments_per_bucket: Optional[int],
+):
+    if max_segments_per_bucket is None or max_segments_per_bucket <= 0:
+        yield seg_meta
+        return
+    for i in range(0, len(seg_meta), max_segments_per_bucket):
+        yield seg_meta[i : i + max_segments_per_bucket]
+
+
+
+def _build_varlen_buckets_pad_full_chunk(
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+):
+    """
+    Bucket segments by:
+      - short/apply-only: seg_len <= chunk_size, bucket by pad_len=chunk_size or seg_len
+      - long/update: key = n_updates only, and always pad total length to (n_updates + 1) * chunk_size
+
+    Definitions:
+        n_updates = ceil(seg_len / chunk_size) - 1
+                  = (seg_len - 1) // chunk_size
+    """
+    cs = cu_seqlens.to(torch.int64).cpu().tolist()
+
+    apply_only_buckets = defaultdict(list)   # key: pad_len
+    update_buckets = defaultdict(list)       # key: n_updates
+
+    num_empty_seg = 0
+    num_apply_only_seg = 0
+    num_update_seg = 0
+
+    for seg_idx in range(len(cs) - 1):
+        s, e = cs[seg_idx], cs[seg_idx + 1]
+        if e <= s:
+            num_empty_seg += 1
+            continue
+
+        seg_len = e - s
+
+        if seg_len <= chunk_size:
+            num_apply_only_seg += 1
+            # 这里你有两个选择：
+            # 1. 继续保留真实 seg_len，减少短段浪费
+            # 2. 也统一 pad 到 chunk_size，shape 最简单
+            #
+            # 如果你想“全都最简单”，就直接用下面这一行：
+            pad_len = chunk_size
+
+            apply_only_buckets[pad_len].append((s, e, seg_len))
+        else:
+            num_update_seg += 1
+            n_updates = (seg_len - 1) // chunk_size
+            update_buckets[n_updates].append((s, e, seg_len))
+
+    stats = {
+        "total_seg": len(cs) - 1,
+        "update_seg": num_update_seg,
+        "apply_only_seg": num_apply_only_seg,
+        "empty_seg": num_empty_seg,
+        "n_apply_buckets": len(apply_only_buckets),
+        "n_update_buckets": len(update_buckets),
+        "cu_seqlens_n": len(cs),
+        "cu_seqlens_preview": cs if len(cs) <= 16 else cs[:8] + ["..."] + cs[-8:],
+    }
+    return apply_only_buckets, update_buckets, stats
+
+@torch._dynamo.disable()
+def prenorm_block_causal_lact_swiglu_varlen_bucketed(
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    q: torch.Tensor,          # [bh, total_len, d]
+    k: torch.Tensor,          # [bh, total_len, d]
+    v: torch.Tensor,          # [bh, total_len, d]
+    lr0: torch.Tensor,        # [bh, total_len, lr_dim]
+    lr1: torch.Tensor,        # [bh, total_len, lr_dim]
+    lr2: torch.Tensor,        # [bh, total_len, lr_dim]
+    cu_seqlens: torch.Tensor, # [n_seq + 1]
+    chunk_size: int = 2048,
+    use_muon: bool = False,
+    momentum: torch.Tensor = None,  # [bh, total_len, 1] or None
+    max_segments_per_bucket: Optional[int] = None,
+):
+    """
+    Bucketed dense-batching version of varlen LaCT.
+
+    Simpler policy:
+      - short segments: optionally all pad to chunk_size
+      - long segments: final chunk always pad to full chunk_size
+      - update bucket key = n_updates only
+    """
+    if cu_seqlens.dim() != 1:
+        raise ValueError(f"cu_seqlens must be 1D, got {tuple(cu_seqlens.shape)}")
+
+    total_len = q.shape[1]
+    if int(cu_seqlens[-1].item()) != total_len:
+        raise ValueError(
+            f"cu_seqlens[-1] ({int(cu_seqlens[-1].item())}) != total_len ({total_len})"
+        )
+
+    out = torch.zeros_like(v)
+    zero_anchor = q.new_zeros((), dtype=torch.float32)
+
+    apply_only_buckets, update_buckets, stats = _build_varlen_buckets_pad_full_chunk(
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+    )
+
+    # ----------------------------------------------------------
+    # 1) Apply-only buckets
+    # ----------------------------------------------------------
+    for pad_len, seg_list in apply_only_buckets.items():
+        for seg_meta in _iter_bucket_minibatches(seg_list, max_segments_per_bucket):
+            packed_q = _pack_varlen_segments_dense(q, seg_meta, pad_len=pad_len)
+
+            packed_w0 = _repeat_fast_weights_per_segment(w0, len(seg_meta))
+            packed_w1 = _repeat_fast_weights_per_segment(w1, len(seg_meta))
+            packed_w2 = _repeat_fast_weights_per_segment(w2, len(seg_meta))
+
+            packed_out = prenorm_block_causal_lact_swiglu_apply_only(
+                w0=packed_w0,
+                w1=packed_w1,
+                w2=packed_w2,
+                q=packed_q,
+            )
+
+            _scatter_varlen_segments_dense(out, packed_out, seg_meta)
+
+            for s, e, _ in seg_meta:
+                zero_anchor = zero_anchor + lr0[:, s:e, :].float().sum() * 0.0
+                zero_anchor = zero_anchor + lr1[:, s:e, :].float().sum() * 0.0
+                zero_anchor = zero_anchor + lr2[:, s:e, :].float().sum() * 0.0
+                if momentum is not None:
+                    zero_anchor = zero_anchor + momentum[:, s:e, :].float().sum() * 0.0
+
+    # ----------------------------------------------------------
+    # 2) Update buckets
+    # ----------------------------------------------------------
+    for n_updates, seg_list in update_buckets.items():
+        pad_len = (n_updates + 1) * chunk_size
+
+        for seg_meta in _iter_bucket_minibatches(seg_list, max_segments_per_bucket):
+            packed_q = _pack_varlen_segments_dense(q, seg_meta, pad_len=pad_len)
+            packed_k = _pack_varlen_segments_dense(k, seg_meta, pad_len=pad_len)
+            packed_v = _pack_varlen_segments_dense(v, seg_meta, pad_len=pad_len)
+            packed_lr0 = _pack_varlen_segments_dense(lr0, seg_meta, pad_len=pad_len)
+            packed_lr1 = _pack_varlen_segments_dense(lr1, seg_meta, pad_len=pad_len)
+            packed_lr2 = _pack_varlen_segments_dense(lr2, seg_meta, pad_len=pad_len)
+            packed_momentum = (
+                None if momentum is None
+                else _pack_varlen_segments_dense(momentum, seg_meta, pad_len=pad_len)
+            )
+
+            packed_w0 = _repeat_fast_weights_per_segment(w0, len(seg_meta))
+            packed_w1 = _repeat_fast_weights_per_segment(w1, len(seg_meta))
+            packed_w2 = _repeat_fast_weights_per_segment(w2, len(seg_meta))
+
+            packed_out = prenorm_block_causal_lact_swiglu(
+                w0=packed_w0,
+                w1=packed_w1,
+                w2=packed_w2,
+                q=packed_q,
+                k=packed_k,
+                v=packed_v,
+                lr0=packed_lr0,
+                lr1=packed_lr1,
+                lr2=packed_lr2,
+                chunk_size=chunk_size,
+                use_muon=use_muon,
+                momentum=packed_momentum,
+            )
+
+            _scatter_varlen_segments_dense(out, packed_out, seg_meta)
+
+    global _varlen_seg_stats_calls
+    _varlen_seg_stats_calls += 1
+    if _LOG_VARLEN_SEG_STATS and _varlen_seg_stats_calls % _LOG_VARLEN_SEG_STATS_EVERY == 0:
+        should_log = True
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            should_log = torch.distributed.get_rank() == 0
+        if should_log:
+            print(
+                "[LaCT varlen bucketed fullpad stats] "
+                f"call={_varlen_seg_stats_calls} "
+                f"chunk_size={chunk_size} "
+                f"total_seg={stats['total_seg']} "
+                f"update_seg={stats['update_seg']} "
+                f"apply_only_seg={stats['apply_only_seg']} "
+                f"empty_seg={stats['empty_seg']} "
+                f"apply_buckets={stats['n_apply_buckets']} "
+                f"update_buckets={stats['n_update_buckets']} "
+                f"cu_seqlens_n={stats['cu_seqlens_n']} "
+                f"cu_seqlens={stats['cu_seqlens_preview']}"
+            )
+
+    return out + zero_anchor.to(dtype=out.dtype)
+
+    
+
+@torch.compile()
+@torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16)
+def prenorm_block_causal_lact_swiglu_apply_only(
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    q: torch.Tensor,   # [bh, s, d]
+):
+    q_t = q.transpose(1, 2)  # [bh, d, s]
+
+    h = torch.bmm(w2, q_t)
+    gate = F.silu(torch.bmm(w0, q_t), inplace=True)
+    out = torch.bmm(w1, gate * h)  # [bh, d, s]
+
+    return out.transpose(1, 2)     # [bh, s, d]

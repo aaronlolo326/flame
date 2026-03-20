@@ -4,10 +4,10 @@ echo $RUN_NAME
 debug=false
 profile=false
 
-batch_size=2
-seq_len=2048
-grad_accum=8
-no_tokens=$(( 50 * 10**9 ))
+batch_size=1
+seq_len=16384
+grad_accum=16
+no_tokens=$(( 10 * 10**9 ))
 
 if [ "$debug" = true ]; then
   CUDA_VISIBLE_DEVICES=0
@@ -48,11 +48,14 @@ NNODE=1 NGPU=${NGPU} LOG_RANK=0 bash train.sh \
   --training.steps $steps \
   --training.max_norm 1.0 \
   --training.skip_nan_inf \
-  --training.tokenized_dataset_dir /storage/backup/hei/data/HuggingFaceFW___fineweb-edu___sample-350BT \
+  --training.tokenized_dataset_dir /storage/backup/hei/data/qwen3-dclm-filter-16k_train \
+  --training.data_mix_stopping_strategy first_exhausted \
+  --training.streaming \
+  --training.data_format arrow \
+  --training.dataset_split train \
   --training.num_workers 32 \
   --training.prefetch_factor 2 \
   --training.seed 42 \
-  --training.compile \
   --training.data_parallel_shard_degree 1 \
   --training.data_parallel_replicate_degree 8 \
   --training.disable_loss_parallel \

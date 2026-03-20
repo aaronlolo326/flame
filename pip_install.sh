@@ -17,7 +17,7 @@ pip install flash-linear-attention
 pip install datasets==4.5.0
 pip install tyro
 pip install matplotlib
-git clone --depth 1 https://github.com/EleutherAI/lm-evaluation-harness
+git clone -b flame --depth 1 https://github.com/aaronlolo326/lm-evaluation-harness.git
 cd lm-evaluation-harness
 pip install -e .[longbench]
 pip install -e .[niah]

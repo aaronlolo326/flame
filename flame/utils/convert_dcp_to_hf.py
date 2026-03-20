@@ -47,8 +47,12 @@ def save_pretrained(
 
         # Add datetime.timedelta and io.BytesIO to safe globals
         torch.serialization.add_safe_globals([timedelta, io.BytesIO])
-        # torch.load now with default weights_only=True will work
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu')['model'])
+        payload = torch.load(checkpoint_path, map_location='cpu')
+        # Compatible with both:
+        # 1) full training checkpoints: {"model": ... , "optimizer": ...}
+        # 2) model-only checkpoints: flat state_dict at the top level
+        state_dict = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+        model.load_state_dict(state_dict)
 
         logger.info(f"Saving the model to {path}")
         model.save_pretrained(path)

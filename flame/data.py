@@ -160,6 +160,7 @@ class OnlineTokenizedIterableDataset(IterableDataset):
         dataset: Dataset,
         tokenizer: PreTrainedTokenizer | None,
         is_tokenized: bool,
+        emit_cu_seqlens: bool = False,
         seq_len: int = 2048,
         rank: int = 0,
         world_size: int = 1
@@ -167,6 +168,7 @@ class OnlineTokenizedIterableDataset(IterableDataset):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.is_tokenized = is_tokenized
+        self.emit_cu_seqlens = emit_cu_seqlens
         if tokenizer is None and not is_tokenized:
             raise ValueError("tokenizer is None and not is_tokenized")
         self.data = dataset.shard(world_size, rank)
@@ -176,6 +178,27 @@ class OnlineTokenizedIterableDataset(IterableDataset):
 
         self.states = None
         self.tokens = []
+        self.sample_end_offsets = []
+
+    def _normalize_token_ids(self, sample_input_ids: Any) -> List[int]:
+        if isinstance(sample_input_ids, torch.Tensor):
+            return sample_input_ids.to(dtype=torch.long).tolist()
+        if isinstance(sample_input_ids, np.ndarray):
+            return sample_input_ids.astype(np.int64).tolist()
+        return list(sample_input_ids)
+
+    def _append_sample(self, token_ids: List[int]) -> None:
+        self.tokens += token_ids
+        prev_end = self.sample_end_offsets[-1] if self.sample_end_offsets else 0
+        self.sample_end_offsets.append(prev_end + len(token_ids))
+
+    def _build_chunk_cu_seqlens(self, chunk_len: int) -> List[int]:
+        boundaries = [x for x in self.sample_end_offsets if 0 < x < chunk_len]
+        return [0] + boundaries + [chunk_len]
+
+    def _consume_chunk(self, chunk_len: int) -> None:
+        self.tokens = self.tokens[chunk_len:]
+        self.sample_end_offsets = [x - chunk_len for x in self.sample_end_offsets if x > chunk_len]
 
     def __iter__(self):
         if self.states is not None:
@@ -191,14 +214,23 @@ class OnlineTokenizedIterableDataset(IterableDataset):
             for sample in samples:
                 # keep appending the samples to the token buffer
                 if self.is_tokenized:
-                    sample = sample['input_ids']
-                self.tokens += sample
+                    token_ids = self._normalize_token_ids(sample['input_ids'])
+                else:
+                    token_ids = self._normalize_token_ids(sample)
+                self._append_sample(token_ids)
                 # logger.info(f"{self.tokens=}")
                 while len(self.tokens) >= self.seq_len:
                     input_ids = torch.tensor(self.tokens[:self.seq_len], dtype=torch.long)
-                    self.tokens = self.tokens[self.seq_len:]
+                    if self.emit_cu_seqlens:
+                        cu_seqlens = torch.tensor(
+                            self._build_chunk_cu_seqlens(self.seq_len),
+                            dtype=torch.int32,
+                        )
+                        yield {'input_ids': input_ids, 'cu_seqlens': cu_seqlens}
+                    else:
+                        yield {'input_ids': input_ids}
+                    self._consume_chunk(self.seq_len)
                     # logger.info(f"{len(self.tokens)=} {self.seq_len=}")
-                    yield {'input_ids': input_ids}
 
     def tokenize(self, data, buffer_size: int = 64):
         buffer, states = [], []
@@ -224,11 +256,16 @@ class OnlineTokenizedIterableDataset(IterableDataset):
                 yield tokenized
 
     def state_dict(self):
-        return {'states': self.states, 'tokens': deepcopy(self.tokens)}
+        return {
+            'states': self.states,
+            'tokens': deepcopy(self.tokens),
+            'sample_end_offsets': deepcopy(self.sample_end_offsets),
+        }
 
     def load_state_dict(self, state_dict):
         self.states = state_dict['states']
         self.tokens = deepcopy(state_dict['tokens'])
+        self.sample_end_offsets = deepcopy(state_dict.get('sample_end_offsets', []))
 
 
 class BufferShuffledExamplesIterable(datasets.iterable_dataset.BufferShuffledExamplesIterable):
@@ -420,9 +457,8 @@ class DataCollatorForLanguageModeling:
 
             # --- cu_seqlens calculation logic remains the same ---
             if 'cu_seqlens' in examples[0]:
-                batch['cu_seqlens'] = (
-                    torch.cat([example['cu_seqlens'] for example in examples], dim=0).unsqueeze(0).to(dtype=torch.int32)
-                )  # Ensure int32
+                # varlen mode enforces batch_size=1, keep cu_seqlens as 1D for downstream kernels.
+                batch['cu_seqlens'] = examples[0]['cu_seqlens'].to(dtype=torch.int32)
             else:
                 # determine boundaries by bos/eos positions
                 # Check for bos_token_id first
@@ -569,11 +605,14 @@ class ParallelAwareDataLoader(StatefulDataLoader, Stateful):
 def build_dataset(
     dataset: str=None,
     tokenized_dataset_dir: str=None,
+    data_format: str=None,
+    seq_len: Optional[int]=None,
     dataset_name: str = None,
     dataset_split: str = 'train',
     data_dir: str = None,
     data_files: str = None,
     data_probs: List[float] = None,
+    data_mix_stopping_strategy: str = "first_exhausted",
     streaming: bool = False,
     dp_degree: Optional[int] = None,
     num_workers: int = 32,
@@ -586,12 +625,23 @@ def build_dataset(
     if len(path.split(',')) == 1:
 
         if tokenized_dataset_dir is not None:
-            dataset = load_from_disk(path)
-            # dataset = Dataset.from_file("/work/mingze/data/data-00000-of-02786.arrow")
+            if data_format == "zarr":
+                zarr_array = zarr.open(tokenized_dataset_dir, mode='r')
+                dataset = Dataset.from_generator(
+                    zarr_sample_generator,
+                    gen_kwargs={
+                        "zarr_array": zarr_array,
+                        "seq_len": seq_len,
+                    },
+                )
+            elif data_format == "arrow":
+                dataset = load_from_disk(path)
+                # dataset = Dataset.from_file("/work/mingze/data/data-00000-of-02786.arrow")
                 
-            # # 截取并打印
-            # dataset = dataset.select(range(min(1000, len(dataset))))
-            # print(f"First sample: {dataset[0]}")
+                # # 截取并打印
+                # dataset = dataset.select(range(min(1000, len(dataset))))
+                # print(f"First sample: {dataset[0]}")
+                
             logger.info(f"Shuffling the dataset with seed {seed}")
             if seed is not None:
                 dataset = dataset.shuffle(seed=seed)
@@ -691,15 +741,23 @@ def build_dataset(
             )
 
         subsets = []
+        len_subsets = []
         for i, prob in enumerate(data_probs):
             if tokenized_dataset_dir is not None:
-                subset = load_from_disk(path)
-                subset = subset.to_iterable_dataset(num_shards=min_num_shards)
+                if data_format == "zarr":
+                    dataset = zarr.open(paths[i], mode='r')
+                elif data_format == "arrow":
+                    subset = load_from_disk(paths[i])
+                logger.info (f"[Data] {len(subset)} instances from {paths[i]}")
+                len_subsets.append(len(subset))
+                # print (subset[0]['input_ids'][:20], subset[0]['input_ids'][-20:])
+                # breakpoint()
                 # the states of map-style dataset is recoverable after shuffling
-                logger.info(f"Shuffling the dataset with seed {seed}")
                 if seed is not None:
+                    logger.info(f"Shuffling the dataset with seed {seed}")
                     subset = subset.shuffle(seed=seed)
                 if min_num_shards is not None:
+                    logger.info(f"Converting subset to iterable dataset with {min_num_shards} shards")
                     subset = subset.to_iterable_dataset(num_shards=min_num_shards)
             else:
                 subset = load_dataset(
@@ -770,17 +828,21 @@ def build_dataset(
                     )
             subsets.append(subset)
 
+        if data_mix_stopping_strategy == 'first_exhausted':
+            total_tokens = seq_len * min(len_subsets) * len(subsets)
+            logger.info(f"At {seq_len=} with {data_mix_stopping_strategy=}, we have {total_tokens} training tokens")
         logger.info(
-            f"Interleaving {len(subsets)} datasets with probabilities {data_probs}"
+            f"Interleaving {len(subsets)} datasets with probabilities {data_probs}; {data_mix_stopping_strategy=}"
         )
         dataset = interleave_datasets(
             datasets=subsets,
             probabilities=data_probs,
-            stopping_strategy="all_exhausted",
+            stopping_strategy=data_mix_stopping_strategy,
             seed=seed,
         )
     logger.info(f"{dataset}")
     return dataset
+
 
 
 def build_dataloader(
@@ -797,9 +859,16 @@ def build_dataloader(
     pin_memory: bool = False,
     persistent_workers: bool = False,
     snapshot_every_n_steps: Optional[int] = 1,
+    sample_trunc_seq: int = 1
 ):
     dataset = OnlineTokenizedIterableDataset(
-        dataset=dataset, tokenizer=tokenizer, is_tokenized=is_tokenized, seq_len=seq_len, rank=rank, world_size=world_size
+        dataset=dataset,
+        tokenizer=tokenizer,
+        is_tokenized=is_tokenized,
+        emit_cu_seqlens=varlen,
+        seq_len=seq_len,
+        rank=rank,
+        world_size=world_size,
     )
     return ParallelAwareDataLoader(
         rank=rank,

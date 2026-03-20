@@ -1,6 +1,7 @@
 #!/usr/bin/bash
 train=true
 convert=true
+train_exit_code=0
 
 params=""
 if [ $# -ne 0 ]; then
@@ -114,12 +115,16 @@ if $train; then
     --tee 3 \
     --log-dir $path/logs \
     -m flame.train \
-    $params
+    $params || train_exit_code=$?
 
   echo "TRAINING DONE!"
 fi
 
 if $convert; then
+  if [ "$train_exit_code" != "0" ]; then
+    echo "Skipping conversion because training failed with exit code ${train_exit_code}."
+    exit "$train_exit_code"
+  fi
   echo "Converting the DCP checkpoints to HF format..."
   python -m flame.utils.convert_dcp_to_hf \
     --path $path \

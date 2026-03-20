@@ -12,7 +12,7 @@ from datetime import timedelta
 
 import fla  # noqa
 import torch
-from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
+# from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss # commented out for now as it is not used so far; also not available in flash-linear-attention 0.4.0
 from fla.ops.utils import prepare_position_ids
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpoint import CheckpointManager
@@ -30,14 +30,15 @@ from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-import custom_models
 from flame.components.checkpoint import TrainState
 from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
-from flame.tools.utils import get_nparams_and_flops, get_parameter_counts
+from flame.tools.utils import get_nparams_and_flops
 
+import custom_models
+# torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
@@ -63,6 +64,20 @@ register_train_spec(
 def main(job_config: JobConfig):
 
     # torch.cuda.memory._record_memory_history(max_entries=100000)
+
+    # # get model_type attr from the json file at job_config.model.config, and import
+    # import json
+    # with open(job_config.model.config, "r") as f:
+    #     model_json = json.load(f)
+    #     model_type = model_json.get("model_type")
+    #     layer_types = model_json.get("layer_types")
+    # from custom_models import MODEL_TYPE_TO_PARENT_DIR
+    # parent_dir = MODEL_TYPE_TO_PARENT_DIR[model_type]
+    # import importlib
+    # importlib.import_module(f"custom_models.{parent_dir}")
+    model_type=None
+    layer_types=None
+
 
     logger.info(f"Starting job: {job_config.job.description}")
 
@@ -150,7 +165,8 @@ def main(job_config: JobConfig):
         trust_remote_code=True,
         model_max_length=int(1e10),
     )
-    logger.info(f"{tokenizer}")
+    tokenizer.eos_token_id = tokenizer.pad_token_id # for qwen3 base
+    # logger.info(f"{tokenizer}")
 
     is_tokenized = False if job_config.training.tokenized_dataset_dir is None else True
 
@@ -164,11 +180,14 @@ def main(job_config: JobConfig):
     dataset = build_dataset(
         dataset=job_config.training.dataset if job_config.training.tokenized_dataset_dir is None else None,
         tokenized_dataset_dir=job_config.training.tokenized_dataset_dir,
+        data_format=job_config.training.data_format,
+        seq_len=job_config.training.seq_len,
         dataset_name=job_config.training.dataset_name,
         dataset_split=job_config.training.dataset_split,
         data_dir=job_config.training.data_dir,
         data_files=job_config.training.data_files,
         data_probs=job_config.training.data_probs,
+        data_mix_stopping_strategy=job_config.training.data_mix_stopping_strategy,
         streaming=job_config.training.streaming,
         dp_degree=dp_degree,
         num_workers=job_config.training.num_workers,
@@ -190,6 +209,7 @@ def main(job_config: JobConfig):
         pin_memory=job_config.training.pin_memory,
         persistent_workers=job_config.training.persistent_workers,
         snapshot_every_n_steps=job_config.checkpoint.interval,
+        sample_trunc_seq=job_config.training.sample_trunc_seq,
     )
     # breakpoint()
     # data_iterator = iter(dataloader)
@@ -223,25 +243,6 @@ def main(job_config: JobConfig):
     logger.info(
         f"Building model from the config\n{color.green}{model_config}{color.reset}"
     )
-
-    # E2E-TTT performs inner-loop autograd.grad inside forward, then uses outer loss.backward.
-    # With torch.compile + donated buffers, AOT backward requires retain_graph=False/create_graph=False
-    # across all backward calls, which conflicts with this pattern. Disable donated buffers for stability.
-    if job_config.training.compile and bool(getattr(model_config, "use_e2e_ttt", False)):
-        try:
-            job_config.training.compile = False
-            if getattr(torch._functorch.config, "donated_buffer", False):
-                torch._functorch.config.donated_buffer = False
-
-                logger.info(
-                    "Disabled torch._functorch.config.donated_buffer for E2E-TTT inner-loop autograd compatibility."
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to set torch._functorch.config.donated_buffer=False ({e}). "
-                "If you hit donated buffer backward errors, disable it manually."
-            )
-
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(model_config)
         if (
@@ -255,24 +256,38 @@ def main(job_config: JobConfig):
         model.apply(lambda m: setattr(m, "_is_hf_initialized", False))
     logger.info(f"{color.blue}\n{model}{color.reset}\n")
 
+    # E2E-TTT training path can call autograd.grad with graph retention in the inner loop.
+    # Under torch.compile, donated buffers may conflict with that usage in AOTAutograd.
+    if bool(getattr(model_config, "use_e2e_ttt", False)) and bool(getattr(job_config.training, "compile", False)):
+        try:
+            import torch._functorch.config as functorch_config
+
+            functorch_config.donated_buffer = False
+            logger.info(
+                "Disabled torch._functorch.config.donated_buffer for "
+                "E2E-TTT inner-loop autograd compatibility."
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to disable torch._functorch.config.donated_buffer "
+                f"(continuing with default): {type(e).__name__}: {e}"
+            )
+
+    # # Source - https://stackoverflow.com/a/79627453
+    # # Posted by Om Rastogi
+    # # Retrieved 2026-03-07, License - CC BY-SA 4.0
+
+    # for i, (name, tensor) in enumerate(model.state_dict().items()):
+    #     print(f"{i}: {name} → shape={tensor.shape}, dtype={tensor.dtype}")
+
+
     # Build the collection of model converters. No-op if `model.converters` empty
     model_converters = build_model_converters(job_config, parallel_dims)
     model_converters.convert(model)
 
     # calculate model size and flops per token
-    model_param_count, num_flops_per_token = get_nparams_and_flops(
+    model_param_count, nparams_embedding, num_flops_per_token = get_nparams_and_flops(
         model, model_config, job_config.training.context_len
-    )
-    (
-        model_param_count_og,
-        model_trainable_param_count,
-        model_non_trainable_param_count,
-    ) = get_parameter_counts(model)
-    logger.info(
-        f"{color.green}Model parameters at init (before parallelism): "
-        f"total={model_param_count_og:,}, "
-        f"trainable={model_trainable_param_count:,}, "
-        f"non-trainable={model_non_trainable_param_count:,}{color.reset}"
     )
 
     # move sharded model to CPU/GPU and initialize weights via DTensor
@@ -318,6 +333,15 @@ def main(job_config: JobConfig):
         ensure_pp_loss_visible(parallel_dims, job_config, color)
     else:
         # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
+        ignored_params = None
+        if model_type == 'qwen3_gdn' and layer_types is not None:
+            # FSDP fully_shard expects ignored_params to be a set of nn.Parameter
+            ignored_params = {
+                model.model.layers[idx].self_attn.A_log
+                for idx, layer_type in enumerate(layer_types)
+                if layer_type == 'linear_attention'
+            }
+        # train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config, ignored_params=ignored_params)
         train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config)
         model.to_empty(device=init_device)
         with torch.no_grad():
@@ -325,6 +349,21 @@ def main(job_config: JobConfig):
         model.train()
 
         model_parts = [model]
+
+    ###
+    from collections import defaultdict
+
+    # dtypes = defaultdict(list)
+
+    # for name, p in model.named_parameters():
+    #     dtypes[p.dtype].append(name)
+
+    # for k, v in dtypes.items():
+    #     print(k, len(v))
+    for name, p in model.named_parameters():
+        if p.dtype == torch.float32:
+            print(name, "is in", p.dtype)
+    ###
 
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
@@ -335,6 +374,24 @@ def main(job_config: JobConfig):
 
     # build optimizer after applying parallelisms to the model
     optimizers = train_spec.build_optimizers_fn(model_parts, job_config, ft_manager)
+
+
+    # # Sanity check: ensure lr_proj / momentum_proj params are covered by the optimizer
+    # name_to_param = dict(model.named_parameters())
+    # target_names = [n for n in name_to_param if "attn.lr_proj" in n or "attn.momentum_proj" in n]
+    # # Collect all params that the (first) underlying optimizer actually optimizes
+    # from itertools import chain
+    # # TorchTitan's build_optimizers returns a container with a list of torch.optim optimizers
+    # all_opt_params = set(
+    #     chain.from_iterable(
+    #         group["params"] for opt in optimizers.optimizers for group in opt.param_groups
+    #     )
+    # )
+    # missing = [n for n in target_names if name_to_param[n] not in all_opt_params]
+    # if missing:
+    #     raise RuntimeError(f"The following attn extra params are NOT in the optimizer: {missing}")
+
+
     lr_schedulers = train_spec.build_lr_schedulers_fn(optimizers, job_config)
     # Post optimizer step model converters hook.
     # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
@@ -367,7 +424,57 @@ def main(job_config: JobConfig):
         logger.info("Created seed checkpoint")
         return
 
+
+
     checkpoint.load(step=job_config.checkpoint.load_step)
+    # # NOTE[flame]:
+    # # When loading checkpoints created with an older model/optimizer configuration,
+    # # TorchTitan's CheckpointManager may raise:
+    # #   "checkpoint's metadata does not match its state_dict"
+    # # especially for newly introduced optimizer states such as
+    # #   optimizer.state.model.layers.*.attn.lr_proj.*
+    # #   optimizer.state.model.layers.*.attn.momentum_proj.*.
+    # #
+    # # PyTorch's distributed checkpoint utilities currently require an exact match
+    # # between optimizer state metadata and the in-memory optimizer state, and do
+    # # not support partially missing per-parameter optimizer entries.
+    # #
+    # # To allow resuming from such checkpoints while the model architecture has
+    # # changed, we fall back to *ignoring optimizer (and scheduler) state* on
+    # # load, and only restore model weights and training state.
+    # try:
+    #     checkpoint.load(step=job_config.checkpoint.load_step)
+    # except Exception as e:
+    #     if "metadata does not match its state_dict" in str(e):
+    #         logger.warning(
+    #             "Checkpoint load failed due to optimizer metadata/state mismatch. "
+    #             "Falling back to loading model weights and train_state only; "
+    #             "optimizer and lr_schedulers will be reinitialized."
+    #         )
+    #         # Ensure optimizer / scheduler are excluded from the next load attempt.
+    #         exclude = list(getattr(job_config.checkpoint, "exclude_from_loading", []))
+    #         for key in ["optimizer", "lr_scheduler"]:
+    #             if key not in exclude:
+    #                 exclude.append(key)
+    #         job_config.checkpoint.exclude_from_loading = exclude
+
+    #         # Recreate CheckpointManager so it observes the updated config.
+    #         checkpoint = CheckpointManager(
+    #             dataloader=dataloader,
+    #             model_parts=model_parts,
+    #             optimizers=optimizers,
+    #             lr_schedulers=lr_schedulers,
+    #             states={"train_state": train_state},
+    #             job_config=job_config,
+    #             ft_manager=ft_manager,
+    #         )
+    #         checkpoint.load(step=job_config.checkpoint.load_step)
+    #     else:
+    #         raise
+
+
+
+
     metric_logger = build_metrics_processor(job_config, parallel_dims)
     # Set dependent attributes for metric_logger
     metric_logger.num_flops_per_token = num_flops_per_token
@@ -436,8 +543,14 @@ def main(job_config: JobConfig):
         f"{color.green}  Number of parameters = {model_param_count:,} {color.reset}"
     )
     logger.info(
-        f"{color.green}  Number of trainable parameters = {model_trainable_param_count:,} {color.reset}"
+        f"{color.green}  Number of embedding parameters = {nparams_embedding:,} {color.reset}"
     )
+    if model_config.tie_word_embeddings:
+        logger.info("Model ties input and output word embeddings, so")
+        logger.info(f"Number of distinct parameters = {model_param_count - nparams_embedding:,}")
+    else:
+        logger.info(f"Model does not tie input and output word embeddings, so the number of unique model parameters is the above.")
+    
 
     with (
         maybe_enable_profiling(
@@ -642,6 +755,7 @@ def main(job_config: JobConfig):
                     f"{color.magenta}[{str(train_state.elapsed).split('.')[0]:>8}<{str(eta).split('.')[0]:>8}]{color.reset}"
                 )
 
+            # breakpoint()
             checkpoint.save(
                 train_state.step, force=(train_state.step == job_config.training.steps)
             )

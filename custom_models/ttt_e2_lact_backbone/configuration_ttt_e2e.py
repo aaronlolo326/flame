@@ -120,6 +120,7 @@ class E2ETTTConfig(PretrainedConfig):
         # sliding-window attention
         window_size: int = 2048,
         # E2E-TTT knobs
+        use_cache: bool = True,
         use_e2e_ttt: bool = True,
         suffix_frac: float = 0.25,
         mini_batch_size: int = 16,
@@ -184,6 +185,7 @@ class E2ETTTConfig(PretrainedConfig):
         self.window_size = window_size
 
         # E2E-TTT
+        self.use_cache = use_cache
         self.use_e2e_ttt = use_e2e_ttt
         self.suffix_frac = float(suffix_frac)
         self.suffix_len = max(1, int(round(self.num_hidden_layers * self.suffix_frac)))

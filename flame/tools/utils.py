@@ -8,26 +8,18 @@ from torch import nn
 from torchtitan.tools.logging import logger
 from pprint import pformat
 
-
-def get_parameter_counts(model: nn.Module) -> tuple[int, int, int]:
+def get_total_embedding_params(model):
     total_params = 0
-    trainable_params = 0
-    seen_param_ids = set()
-
-    for param in model.parameters():
-        param_id = id(param)
-        if param_id in seen_param_ids:
-            continue
-        seen_param_ids.add(param_id)
-
-        param_count = param.numel()
-        total_params += param_count
-        if param.requires_grad:
-            trainable_params += param_count
-
-    non_trainable_params = total_params - trainable_params
-    return total_params, trainable_params, non_trainable_params
-
+    # Traverse all modules in the model
+    for name, module in model.named_modules():
+        # Check if the module is specifically an instance of nn.Embedding
+        if isinstance(module, nn.Embedding):
+            # Calculate numel for the weight tensor within the embedding
+            params = module.weight.numel()
+            total_params += params
+            print(f"Layer: {name:20} | Params: {params:,}")
+            
+    return total_params
 
 def get_nparams_and_flops(model: nn.Module, model_config, seq_len: int) -> tuple[int, int]:
     nparams = sum(p.numel() for p in model.parameters())
@@ -36,11 +28,18 @@ def get_nparams_and_flops(model: nn.Module, model_config, seq_len: int) -> tuple
     #         {name: p.numel() for name, p in model.named_parameters()}
     #     )
     # )
-    nparams_embedding = sum(
-        sum(p.numel() for p in m.parameters())
-        for m in model.children()
-        if isinstance(m, nn.Embedding)
-    )
+
+    # nparams_embedding = sum(
+    #     sum(p.numel() for p in m.parameters())
+    #     for m in model.children()
+    #     if isinstance(m, nn.Embedding)
+    # )
+
+    # nparams_embedding = model.model.embeddings's p.numel
+    # nparams_embedding = sum(p.numel() for p in model.model.embeddings.parameters())
+
+    # traverse model parameters and get total numel() for those that is isinstance of nn.Embedding
+    nparams_embedding = get_total_embedding_params(model)
     
     if hasattr(model_config, "num_heads"):
         num_heads = model_config.num_heads
@@ -64,4 +63,4 @@ def get_nparams_and_flops(model: nn.Module, model_config, seq_len: int) -> tuple
     # 4. we follow the convention and do not account for sparsity in causal attention
     num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
 
-    return nparams, num_flops_per_token
+    return nparams, nparams_embedding, num_flops_per_token

@@ -144,6 +144,7 @@ class JobConfig:
         self.parser.add_argument(
             "--profiling.enable_profiling",
             action="store_true",
+            default=False,
             help="Whether to enable pytorch profiler",
         )
         self.parser.add_argument(
@@ -281,6 +282,12 @@ class JobConfig:
             help="Whether to take sequences of variable length as input",
         )
         self.parser.add_argument(
+            "--training.sample_trunc_seq",
+            type=int,
+            default=1,
+            help="Whether to truncate an instance via sampling if it is longer than the sequence length",
+        )
+        self.parser.add_argument(
             "--training.gradient_accumulation_steps",
             type=int,
             default=1,
@@ -308,6 +315,12 @@ class JobConfig:
             type=str,
             default=None,
             help="tokenized_dataset_dir"
+        )
+        self.parser.add_argument(
+            "--training.data_format",
+            type=str,
+            default="arrow",
+            help="data_format"
         )
         self.parser.add_argument(
             "--training.dataset",
@@ -345,6 +358,11 @@ class JobConfig:
             help="Data sampling probabilities, with comma separated values if provided",
         )
         self.parser.add_argument(
+            "--training.data_mix_stopping_strategy",
+            default="first_exhausted",
+            help="Data mixing stopping strategy. Supported values are 'first_exhausted', 'all_exhausted ', and 'all_exhausted_without_replacement '.",
+        )
+        self.parser.add_argument(
             "--training.streaming",
             action="store_true",
             help="Whether to load dataset in streaming mode, used for huge dataset",
@@ -354,6 +372,16 @@ class JobConfig:
             type=int,
             default=32,
             help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
+        )
+        self.parser.add_argument(
+            "--training.pin_memory",
+            action="store_true",
+            help="pin_memory",
+        )
+        self.parser.add_argument(
+            "--training.persistent_workers",
+            action="store_true",
+            help="persistent_workers",
         )
         self.parser.add_argument(
             "--training.prefetch_factor",

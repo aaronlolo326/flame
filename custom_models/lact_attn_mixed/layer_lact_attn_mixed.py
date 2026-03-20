@@ -15,10 +15,9 @@ from transformers.utils import logging
 from fla.models.utils import Cache
 from fla.modules import RMSNorm, RotaryEmbedding
 import torch.nn.functional as F
-import torch.nn as nn
-from einops import rearrange, repeat
+from einops import rearrange
 
-from .ttt_operation import (
+from ..lact_model.ttt_operation import (
     block_causal_lact_swiglu,
     prenorm_block_causal_lact_swiglu,
     l2_norm,
@@ -26,7 +25,7 @@ from .ttt_operation import (
     prenorm_block_causal_lact_swiglu_varlen_bucketed,
 )
 
-from .ttt_operation_fused_kernel import (
+from ..lact_model.ttt_operation_fused_kernel import (
     postnorm_block_causal_lact_swiglu_fused_kernel_triton,
     prenorm_block_causal_lact_swiglu_fused_kernel_triton,
 )
@@ -61,6 +60,17 @@ def inv_softplus(x):
     else:
         y = x + math.log(-math.expm1(-x))
     return y
+
+
+def masked_mean(x: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    if attention_mask is None:
+        return x.mean(dim=1)
+
+    if attention_mask.shape[1] != x.shape[1]:
+        attention_mask = attention_mask[:, -x.shape[1]:]
+    m = attention_mask.to(dtype=x.dtype).unsqueeze(-1)
+    denom = m.sum(dim=1).clamp_min(1.0)
+    return (x * m).sum(dim=1) / denom
 
 
 class LowRankFastWeight(nn.Module):
@@ -161,6 +171,10 @@ class LaCTSWIGLULayer(nn.Module):
         fw_init_gain: float = 0.5,  # init the fast weights
         use_fused_kernel: bool = False,
         fp32_states: bool = False,
+        use_ttt_depth_mix: bool = False,
+        depth_mix_dim: int = 256,
+        depth_mix_detach_cache: bool = True,
+        depth_mix_init_gate_bias: float = -4.0,
     ):
         super().__init__()
 
@@ -179,6 +193,10 @@ class LaCTSWIGLULayer(nn.Module):
             self.k_norm = RMSNorm(self.hidden_size)
 
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.use_ttt_depth_mix = bool(use_ttt_depth_mix)
+        self.depth_mix_dim = max(int(depth_mix_dim), 1)
+        self.depth_mix_detach_cache = bool(depth_mix_detach_cache)
+        self.depth_mix_init_gate_bias = float(depth_mix_init_gate_bias)
 
         self.rope_theta = rope_theta
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
@@ -190,6 +208,7 @@ class LaCTSWIGLULayer(nn.Module):
         self.lact_chunk_size = lact_chunk_size
         self.num_fw_heads = int(num_lact_heads)
         self.use_ttt = self.num_fw_heads > 0
+        self.use_ttt_depth_mix = self.use_ttt_depth_mix and self.use_ttt
         self.fw_head_dim = self.hidden_size // self.num_fw_heads if self.use_ttt else 0
         self.qkv_silu = qkv_silu
         self.no_v_silu = no_v_silu
@@ -274,6 +293,18 @@ class LaCTSWIGLULayer(nn.Module):
         self.ttt_norm = (
             RMSNorm(self.fw_head_dim, elementwise_affine=True) if self.use_ttt else None
         )
+        if self.use_ttt_depth_mix:
+            self.depth_query_proj = nn.Linear(self.hidden_size, self.depth_mix_dim, bias=False)
+            self.depth_key_proj = nn.Linear(self.hidden_size, self.depth_mix_dim, bias=False)
+            self.depth_value_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+            self.depth_summary_norm = RMSNorm(self.depth_mix_dim)
+            self.depth_gate_proj = nn.Linear(self.hidden_size, 1, bias=True)
+        else:
+            self.depth_query_proj = None
+            self.depth_key_proj = None
+            self.depth_value_proj = None
+            self.depth_summary_norm = None
+            self.depth_gate_proj = None
 
         self.use_momentum = use_momentum and self.use_ttt
         if self.use_momentum:
@@ -293,7 +324,7 @@ class LaCTSWIGLULayer(nn.Module):
         self._diversity_log_forward_calls = 0
         if self.log_chunk_diversity:
             logger.info(
-                "Enable LACT chunk diversity log for lact_model layer=%s every=%d max_chunks=%d",
+                "Enable LACT chunk diversity log for lact_attn_mixed layer=%s every=%d max_chunks=%d",
                 self.layer_idx,
                 self.log_chunk_diversity_every,
                 self.log_chunk_diversity_max_chunks,
@@ -328,7 +359,7 @@ class LaCTSWIGLULayer(nn.Module):
 
             if num_tokens < 2:
                 logger.info(
-                    "[chunk_diversity][model=lact_model][layer=%s][call=%d][tensor=%s][chunk=%d/%d] "
+                    "[chunk_diversity][model=lact_attn_mixed][layer=%s][call=%d][tensor=%s][chunk=%d/%d] "
                     "tokens=%d (skip: <2 tokens)",
                     self.layer_idx,
                     call_idx,
@@ -369,7 +400,7 @@ class LaCTSWIGLULayer(nn.Module):
                     top_singular_values.extend([0.0] * (3 - topk))
 
             logger.info(
-                "[chunk_diversity][model=lact_model][layer=%s][call=%d][tensor=%s][chunk=%d/%d] "
+                "[chunk_diversity][model=lact_attn_mixed][layer=%s][call=%d][tensor=%s][chunk=%d/%d] "
                 "tokens=%d mean_pairwise_cos=%.6f effective_rank=%.3f top_singular_values=%s "
                 "token_var_mean=%.6e token_var_max=%.6e",
                 self.layer_idx,
@@ -387,7 +418,7 @@ class LaCTSWIGLULayer(nn.Module):
 
         if chunks_to_log < num_chunks:
             logger.info(
-                "[chunk_diversity][model=lact_model][layer=%s][call=%d][tensor=%s] "
+                "[chunk_diversity][model=lact_attn_mixed][layer=%s][call=%d][tensor=%s] "
                 "skip remaining chunks: logged=%d total=%d",
                 self.layer_idx,
                 call_idx,
@@ -433,8 +464,14 @@ class LaCTSWIGLULayer(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        depth_cache: Optional[dict[str, List[torch.Tensor]]] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[Tuple[torch.Tensor]],
+        Optional[dict[str, torch.Tensor]],
+    ]:
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
@@ -450,6 +487,7 @@ class LaCTSWIGLULayer(nn.Module):
         if self.attn_qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
+        depth_info = None
         if self.num_fw_heads > 0:
             # rescale and reshift the q, k for test-time training layer.
             fast_q, fast_k = self._rescale_qk(q, k)
@@ -757,7 +795,37 @@ class LaCTSWIGLULayer(nn.Module):
             ttt_x_normed = rearrange(
                 ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
             )
-            o = o + ttt_x_normed
+            ttt_local = ttt_x_normed
+            if (
+                self.use_ttt_depth_mix
+                and depth_cache is not None
+                and len(depth_cache.get("keys", [])) > 0
+            ):
+                cur_summary = masked_mean(hidden_states, attention_mask)
+                q_depth = self.depth_query_proj(cur_summary)
+
+                K = torch.stack(depth_cache["keys"], dim=0)
+                K = self.depth_summary_norm(K)
+                scores = torch.einsum("bd,nbd->nb", q_depth, K)
+                alpha = torch.softmax(scores.float(), dim=0).to(dtype=K.dtype)
+
+                V = torch.stack(depth_cache["values"], dim=0)
+                cross_layer_ttt = torch.einsum("nb,nbd->bd", alpha, V)
+                cross_layer_ttt = self.depth_value_proj(cross_layer_ttt).unsqueeze(1)
+
+                gate = torch.sigmoid(self.depth_gate_proj(cur_summary)).unsqueeze(1)
+                o = o + ttt_local + gate * cross_layer_ttt
+            else:
+                o = o + ttt_local
+
+            if self.use_ttt_depth_mix:
+                ttt_summary_src = masked_mean(ttt_local, attention_mask)
+                depth_key = self.depth_key_proj(ttt_summary_src)
+                depth_value = ttt_summary_src
+                if self.depth_mix_detach_cache:
+                    depth_key = depth_key.detach()
+                    depth_value = depth_value.detach()
+                depth_info = {"key": depth_key, "value": depth_value}
         ### TTT ends ###
         
         o = self.o_proj(o)
@@ -765,7 +833,7 @@ class LaCTSWIGLULayer(nn.Module):
         if not output_attentions:
             attentions = None
 
-        return o, attentions, past_key_values
+        return o, attentions, past_key_values, depth_info
 
     def _upad_input(self, q, k, v, attention_mask, q_len):
         batch_size, seq_len, num_key_value_heads, head_dim = k.shape
