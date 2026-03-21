@@ -52,14 +52,14 @@ class LaCTBlock(nn.Module):
         # - "sliding_attention"  -> LaCT + sliding window   (window_size=config.window_size)
         # If `layer_types` is not provided, we fall back to the global
         # `use_sliding_window` flag.
-        attention_type = None
+        layer_config = None
         if getattr(config, "layer_types", None) is not None:
             if 0 <= layer_idx < len(config.layer_types):
-                attention_type = config.layer_types[layer_idx]
+                layer_config = config.layer_types[layer_idx]
 
-        if attention_type == "full_attention":
+        if layer_config['attn_type'] == 'full':
             window_size = None
-        elif attention_type in ("linear_attention", "sliding_attention"):
+        elif layer_config['attn_type'] in ("linear", "swa"):
             window_size = config.window_size
         else:
             # Fallback: behave like the original global toggle.
@@ -68,11 +68,15 @@ class LaCTBlock(nn.Module):
                 if getattr(config, "use_sliding_window", True)
                 else None
             )
+        if not layer_config['use_ttt']:
+            num_lact_heads = 0
+        else:
+            num_lact_heads = config.num_lact_heads
 
         self.attn = LaCTSWIGLULayer(
             hidden_size=config.hidden_size,
             num_attn_heads=config.num_attn_heads,
-            num_lact_heads=config.num_lact_heads,
+            num_lact_heads=num_lact_heads,
             inter_multi=config.inter_multi,
             window_size=window_size,
             lact_chunk_size=config.lact_chunk_size,
