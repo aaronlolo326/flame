@@ -194,7 +194,7 @@ class E2EBlock(nn.Module):
             **kwargs,
         )
 
-        if self.prime_mlp is not None and fast is not None:
+        if self.prime_mlp is not None:
             if self.config.fuse_norm:
                 p_in, _ = self.prime_mlp_norm(hidden_states, residual, True)
             else:
@@ -540,6 +540,7 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
         self.register_buffer("_inner_update_step", torch.zeros((), dtype=torch.long), persistent=False)
+        self._inference_ttt_state: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _warn_once(msg: str):
@@ -655,6 +656,189 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
         )
+
+    def _reset_inference_ttt_state(self):
+        self._inference_ttt_state = None
+
+    def _init_inference_ttt_state(self, batch_size: int) -> Dict[str, Any]:
+        fast = self.model.init_fast_weights()
+        normalized_fast: Dict[str, torch.Tensor] = {}
+        for k, w in fast.items():
+            if w.requires_grad:
+                normalized_fast[k] = w
+            else:
+                normalized_fast[k] = w.detach().requires_grad_(True)
+        return {
+            "batch_size": int(batch_size),
+            "fast": normalized_fast,
+            "prime_keys": list(normalized_fast.keys()),
+            "suffix_past": tuple(),
+            "pending_input_ids": None,
+            "pending_attention_mask": None,
+        }
+
+    @staticmethod
+    def _slice_new_attention_segment(
+        attention_mask: Optional[torch.Tensor], token_len: int
+    ) -> Optional[torch.Tensor]:
+        if attention_mask is None:
+            return None
+        if token_len <= 0:
+            return attention_mask[:, :0]
+        return attention_mask[:, -token_len:]
+
+    @staticmethod
+    def _make_shift_labels(
+        token_ids: torch.LongTensor,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.LongTensor:
+        labels = token_ids[:, 1:].clone()
+        if token_mask is not None:
+            valid = token_mask[:, 1:].to(device=labels.device, dtype=torch.bool)
+            labels = labels.masked_fill(~valid, -100)
+        return labels
+
+    def _ensure_fast_requires_grad(self, fast: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        normalized: Dict[str, torch.Tensor] = {}
+        for k, w in fast.items():
+            if w.requires_grad:
+                normalized[k] = w
+            else:
+                normalized[k] = w.detach().requires_grad_(True)
+        return normalized
+
+    def _inference_teacher_forcing_update(
+        self,
+        token_window: torch.LongTensor,
+        token_window_mask: Optional[torch.Tensor],
+        fast: Dict[str, torch.Tensor],
+        prime_keys: List[str],
+        inner_target_lr: float,
+        inner_clip_gradient: float,
+    ) -> Dict[str, torch.Tensor]:
+        if not prime_keys or token_window.size(1) < 2:
+            return fast
+
+        fast = self._ensure_fast_requires_grad(fast)
+
+        with torch.enable_grad():
+            x = self.model.embeddings(token_window)
+            prefix_output = self.model.forward_prefix_blocks(
+                x,
+                attention_mask=token_window_mask,
+                use_cache=False,
+            )
+            x_chunk = prefix_output[:, :-1, :]
+            mask_chunk = token_window_mask[:, :-1] if token_window_mask is not None else None
+            h_chunk, _ = self.model.forward_suffix_blocks(
+                x_chunk,
+                fast=fast,
+                attention_mask=mask_chunk,
+                use_cache=False,
+                past_key_values=None,
+            )
+            chunk_logits = self.lm_head(h_chunk)
+            chunk_labels = self._make_shift_labels(token_window, token_window_mask)
+            valid_count = chunk_labels.ne(-100).sum()
+            if int(valid_count.detach().item()) <= 0:
+                return fast
+
+            chunk_loss = F.cross_entropy(
+                chunk_logits.reshape(-1, chunk_logits.size(-1)),
+                chunk_labels.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            loss_for_inner = chunk_loss / valid_count.clamp(min=1).float()
+
+            fast_params = [fast[k] for k in prime_keys]
+            grads = torch.autograd.grad(
+                loss_for_inner,
+                fast_params,
+                create_graph=False,
+                retain_graph=False,
+                allow_unused=True,
+            )
+            lr = self._compute_inner_lr(inner_target_lr)
+            grads, _ = self._clip_inner_grads(grads, inner_clip_gradient)
+
+            updated: Dict[str, torch.Tensor] = {}
+            for k, w, g in zip(prime_keys, fast_params, grads):
+                if g is None:
+                    w_new = w.detach()
+                else:
+                    w_new = (w - lr * g).detach()
+                updated[k] = w_new.requires_grad_(True)
+
+        with torch.no_grad():
+            self._inner_update_step.add_(1)
+        return {**fast, **updated}
+
+    def _append_pending_observations(
+        self,
+        state: Dict[str, Any],
+        input_ids: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.Tensor],
+    ):
+        if input_ids is None:
+            return
+
+        new_ids = input_ids.detach()
+        new_mask = self._slice_new_attention_segment(attention_mask, new_ids.size(1))
+        if new_mask is not None:
+            new_mask = new_mask.detach()
+
+        if state["pending_input_ids"] is None:
+            state["pending_input_ids"] = new_ids
+            state["pending_attention_mask"] = new_mask
+            return
+
+        state["pending_input_ids"] = torch.cat([state["pending_input_ids"], new_ids], dim=1)
+        if state["pending_attention_mask"] is None:
+            if new_mask is None:
+                return
+            old = torch.ones_like(state["pending_input_ids"][:, :-new_ids.size(1)])
+            state["pending_attention_mask"] = torch.cat([old, new_mask], dim=1)
+        elif new_mask is None:
+            ones = torch.ones_like(new_ids, dtype=state["pending_attention_mask"].dtype, device=new_ids.device)
+            state["pending_attention_mask"] = torch.cat([state["pending_attention_mask"], ones], dim=1)
+        else:
+            state["pending_attention_mask"] = torch.cat([state["pending_attention_mask"], new_mask], dim=1)
+
+    def _consume_pending_windows(
+        self,
+        state: Dict[str, Any],
+        chunk_size: int,
+        inner_target_lr: float,
+        inner_clip_gradient: float,
+    ):
+        if chunk_size <= 0:
+            return
+
+        pending_ids = state.get("pending_input_ids", None)
+        pending_mask = state.get("pending_attention_mask", None)
+        if pending_ids is None:
+            return
+
+        while pending_ids is not None and pending_ids.size(1) >= (chunk_size + 1):
+            token_window = pending_ids[:, : chunk_size + 1]
+            token_window_mask = (
+                pending_mask[:, : chunk_size + 1] if pending_mask is not None else None
+            )
+            state["fast"] = self._inference_teacher_forcing_update(
+                token_window=token_window,
+                token_window_mask=token_window_mask,
+                fast=state["fast"],
+                prime_keys=state["prime_keys"],
+                inner_target_lr=inner_target_lr,
+                inner_clip_gradient=inner_clip_gradient,
+            )
+            pending_ids = pending_ids[:, chunk_size:]
+            if pending_mask is not None:
+                pending_mask = pending_mask[:, chunk_size:]
+
+        state["pending_input_ids"] = pending_ids
+        state["pending_attention_mask"] = pending_mask
     
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     def prepare_inputs_for_generation(
@@ -667,12 +851,19 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
         logits_to_keep: Optional[int] = None,
         **kwargs,
     ):
-        
+        has_past = use_cache and _has_past_tokens(past_key_values)
+        if (
+            bool(getattr(self.config, "use_e2e_ttt", False))
+            and bool(getattr(self.config, "enable_inference_ttt", True))
+            and not has_past
+        ):
+            self._reset_inference_ttt_state()
+
         # only last token for `inputs_ids` if the `past_key_values` is not empty.
-        if use_cache and _has_past_tokens(past_key_values):
+        if has_past:
             input_ids = input_ids[:, -1:]
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and not _has_past_tokens(past_key_values):
+        if inputs_embeds is not None and not has_past:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
@@ -689,6 +880,7 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
                 "past_key_values": _to_legacy_cache(past_key_values),
                 "use_cache": use_cache,
                 "attention_mask": attention_mask,
+                "inference_ttt_generation": True,
             }
         )
         return model_inputs
@@ -709,7 +901,11 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
         logits_to_keep: Optional[int] = 0,
         **kwargs: Unpack[Any],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        use_cache = True
+        use_cache = (
+            use_cache
+            if use_cache is not None
+            else (self.config.use_cache if not self.training else False)
+        )
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -727,10 +923,12 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
         cfg = self.config
         if use_e2e_ttt is None:
             use_e2e_ttt = bool(getattr(cfg, "use_e2e_ttt", False))
+
         debug_ttt_logs = bool(getattr(cfg, "debug_ttt_logs", False))
         debug_ttt_log_every = max(1, int(getattr(cfg, "debug_ttt_log_every", 50)))
         create_graph_for_inner = not bool(getattr(cfg, "detach_fast_weights", False))
         inner_optimizer_type, inner_target_lr, inner_clip_gradient = self._resolve_inner_optimizer()
+
         inner_steps = int(getattr(cfg, "inner_steps_per_chunk", 1))
         if inner_steps != 1:
             self._warn_once(
@@ -738,9 +936,12 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
             )
             inner_steps = 1
 
-        run_e2e_ttt = bool(use_e2e_ttt) and labels is not None
+        run_e2e_ttt_train = bool(use_e2e_ttt) and self.training
+        run_e2e_ttt_infer = bool(use_e2e_ttt) and (not self.training)
+
         outputs = None
-        if not run_e2e_ttt:
+        if not run_e2e_ttt_train and not run_e2e_ttt_infer:
+            self._reset_inference_ttt_state()
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -755,11 +956,14 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
 
             hidden_states = outputs[0]
             fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
-            logits = (
-                None
-                if fuse_linear_and_cross_entropy
-                else self.lm_head(hidden_states[:, -logits_to_keep:])
-            )
+            if fuse_linear_and_cross_entropy:
+                logits = None
+            else:
+                if logits_to_keep is not None and logits_to_keep > 0:
+                    logits_input = hidden_states[:, -logits_to_keep:]
+                else:
+                    logits_input = hidden_states
+                logits = self.lm_head(logits_input)
 
             loss = None
             if labels is not None:
@@ -788,8 +992,8 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
                 else:
                     loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
 
-                    
-        else:
+        elif run_e2e_ttt_train:
+            self._reset_inference_ttt_state()
             if input_ids is not None and inputs_embeds is not None:
                 raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
             if input_ids is None and inputs_embeds is None:
@@ -977,10 +1181,155 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
                 loss = total_loss_sum / total_valid_tokens.float()
             else:
                 loss = total_loss_sum.new_zeros(()).requires_grad_(True)
+        else:
+            if input_ids is not None and inputs_embeds is not None:
+                raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            if input_ids is None and inputs_embeds is None:
+                raise ValueError("You must specify either input_ids or inputs_embeds")
+
+            chunk = int(cfg.mini_batch_size)
+            if chunk <= 0:
+                raise ValueError("mini_batch_size must be > 0")
+
+            has_past = use_cache and _has_past_tokens(past_key_values)
+
+            # 这里只是内部运行时判断：
+            # - eval + use_cache + no labels => 认为是 stateful generation/eval
+            # - 否则就是单次 stateless eval
+            is_stateful_eval = (not self.training) and bool(use_cache) and (labels is None)
+
+            # 新的一轮 eval/generation 开始
+            if not has_past:
+                self._reset_inference_ttt_state()
+
+            if is_stateful_eval:
+                bsz = int((input_ids if input_ids is not None else inputs_embeds).size(0))
+                if (
+                    self._inference_ttt_state is None
+                    or int(self._inference_ttt_state.get("batch_size", -1)) != bsz
+                ):
+                    self._inference_ttt_state = self._init_inference_ttt_state(batch_size=bsz)
+
+                state = self._inference_ttt_state
+
+                # 把本步新观察到的 token 追加到 pending buffer
+                self._append_pending_observations(
+                    state,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+
+                # 每凑够 chunk+1 个 token，就做一次 teacher-forcing inner update
+                self._consume_pending_windows(
+                    state=state,
+                    chunk_size=chunk,
+                    inner_target_lr=inner_target_lr,
+                    inner_clip_gradient=inner_clip_gradient,
+                )
+
+                fast = state["fast"]
+                prime_keys = state["prime_keys"]
+
+                suffix_past = state.get("suffix_past", None)
+                if suffix_past is None:
+                    suffix_past = _to_legacy_cache(past_key_values)
+                    if suffix_past is None:
+                        suffix_past = tuple()
+            else:
+                state = None
+                fast = self.model.init_fast_weights()
+                prime_keys = list(fast.keys())
+
+                suffix_past = _to_legacy_cache(past_key_values)
+                if suffix_past is None:
+                    suffix_past = tuple()
+
+            x = self.model.embeddings(input_ids) if inputs_embeds is None else inputs_embeds
+            total_seq_len = x.size(1)
+
+            prefix_output = self.model.forward_prefix_blocks(
+                x,
+                attention_mask=attention_mask,
+                use_cache=use_cache,
+            )
+
+            all_logits_list = []
+            for s in range(0, total_seq_len, chunk):
+                e = min(s + chunk, total_seq_len)
+                x_chunk = prefix_output[:, s:e, :]
+
+                mask_chunk = attention_mask[:, :e] if attention_mask is not None else None
+
+                h_chunk, suffix_past = self.model.forward_suffix_blocks(
+                    x_chunk,
+                    fast=fast,
+                    attention_mask=mask_chunk,
+                    use_cache=use_cache,
+                    past_key_values=suffix_past,
+                )
+                chunk_logits = self.lm_head(h_chunk)
+                all_logits_list.append(chunk_logits)
+
+                # 对于非 stateful eval（例如一次性整句 eval / ppl eval），
+                # 可以在当前 forward 内部按 chunk 做 teacher-forcing 更新
+                has_lookahead = e < total_seq_len
+                is_full_chunk = (e - s) == chunk
+                if (
+                    (not is_stateful_eval)
+                    and input_ids is not None
+                    and is_full_chunk
+                    and has_lookahead
+                ):
+                    token_window = input_ids[:, s : e + 1]
+                    token_window_mask = (
+                        attention_mask[:, s : e + 1] if attention_mask is not None else None
+                    )
+                    fast = self._inference_teacher_forcing_update(
+                        token_window=token_window,
+                        token_window_mask=token_window_mask,
+                        fast=fast,
+                        prime_keys=prime_keys,
+                        inner_target_lr=inner_target_lr,
+                        inner_clip_gradient=inner_clip_gradient,
+                    )
+
+            logits_full = (
+                torch.cat(all_logits_list, dim=1)
+                if len(all_logits_list) > 0
+                else x.new_zeros((x.size(0), 0, self.lm_head.out_features))
+            )
+
+            if logits_to_keep is not None and logits_to_keep > 0:
+                logits = logits_full[:, -logits_to_keep:]
+            else:
+                logits = logits_full
+
+            loss = None
+            if labels is not None:
+                labels = labels.to(logits_full.device)
+                shift_labels = torch.cat(
+                    (
+                        labels[..., 1:],
+                        torch.full_like(labels[:, :1], -100),
+                    ),
+                    dim=1,
+                )
+                loss = F.cross_entropy(
+                    logits_full.reshape(-1, logits_full.size(-1)),
+                    shift_labels.reshape(-1),
+                    ignore_index=-100,
+                )
+
+            if is_stateful_eval and state is not None:
+                state["fast"] = fast
+                state["suffix_past"] = suffix_past
+                self._inference_ttt_state = state
+            else:
+                self._reset_inference_ttt_state()
 
         if not return_dict:
             if outputs is None:
-                output = (logits, suffix_past)
+                output = (logits, suffix_past if use_cache else None)
             else:
                 output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -988,7 +1337,7 @@ class E2EForCausalLM(E2EPreTrainedModel, GenerationMixin):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=suffix_past if outputs is None else outputs.past_key_values,
+            past_key_values=(suffix_past if use_cache else None) if outputs is None else outputs.past_key_values,
             hidden_states=None if outputs is None else outputs.hidden_states,
             attentions=None if outputs is None else outputs.attentions,
         )

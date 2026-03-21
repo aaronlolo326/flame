@@ -195,7 +195,9 @@ class E2ESWIGLULayer(nn.Module):
 
         # LACT window tuple
         window = (-1, -1) if self.window_size is None else (self.window_size - 1, 0)
-        causal_flag = True
+        # Keep flash-attn semantics aligned with LaCT:
+        # full attention => causal=True; local window => causal=False with (window_size-1, 0).
+        causal_flag = (self.window_size is None)
 
         if attention_mask is not None:
             # Aligned with LACT: padding -> varlen.
