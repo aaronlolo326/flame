@@ -49,7 +49,7 @@ fi
 
 
 steps=$(( no_tokens / NNODE / NGPU / seq_len / batch_size / grad_accum ))
-interval=$(( steps / 20 ))
+interval=$(( steps / 4 ))
 echo steps=$steps
 if $profile; then
   steps=10

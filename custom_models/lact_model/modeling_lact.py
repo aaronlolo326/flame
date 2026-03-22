@@ -57,10 +57,17 @@ class LaCTBlock(nn.Module):
             if 0 <= layer_idx < len(config.layer_types):
                 layer_config = config.layer_types[layer_idx]
 
-        if layer_config['attn_type'] == 'full':
-            window_size = None
-        elif layer_config['attn_type'] in ("linear", "swa"):
-            window_size = config.window_size
+        if layer_config is not None:
+            if layer_config['attn_type'] == 'full':
+                window_size = None
+            elif layer_config['attn_type'] in ("linear", "swa"):
+                window_size = config.window_size
+            else:
+                raise ValueError(f"Invalid {layer_config['attn_type']=}")
+            if not layer_config['use_ttt']:
+                num_lact_heads = 0
+            else:
+                num_lact_heads = config.num_lact_heads
         else:
             # Fallback: behave like the original global toggle.
             window_size = (
@@ -68,9 +75,6 @@ class LaCTBlock(nn.Module):
                 if getattr(config, "use_sliding_window", True)
                 else None
             )
-        if not layer_config['use_ttt']:
-            num_lact_heads = 0
-        else:
             num_lact_heads = config.num_lact_heads
 
         self.attn = LaCTSWIGLULayer(
