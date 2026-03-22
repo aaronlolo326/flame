@@ -6,9 +6,9 @@ source "$(dirname "$0")/vars.sh"
 python gen_results_csv.py \
     --data_set lm \
     --run_name ${RUN_NAME}
-python gen_results_csv.py \
-    --data_set jrt \
-    --run_name ${RUN_NAME}
+# python gen_results_csv.py \
+#     --data_set jrt \
+#     --run_name ${RUN_NAME}
 # python gen_results_csv.py \
 #     --data_set lb \
 #     --run_name ${RUN_NAME}

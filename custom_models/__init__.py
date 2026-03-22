@@ -6,6 +6,7 @@
 import warnings
 
 from .lact_model import *
+from .hybrid_qwen3_lact_model import *
 
 try:
     from .qwen3_ import *

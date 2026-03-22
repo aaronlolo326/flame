@@ -84,6 +84,18 @@ def load_data(run_name, data_set):
                         flattened_data[column_name] = metrics[json_key] * 100
                         break
 
+    elif data_set == 'jrt':
+        for task in sorted(results):
+            metrics = results[task]
+            for metric_name, metric_value in metrics.items():
+                if metric_name == "alias" or metric_name.endswith("_stderr"):
+                    continue
+                column_name = f"{task}__{metric_name.replace(',', '__')}"
+                if isinstance(metric_value, (int, float)):
+                    flattened_data[column_name] = metric_value * 100
+                else:
+                    flattened_data[column_name] = metric_value
+
     df = pd.DataFrame([flattened_data])
     # df = df.reindex(sorted(df.columns), axis=1)
     # Format all float values to two decimal places using DataFrame.astype(str) and DataFrame.round

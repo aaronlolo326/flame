@@ -22,6 +22,7 @@ wandb
 *.csv
 *.png
 *.html
+checkpoints
 
 # log and config files
 log.*
