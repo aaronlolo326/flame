@@ -63,15 +63,35 @@ class Qwen3MLP(nn.Module):
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, base: float = 1000000.0) -> None:
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.dim = dim
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, position_ids: torch.LongTensor, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        inv_freq = self.inv_freq.to(device=device)
-        pos = position_ids[:, :, None].float()
-        freqs = pos * inv_freq[None, None, :]
+        # Match Qwen3-style float32 RoPE computation for numerical stability.
+        # Recompute from (dim, base) to avoid relying on non-persistent buffer materialization.
+        inv_freq = 1.0 / (
+            self.base
+            ** (
+                torch.arange(0, self.dim, 2, device=device, dtype=torch.float32)
+                / self.dim
+            )
+        )
+        pos = position_ids.to(device=device, dtype=torch.long)
+        if not pos.is_contiguous():
+            pos = pos.contiguous()
+        inv_freq_expanded = inv_freq[None, :, None].expand(pos.shape[0], -1, 1)
+        pos_expanded = pos[:, None, :].to(torch.float32)
+        freqs = (inv_freq_expanded @ pos_expanded).transpose(1, 2)
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype), emb.sin().to(dtype)
+        cos = emb.cos()
+        sin = emb.sin()
+        # if not (torch.isfinite(cos).all() and torch.isfinite(sin).all()):
+        #     # Defensive guard: keep forward finite even if upstream kernels return non-finite values.
+        #     cos = torch.nan_to_num(cos, nan=1.0, posinf=1.0, neginf=1.0)
+        #     sin = torch.nan_to_num(sin, nan=0.0, posinf=0.0, neginf=0.0)
+        return cos.to(dtype), sin.to(dtype)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -106,6 +126,10 @@ def build_attention_mask(
         allowed &= (pos[:, None] - pos[None, :]) < sliding_window
     if attention_mask is not None:
         allowed = allowed.unsqueeze(0) & attention_mask[:, None, None, :].bool()
+        # Avoid all-masked query rows, which would lead to NaNs in softmax.
+        has_valid_key = allowed.any(dim=-1, keepdim=True)
+        eye = torch.eye(seq_len, device=device, dtype=torch.bool).unsqueeze(0).unsqueeze(1)
+        allowed = torch.where(has_valid_key, allowed, eye)
     return allowed
 
 
@@ -114,14 +138,33 @@ class HybridQwen3LaCTBranch(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        self.head_dim = config.head_dim
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                "num_attention_heads must be divisible by num_key_value_heads for GQA. "
+                f"Got {self.num_attention_heads} and {self.num_key_value_heads}."
+            )
+        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
+        self.token_mixer_dim = self.num_attention_heads * self.head_dim
         self.num_fw_heads = config.num_lact_heads
-        self.fw_head_dim = self.hidden_size // self.num_fw_heads
+        if self.num_fw_heads <= 0:
+            raise ValueError(
+                "num_lact_heads must be > 0 for layers configured as 'lact'. "
+                f"Got num_lact_heads={self.num_fw_heads} at layer {layer_idx}."
+            )
+        if self.token_mixer_dim % self.num_fw_heads != 0:
+            raise ValueError(
+                "token_mixer_dim must be divisible by num_lact_heads. "
+                f"Got token_mixer_dim={self.token_mixer_dim}, num_lact_heads={self.num_fw_heads}."
+            )
+        self.fw_head_dim = self.token_mixer_dim // self.num_fw_heads
         self.inter_multi = config.inter_multi
-        self.qkv = nn.Linear(self.hidden_size, self.hidden_size * 3, bias=config.qkv_bias)
         self.attn_qk_norm = config.attn_qk_norm
         if self.attn_qk_norm:
-            self.q_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+            self.q_norm = RMSNorm(self.fw_head_dim, eps=config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.fw_head_dim, eps=config.rms_norm_eps)
         self.qkv_silu = config.qkv_silu
         self.no_v_silu = config.no_v_silu
         self.ttt_prenorm = config.ttt_prenorm
@@ -153,8 +196,8 @@ class HybridQwen3LaCTBranch(nn.Module):
         self.w1 = nn.Parameter(torch.randn(self.num_fw_heads, d_out, d_h) / math.sqrt(d_h))
 
         self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
-        self.qk_scale = nn.Parameter(torch.ones(self.hidden_size, 2))
-        self.qk_offset = nn.Parameter(torch.zeros(self.hidden_size, 2))
+        self.qk_scale = nn.Parameter(torch.ones(self.token_mixer_dim, 2))
+        self.qk_offset = nn.Parameter(torch.zeros(self.token_mixer_dim, 2))
         self.learnable_ttt_scale = config.learnable_ttt_scale
         if self.learnable_ttt_scale:
             self.ttt_scale_proj = nn.Linear(self.hidden_size, self.num_fw_heads)
@@ -165,8 +208,6 @@ class HybridQwen3LaCTBranch(nn.Module):
         self.register_buffer("_metric_ttt_scale_sum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_metric_ttt_scale_abs_sum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_metric_ttt_scale_max", torch.zeros((), dtype=torch.float32), persistent=False)
-        self.register_buffer("_metric_ttt_rms_sum", torch.zeros((), dtype=torch.float32), persistent=False)
-        self.register_buffer("_metric_ttt_ratio_sum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_metric_ttt_count", torch.zeros((), dtype=torch.float32), persistent=False)
 
     def _rescale_qk(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -176,21 +217,62 @@ class HybridQwen3LaCTBranch(nn.Module):
         k = k * qk_scale[:, :, :, 1] + qk_offset[:, :, :, 1]
         return q, k
 
-    def forward(
+    def prepare_fast_qkv(
         self,
-        hidden_states: torch.Tensor,
+        *,
+        fast_q: torch.Tensor,
+        fast_k: torch.Tensor,
+        fast_v: torch.Tensor,
         position_ids: torch.LongTensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        batch_size, seq_len, _ = hidden_states.shape
-        q, k, v = self.qkv(hidden_states).chunk(3, dim=-1)
-        if self.attn_qk_norm:
-            q, k = self.q_norm(q), self.k_norm(k)
-        fast_q, fast_k = self._rescale_qk(q, k)
-        fast_v = v
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, num_query_heads, query_head_dim = fast_q.shape
+        if num_query_heads != self.num_attention_heads or query_head_dim != self.head_dim:
+            raise ValueError(
+                "Expected fast_q with shape [B, S, num_attention_heads, head_dim]. "
+                f"Got {tuple(fast_q.shape)}."
+            )
+        if fast_k.shape[:2] != (batch_size, seq_len) or fast_v.shape[:2] != (batch_size, seq_len):
+            raise ValueError(
+                "fast_k and fast_v must match fast_q on batch/seq dimensions. "
+                f"Got fast_k={tuple(fast_k.shape)}, fast_v={tuple(fast_v.shape)}, fast_q={tuple(fast_q.shape)}."
+            )
+        if fast_k.shape[2] != self.num_key_value_heads or fast_k.shape[3] != self.head_dim:
+            raise ValueError(
+                "Expected fast_k with shape [B, S, num_key_value_heads, head_dim]. "
+                f"Got {tuple(fast_k.shape)}."
+            )
+        if fast_v.shape[2] != self.num_key_value_heads or fast_v.shape[3] != self.head_dim:
+            raise ValueError(
+                "Expected fast_v with shape [B, S, num_key_value_heads, head_dim]. "
+                f"Got {tuple(fast_v.shape)}."
+            )
+
+        if self.num_key_value_groups != 1:
+            fast_k = repeat_kv(fast_k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+            fast_v = repeat_kv(fast_v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+
+        fast_q = fast_q.reshape(batch_size, seq_len, -1)
+        fast_k = fast_k.reshape(batch_size, seq_len, -1)
+        fast_v = fast_v.reshape(batch_size, seq_len, -1)
+        if (
+            fast_q.shape[-1] != self.token_mixer_dim
+            or fast_k.shape[-1] != self.token_mixer_dim
+            or fast_v.shape[-1] != self.token_mixer_dim
+        ):
+            raise ValueError(
+                "Expected flattened fast_q/fast_k/fast_v to have token_mixer_dim as last dim. "
+                f"Got fast_q={fast_q.shape[-1]}, fast_k={fast_k.shape[-1]}, fast_v={fast_v.shape[-1]}, token_mixer_dim={self.token_mixer_dim}."
+            )
+
+        fast_q, fast_k = self._rescale_qk(fast_q, fast_k)
 
         fast_q = fast_q.view(batch_size, seq_len, self.num_fw_heads, self.fw_head_dim)
         fast_k = fast_k.view(batch_size, seq_len, self.num_fw_heads, self.fw_head_dim)
         fast_v = fast_v.view(batch_size, seq_len, self.num_fw_heads, self.fw_head_dim)
+
+        if self.attn_qk_norm:
+            fast_q = self.q_norm(fast_q)
+            fast_k = self.k_norm(fast_k)
 
         if self.qkv_silu:
             fast_q = F.silu(fast_q)
@@ -198,9 +280,12 @@ class HybridQwen3LaCTBranch(nn.Module):
             if not self.no_v_silu:
                 fast_v = F.silu(fast_v)
 
-        fast_q = l2_norm(fast_q.reshape(batch_size * self.num_fw_heads, seq_len, self.fw_head_dim))
-        fast_k = l2_norm(fast_k.reshape(batch_size * self.num_fw_heads, seq_len, self.fw_head_dim))
-        fast_v = fast_v.reshape(batch_size * self.num_fw_heads, seq_len, self.fw_head_dim)
+        fast_q = fast_q.permute(0, 2, 1, 3).reshape(batch_size * self.num_fw_heads, seq_len, self.fw_head_dim)
+        fast_k = fast_k.permute(0, 2, 1, 3).reshape(batch_size * self.num_fw_heads, seq_len, self.fw_head_dim)
+        fast_v = fast_v.permute(0, 2, 1, 3).reshape(batch_size * self.num_fw_heads, seq_len, self.fw_head_dim)
+
+        fast_q = l2_norm(fast_q)
+        fast_k = l2_norm(fast_k)
 
         if not self.ttt_nope:
             fast_q_rope = fast_q.view(batch_size, self.num_fw_heads, seq_len, self.fw_head_dim).transpose(1, 2)
@@ -209,6 +294,24 @@ class HybridQwen3LaCTBranch(nn.Module):
             fast_q_rope, fast_k_rope = apply_rotary_pos_emb(fast_q_rope, fast_k_rope, cos, sin)
             fast_q = fast_q_rope.transpose(1, 2).reshape(batch_size * self.num_fw_heads, seq_len, self.fw_head_dim)
             fast_k = fast_k_rope.transpose(1, 2).reshape(batch_size * self.num_fw_heads, seq_len, self.fw_head_dim)
+
+        return fast_q, fast_k, fast_v
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.LongTensor,
+        fast_q: torch.Tensor,
+        fast_k: torch.Tensor,
+        fast_v: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        batch_size, seq_len, _ = hidden_states.shape
+        fast_q, fast_k, fast_v = self.prepare_fast_qkv(
+            fast_q=fast_q,
+            fast_k=fast_k,
+            fast_v=fast_v,
+            position_ids=position_ids,
+        )
 
         if self.w0_w2_low_rank > 0:
             fw_w0 = self.w0().repeat(batch_size, 1, 1)
@@ -280,23 +383,18 @@ class HybridQwen3LaCTBranch(nn.Module):
             ttt_scale = ttt_scale.view(batch_size, seq_len, self.num_fw_heads, 1).permute(0, 2, 1, 3).reshape(batch_size * self.num_fw_heads, seq_len, 1)
             ttt_x = ttt_x * ttt_scale
 
-        ttt_x = ttt_x.view(batch_size, self.num_fw_heads, seq_len, self.fw_head_dim).transpose(1, 2).reshape(batch_size, seq_len, self.hidden_size)
-        ttt_rms = ttt_x.float().pow(2).mean().sqrt()
+        ttt_x = ttt_x.view(batch_size, self.num_fw_heads, seq_len, self.fw_head_dim).transpose(1, 2).reshape(batch_size, seq_len, self.token_mixer_dim)
         return ttt_x, {
             "scale_mean": scale_stats["scale_mean"],
             "scale_abs_mean": scale_stats["scale_abs_mean"],
             "scale_max": scale_stats["scale_max"],
-            "ttt_rms": ttt_rms,
         }
 
-    def update_runtime_metrics(self, stats: dict[str, torch.Tensor], attn_rms: torch.Tensor) -> None:
+    def update_runtime_metrics(self, stats: dict[str, torch.Tensor]) -> None:
         with torch.no_grad():
             self._metric_ttt_scale_sum.add_(stats["scale_mean"].detach().to(torch.float32))
             self._metric_ttt_scale_abs_sum.add_(stats["scale_abs_mean"].detach().to(torch.float32))
             self._metric_ttt_scale_max.copy_(torch.maximum(self._metric_ttt_scale_max, stats["scale_max"].detach().to(torch.float32)))
-            self._metric_ttt_rms_sum.add_(stats["ttt_rms"].detach().to(torch.float32))
-            ratio = stats["ttt_rms"].detach().to(torch.float32) / attn_rms.detach().to(torch.float32).clamp_min(1e-8)
-            self._metric_ttt_ratio_sum.add_(ratio)
             self._metric_ttt_count.add_(torch.ones((), dtype=torch.float32, device=self._metric_ttt_count.device))
 
     def consume_runtime_metrics(self) -> dict[str, float]:
@@ -307,14 +405,10 @@ class HybridQwen3LaCTBranch(nn.Module):
             "ttt_scale_mean": float((self._metric_ttt_scale_sum / self._metric_ttt_count).item()),
             "ttt_scale_abs_mean": float((self._metric_ttt_scale_abs_sum / self._metric_ttt_count).item()),
             "ttt_scale_max": float(self._metric_ttt_scale_max.item()),
-            "ttt_output_rms": float((self._metric_ttt_rms_sum / self._metric_ttt_count).item()),
-            "ttt_to_attn_rms_ratio": float((self._metric_ttt_ratio_sum / self._metric_ttt_count).item()),
         }
         self._metric_ttt_scale_sum.zero_()
         self._metric_ttt_scale_abs_sum.zero_()
         self._metric_ttt_scale_max.zero_()
-        self._metric_ttt_rms_sum.zero_()
-        self._metric_ttt_ratio_sum.zero_()
         self._metric_ttt_count.zero_()
         return metrics
 
@@ -382,24 +476,29 @@ class HybridQwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        q_raw = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        k_raw = self.k_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        v_raw = self.v_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        cos, sin = self.rotary(position_ids, q.dtype, q.device)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q_attn = self.q_norm(q_raw)
+        k_attn = self.k_norm(k_raw)
+        cos, sin = self.rotary(position_ids, q_attn.dtype, q_attn.device)
+        q_attn, k_attn = apply_rotary_pos_emb(q_attn, k_attn, cos, sin)
 
-        attn_output = self._attention(q, k, v, attention_mask)
+        attn_output = self._attention(q_attn, k_attn, v_raw, attention_mask)
         attn_output = attn_output.reshape(batch_size, seq_len, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-
         if self.lact_branch is not None:
-            branch_output, branch_stats = self.lact_branch(hidden_states, position_ids)
-            attn_rms = attn_output.float().pow(2).mean().sqrt()
-            self.lact_branch.update_runtime_metrics(branch_stats, attn_rms)
+            branch_output, branch_stats = self.lact_branch(
+                hidden_states,
+                position_ids,
+                fast_q=q_raw,
+                fast_k=k_raw,
+                fast_v=v_raw,
+            )
+            self.lact_branch.update_runtime_metrics(branch_stats)
             attn_output = attn_output + branch_output
+        
+        attn_output = self.o_proj(attn_output)
         return attn_output
 
 
@@ -505,6 +604,8 @@ class HybridQwen3LaCTModel(HybridQwen3LaCTPreTrainedModel):
 
 
 class HybridQwen3LaCTForCausalLM(HybridQwen3LaCTPreTrainedModel, GenerationMixin):
+
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"} # ["lm_head.weight"]
     def __init__(self, config: HybridQwen3LaCTConfig, **kwargs):
         super().__init__(config)
         del kwargs
@@ -531,7 +632,6 @@ class HybridQwen3LaCTForCausalLM(HybridQwen3LaCTPreTrainedModel, GenerationMixin
         scale_means = []
         scale_abs_means = []
         scale_maxes = []
-        ratio_means = []
         for idx, layer in enumerate(self.model.layers):
             branch = getattr(layer.self_attn, "lact_branch", None)
             if branch is None:
@@ -542,17 +642,13 @@ class HybridQwen3LaCTForCausalLM(HybridQwen3LaCTPreTrainedModel, GenerationMixin
             metrics[f"ttt/layer_{idx:02d}/scale_mean"] = layer_metrics["ttt_scale_mean"]
             metrics[f"ttt/layer_{idx:02d}/scale_abs_mean"] = layer_metrics["ttt_scale_abs_mean"]
             metrics[f"ttt/layer_{idx:02d}/scale_max"] = layer_metrics["ttt_scale_max"]
-            metrics[f"ttt/layer_{idx:02d}/output_rms"] = layer_metrics["ttt_output_rms"]
-            metrics[f"ttt/layer_{idx:02d}/to_attn_rms_ratio"] = layer_metrics["ttt_to_attn_rms_ratio"]
             scale_means.append(layer_metrics["ttt_scale_mean"])
             scale_abs_means.append(layer_metrics["ttt_scale_abs_mean"])
             scale_maxes.append(layer_metrics["ttt_scale_max"])
-            ratio_means.append(layer_metrics["ttt_to_attn_rms_ratio"])
         if scale_means:
             metrics["ttt/global/scale_mean"] = sum(scale_means) / len(scale_means)
             metrics["ttt/global/scale_abs_mean"] = sum(scale_abs_means) / len(scale_abs_means)
             metrics["ttt/global/scale_max"] = max(scale_maxes)
-            metrics["ttt/global/to_attn_rms_ratio"] = sum(ratio_means) / len(ratio_means)
         return metrics
 
     def forward(

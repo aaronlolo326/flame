@@ -22,13 +22,32 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--num-lact-heads", type=int, default=4)
     parser.add_argument("--lact-chunk-size", type=int, default=1024)
-    parser.add_argument("--window-size", type=int, default=16834)
+    parser.add_argument("--window-size", type=int, default=2048)
     parser.add_argument("--w0-init-strategy", type=str, default="random_small")
     parser.add_argument("--w0-init-scale", type=float, default=0.1)
     args = parser.parse_args()
 
     src_cfg = AutoConfig.from_pretrained(args.src, trust_remote_code=True)
     num_hidden_layers = int(getattr(src_cfg, "num_hidden_layers"))
+    num_attention_heads = int(getattr(src_cfg, "num_attention_heads"))
+    num_key_value_heads = int(
+        getattr(src_cfg, "num_key_value_heads", getattr(src_cfg, "num_attention_heads"))
+    )
+    head_dim = int(getattr(src_cfg, "head_dim", src_cfg.hidden_size // src_cfg.num_attention_heads))
+    num_lact_heads = int(args.num_lact_heads)
+    if num_attention_heads % num_key_value_heads != 0:
+        raise ValueError(
+            "Invalid GQA config: num_attention_heads must be divisible by num_key_value_heads. "
+            f"Got {num_attention_heads=} and {num_key_value_heads=}."
+        )
+    if num_lact_heads > 0:
+        token_mixer_dim = num_attention_heads * head_dim
+        if token_mixer_dim % num_lact_heads != 0:
+            raise ValueError(
+                "Invalid LaCT config: token_mixer_dim must be divisible by num_lact_heads. "
+                f"Got token_mixer_dim={token_mixer_dim} and {num_lact_heads=}."
+            )
+
     cfg = {
         "architectures": ["HybridQwen3LaCTForCausalLM"],
         "model_type": "hybrid_qwen3_lact",
@@ -41,9 +60,9 @@ def main() -> None:
         "hidden_size": int(src_cfg.hidden_size),
         "intermediate_size": int(src_cfg.intermediate_size),
         "num_hidden_layers": num_hidden_layers,
-        "num_attention_heads": int(getattr(src_cfg, "num_attention_heads")),
-        "num_key_value_heads": int(getattr(src_cfg, "num_key_value_heads", getattr(src_cfg, "num_attention_heads"))),
-        "head_dim": int(getattr(src_cfg, "head_dim", src_cfg.hidden_size // src_cfg.num_attention_heads)),
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "head_dim": head_dim,
         "hidden_act": str(getattr(src_cfg, "hidden_act", "silu")),
         "max_position_embeddings": int(getattr(src_cfg, "max_position_embeddings", 32768)),
         "initializer_range": float(getattr(src_cfg, "initializer_range", 0.02)),
@@ -55,7 +74,7 @@ def main() -> None:
         "use_sliding_window": True,
         "sliding_window": int(args.window_size),
         "hybrid_layer_types": build_hybrid_layer_types(num_hidden_layers),
-        "num_lact_heads": int(args.num_lact_heads),
+        "num_lact_heads": num_lact_heads,
         "inter_multi": 1,
         "qkv_bias": False,
         "attn_qk_norm": False,

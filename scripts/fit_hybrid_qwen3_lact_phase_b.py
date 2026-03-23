@@ -7,15 +7,10 @@ import json
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import fla  # noqa: F401
 import custom_models  # noqa: F401
-from custom_models.hybrid_qwen3_lact_model.modeling_hybrid_qwen3_lact import (
-    apply_rotary_pos_emb,
-    l2_norm,
-)
 
 
 def load_text_samples(
@@ -63,31 +58,22 @@ def collect_layer_inputs(model, input_ids: torch.Tensor, target_layers: list[int
 
 
 @torch.no_grad()
-def compute_branch_features(branch, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def compute_branch_features(self_attn, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    branch = self_attn.lact_branch
+    if branch is None:
+        raise ValueError("compute_branch_features requires a layer with lact_branch enabled.")
+
     batch_size, seq_len, _ = hidden_states.shape
-    q, k, v = branch.qkv(hidden_states).chunk(3, dim=-1)
-    if branch.attn_qk_norm:
-        q, k = branch.q_norm(q), branch.k_norm(k)
-    _, fast_k = branch._rescale_qk(q, k)
-    fast_v = v
-
-    fast_k = fast_k.view(batch_size, seq_len, branch.num_fw_heads, branch.fw_head_dim)
-    fast_v = fast_v.view(batch_size, seq_len, branch.num_fw_heads, branch.fw_head_dim)
-
-    if branch.qkv_silu:
-        fast_k = F.silu(fast_k)
-        if not branch.no_v_silu:
-            fast_v = F.silu(fast_v)
-
-    fast_k = fast_k.permute(0, 2, 1, 3).reshape(batch_size * branch.num_fw_heads, seq_len, branch.fw_head_dim)
-    fast_v = fast_v.permute(0, 2, 1, 3).reshape(batch_size * branch.num_fw_heads, seq_len, branch.fw_head_dim)
-    fast_k = l2_norm(fast_k)
-
-    if not branch.ttt_nope:
-        fast_k_rope = fast_k.view(batch_size, branch.num_fw_heads, seq_len, branch.fw_head_dim).transpose(1, 2)
-        cos, sin = branch.rotary(position_ids, fast_k.dtype, fast_k.device)
-        _, fast_k_rope = apply_rotary_pos_emb(fast_k_rope, fast_k_rope, cos, sin)
-        fast_k = fast_k_rope.transpose(1, 2).reshape(batch_size * branch.num_fw_heads, seq_len, branch.fw_head_dim)
+    position_ids = position_ids.to(device=hidden_states.device, dtype=torch.long)
+    q_raw = self_attn.q_proj(hidden_states).view(batch_size, seq_len, self_attn.num_attention_heads, self_attn.head_dim)
+    k_raw = self_attn.k_proj(hidden_states).view(batch_size, seq_len, self_attn.num_key_value_heads, self_attn.head_dim)
+    v_raw = self_attn.v_proj(hidden_states).view(batch_size, seq_len, self_attn.num_key_value_heads, self_attn.head_dim)
+    _, fast_k, fast_v = branch.prepare_fast_qkv(
+        fast_q=q_raw,
+        fast_k=k_raw,
+        fast_v=v_raw,
+        position_ids=position_ids,
+    )
 
     return fast_k, fast_v
 
@@ -143,9 +129,10 @@ def main() -> None:
         teacher_inputs = collect_layer_inputs(teacher, input_ids, target_layers)
 
         for idx in target_layers:
-            branch = hybrid.model.layers[idx].self_attn.lact_branch
+            self_attn = hybrid.model.layers[idx].self_attn
+            branch = self_attn.lact_branch
             hidden_states = teacher_inputs[idx]
-            fast_k, fast_v = compute_branch_features(branch, hidden_states, position_ids)
+            fast_k, fast_v = compute_branch_features(self_attn, hidden_states, position_ids)
 
             for head in range(branch.num_fw_heads):
                 hk = fast_k[head::branch.num_fw_heads].reshape(-1, branch.fw_head_dim).double()

@@ -6,20 +6,21 @@ flame_dir="/work/mingze/flame"
 cd ${flame_dir}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NAME=$(basename "${SCRIPT_DIR}")_swa_2k_chunk_1k_rerun6
+RUN_NAME=$(basename "${SCRIPT_DIR}")_swa_2k_chunk_1k_rerun5
+export WANDB_PROJECT=fla
 export WANDB_NAME=${RUN_NAME}
 export WANDB_RUN_ID=${RUN_NAME}
 export WANDB_RESUME=allow
 
 MODEL_CONFIG_PATH=configs/qwen3_hybrid_qwen3_lact_0p6B.json
 BASE_MODEL_ID=Qwen/Qwen3-0.6B-Base
-HYBRID_HF_DIR=${flame_dir}/checkpoints/qwen3_hybrid_qwen3_lact_0p6B_init
+HYBRID_HF_DIR=${flame_dir}/checkpoints/qwen3_hybrid_qwen3_no_lact_0p6B_init
 
 TOKENIZER_PATH=${HYBRID_HF_DIR}
 
 dump_folder=/work/mingze/flame/exp/${RUN_NAME}
 checkpoint_folder=${dump_folder}/checkpoint
-seed_root=/work/mingze/flame/seeds/qwen3_hybrid_qwen3_lact_0p6B
+seed_root=/work/mingze/flame/seeds/qwen3_hybrid_qwen3_no_lact_0p6B
 seed_checkpoint_dir=${seed_root}/step-0
 lm_eval_output_path=/work/mingze/flame/results/${RUN_NAME}
 
