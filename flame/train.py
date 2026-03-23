@@ -40,6 +40,22 @@ from flame.tools.utils import get_nparams_and_flops
 import custom_models
 # torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
 
+
+def consume_model_runtime_metrics(model: torch.nn.Module) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    seen = set()
+    for module in model.modules():
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        consume_fn = getattr(module, "consume_ttt_runtime_metrics", None)
+        if consume_fn is None:
+            continue
+        module_metrics = consume_fn()
+        if module_metrics:
+            metrics.update(module_metrics)
+    return metrics
+
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
 
@@ -729,6 +745,7 @@ def main(job_config: JobConfig):
                         "optimizer/lr": last_lr,
                         "optimizer/grad_norm": grad_norm.item(),
                         "optimizer/skipped_step": train_state.skipped_step,
+                        **consume_model_runtime_metrics(model),
                     },
                 )
 

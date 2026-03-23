@@ -66,6 +66,8 @@ def copy_qwen3_weights(src_model, dst_model) -> None:
     for key in ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]:
         if key in src_sd and key in dst_sd and src_sd[key].shape == dst_sd[key].shape:
             dst_sd[key] = src_sd[key]
+    if "lm_head.weight" in dst_sd and "lm_head.weight" not in src_sd and hasattr(src_model, "lm_head"):
+        dst_sd["lm_head.weight"] = src_model.lm_head.weight.detach().cpu().clone()
 
     for i, layer in enumerate(dst_model.model.layers):
         src_prefix = f"model.layers.{i}"

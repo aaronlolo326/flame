@@ -37,7 +37,7 @@ def main() -> None:
         "vocab_size": int(src_cfg.vocab_size),
         "bos_token_id": getattr(src_cfg, "bos_token_id", None),
         "eos_token_id": getattr(src_cfg, "eos_token_id", None),
-        "tie_word_embeddings": bool(getattr(src_cfg, "tie_word_embeddings", False)),
+        "tie_word_embeddings": False,
         "hidden_size": int(src_cfg.hidden_size),
         "intermediate_size": int(src_cfg.intermediate_size),
         "num_hidden_layers": num_hidden_layers,

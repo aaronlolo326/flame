@@ -162,6 +162,12 @@ class HybridQwen3LaCTBranch(nn.Module):
         if self.use_momentum:
             self.momentum_proj = nn.Sequential(nn.Linear(self.hidden_size, self.num_fw_heads), nn.Sigmoid())
         self.rotary = RotaryEmbedding(self.fw_head_dim, base=config.rope_theta)
+        self.register_buffer("_metric_ttt_scale_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_metric_ttt_scale_abs_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_metric_ttt_scale_max", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_metric_ttt_rms_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_metric_ttt_ratio_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_metric_ttt_count", torch.zeros((), dtype=torch.float32), persistent=False)
 
     def _rescale_qk(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         qk_scale = self.qk_scale.view(1, 1, -1, 2)
@@ -174,7 +180,7 @@ class HybridQwen3LaCTBranch(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.LongTensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         batch_size, seq_len, _ = hidden_states.shape
         q, k, v = self.qkv(hidden_states).chunk(3, dim=-1)
         if self.attn_qk_norm:
@@ -227,7 +233,12 @@ class HybridQwen3LaCTBranch(nn.Module):
             fw_w1 = fw_w1.float()
             fw_w2 = fw_w2.float()
 
-        use_fused = self.use_fused_kernel and self.memory_update_phase in (None, self.lact_chunk_size - 1)
+        use_fused = (
+            self.use_fused_kernel
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.memory_update_phase in (None, self.lact_chunk_size - 1)
+        )
         if self.ttt_prenorm:
             if use_fused:
                 fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
@@ -254,12 +265,58 @@ class HybridQwen3LaCTBranch(nn.Module):
                 )
 
         ttt_x = self.ttt_norm(fw_x)
+        scale_stats = {
+            "scale_mean": torch.zeros((), dtype=torch.float32, device=hidden_states.device),
+            "scale_abs_mean": torch.zeros((), dtype=torch.float32, device=hidden_states.device),
+            "scale_max": torch.zeros((), dtype=torch.float32, device=hidden_states.device),
+        }
         if self.learnable_ttt_scale:
             ttt_scale = F.silu(self.ttt_scale_proj(hidden_states), inplace=False)
+            scale_stats = {
+                "scale_mean": ttt_scale.mean().float(),
+                "scale_abs_mean": ttt_scale.abs().mean().float(),
+                "scale_max": ttt_scale.max().float(),
+            }
             ttt_scale = ttt_scale.view(batch_size, seq_len, self.num_fw_heads, 1).permute(0, 2, 1, 3).reshape(batch_size * self.num_fw_heads, seq_len, 1)
             ttt_x = ttt_x * ttt_scale
 
-        return ttt_x.view(batch_size, self.num_fw_heads, seq_len, self.fw_head_dim).transpose(1, 2).reshape(batch_size, seq_len, self.hidden_size)
+        ttt_x = ttt_x.view(batch_size, self.num_fw_heads, seq_len, self.fw_head_dim).transpose(1, 2).reshape(batch_size, seq_len, self.hidden_size)
+        ttt_rms = ttt_x.float().pow(2).mean().sqrt()
+        return ttt_x, {
+            "scale_mean": scale_stats["scale_mean"],
+            "scale_abs_mean": scale_stats["scale_abs_mean"],
+            "scale_max": scale_stats["scale_max"],
+            "ttt_rms": ttt_rms,
+        }
+
+    def update_runtime_metrics(self, stats: dict[str, torch.Tensor], attn_rms: torch.Tensor) -> None:
+        with torch.no_grad():
+            self._metric_ttt_scale_sum.add_(stats["scale_mean"].detach().to(torch.float32))
+            self._metric_ttt_scale_abs_sum.add_(stats["scale_abs_mean"].detach().to(torch.float32))
+            self._metric_ttt_scale_max.copy_(torch.maximum(self._metric_ttt_scale_max, stats["scale_max"].detach().to(torch.float32)))
+            self._metric_ttt_rms_sum.add_(stats["ttt_rms"].detach().to(torch.float32))
+            ratio = stats["ttt_rms"].detach().to(torch.float32) / attn_rms.detach().to(torch.float32).clamp_min(1e-8)
+            self._metric_ttt_ratio_sum.add_(ratio)
+            self._metric_ttt_count.add_(torch.ones((), dtype=torch.float32, device=self._metric_ttt_count.device))
+
+    def consume_runtime_metrics(self) -> dict[str, float]:
+        count = float(self._metric_ttt_count.item())
+        if count == 0:
+            return {}
+        metrics = {
+            "ttt_scale_mean": float((self._metric_ttt_scale_sum / self._metric_ttt_count).item()),
+            "ttt_scale_abs_mean": float((self._metric_ttt_scale_abs_sum / self._metric_ttt_count).item()),
+            "ttt_scale_max": float(self._metric_ttt_scale_max.item()),
+            "ttt_output_rms": float((self._metric_ttt_rms_sum / self._metric_ttt_count).item()),
+            "ttt_to_attn_rms_ratio": float((self._metric_ttt_ratio_sum / self._metric_ttt_count).item()),
+        }
+        self._metric_ttt_scale_sum.zero_()
+        self._metric_ttt_scale_abs_sum.zero_()
+        self._metric_ttt_scale_max.zero_()
+        self._metric_ttt_rms_sum.zero_()
+        self._metric_ttt_ratio_sum.zero_()
+        self._metric_ttt_count.zero_()
+        return metrics
 
 
 class HybridQwen3Attention(nn.Module):
@@ -291,7 +348,13 @@ class HybridQwen3Attention(nn.Module):
         value_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if flash_attn_func is not None and attention_mask is None:
+        if (
+            flash_attn_func is not None
+            and attention_mask is None
+            and query_states.is_cuda
+            and key_states.is_cuda
+            and value_states.is_cuda
+        ):
             return flash_attn_func(
                 query_states,
                 key_states,
@@ -333,7 +396,10 @@ class HybridQwen3Attention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         if self.lact_branch is not None:
-            attn_output = attn_output + self.lact_branch(hidden_states, position_ids)
+            branch_output, branch_stats = self.lact_branch(hidden_states, position_ids)
+            attn_rms = attn_output.float().pow(2).mean().sqrt()
+            self.lact_branch.update_runtime_metrics(branch_stats, attn_rms)
+            attn_output = attn_output + branch_output
         return attn_output
 
 
@@ -393,8 +459,9 @@ class HybridQwen3LaCTPreTrainedModel(PreTrainedModel):
 
 
 class HybridQwen3LaCTModel(HybridQwen3LaCTPreTrainedModel):
-    def __init__(self, config: HybridQwen3LaCTConfig) -> None:
+    def __init__(self, config: HybridQwen3LaCTConfig, **kwargs) -> None:
         super().__init__(config)
+        del kwargs
         self.padding_idx = config.pad_token_id
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -438,10 +505,9 @@ class HybridQwen3LaCTModel(HybridQwen3LaCTPreTrainedModel):
 
 
 class HybridQwen3LaCTForCausalLM(HybridQwen3LaCTPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-
-    def __init__(self, config: HybridQwen3LaCTConfig):
+    def __init__(self, config: HybridQwen3LaCTConfig, **kwargs):
         super().__init__(config)
+        del kwargs
         self.model = HybridQwen3LaCTModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -459,6 +525,35 @@ class HybridQwen3LaCTForCausalLM(HybridQwen3LaCTPreTrainedModel, GenerationMixin
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def consume_ttt_runtime_metrics(self) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        scale_means = []
+        scale_abs_means = []
+        scale_maxes = []
+        ratio_means = []
+        for idx, layer in enumerate(self.model.layers):
+            branch = getattr(layer.self_attn, "lact_branch", None)
+            if branch is None:
+                continue
+            layer_metrics = branch.consume_runtime_metrics()
+            if not layer_metrics:
+                continue
+            metrics[f"ttt/layer_{idx:02d}/scale_mean"] = layer_metrics["ttt_scale_mean"]
+            metrics[f"ttt/layer_{idx:02d}/scale_abs_mean"] = layer_metrics["ttt_scale_abs_mean"]
+            metrics[f"ttt/layer_{idx:02d}/scale_max"] = layer_metrics["ttt_scale_max"]
+            metrics[f"ttt/layer_{idx:02d}/output_rms"] = layer_metrics["ttt_output_rms"]
+            metrics[f"ttt/layer_{idx:02d}/to_attn_rms_ratio"] = layer_metrics["ttt_to_attn_rms_ratio"]
+            scale_means.append(layer_metrics["ttt_scale_mean"])
+            scale_abs_means.append(layer_metrics["ttt_scale_abs_mean"])
+            scale_maxes.append(layer_metrics["ttt_scale_max"])
+            ratio_means.append(layer_metrics["ttt_to_attn_rms_ratio"])
+        if scale_means:
+            metrics["ttt/global/scale_mean"] = sum(scale_means) / len(scale_means)
+            metrics["ttt/global/scale_abs_mean"] = sum(scale_abs_means) / len(scale_abs_means)
+            metrics["ttt/global/scale_max"] = max(scale_maxes)
+            metrics["ttt/global/to_attn_rms_ratio"] = sum(ratio_means) / len(ratio_means)
+        return metrics
 
     def forward(
         self,
