@@ -40,6 +40,53 @@ from flame.tools.utils import get_nparams_and_flops
 import custom_models
 # torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
 
+
+def freeze_non_ttt_params(model: torch.nn.Module, trainable_patterns: list[str]) -> None:
+    if not trainable_patterns:
+        raise ValueError(
+            "`training.freeze_non_ttt` is enabled but no trainable patterns were provided."
+        )
+
+    trainable_patterns = [p for p in trainable_patterns if p]
+    if not trainable_patterns:
+        raise ValueError(
+            "All entries in `training.ttt_trainable_patterns` are empty."
+        )
+
+    total_params = 0
+    trainable_params = 0
+    trainable_names = []
+    frozen_names = []
+
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        is_trainable = any(pat in name for pat in trainable_patterns)
+        param.requires_grad = is_trainable
+        if is_trainable:
+            trainable_params += param.numel()
+            trainable_names.append(name)
+        else:
+            frozen_names.append(name)
+
+    if not trainable_names:
+        raise RuntimeError(
+            "No parameters matched `training.ttt_trainable_patterns`. "
+            f"Patterns: {trainable_patterns}"
+        )
+
+    logger.info("Enabled TTT-only training.")
+    logger.info("Trainable patterns: %s", trainable_patterns)
+    logger.info(
+        "Trainable params: %d / %d (%.4f%%)",
+        trainable_params,
+        total_params,
+        100.0 * trainable_params / max(1, total_params),
+    )
+    logger.info("Trainable tensors: %d", len(trainable_names))
+    logger.info("Frozen tensors: %d", len(frozen_names))
+    logger.info("First trainable names: %s", trainable_names[:40])
+
+
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
 
@@ -284,6 +331,12 @@ def main(job_config: JobConfig):
     # Build the collection of model converters. No-op if `model.converters` empty
     model_converters = build_model_converters(job_config, parallel_dims)
     model_converters.convert(model)
+
+    if bool(getattr(job_config.training, "freeze_non_ttt", False)):
+        freeze_non_ttt_params(
+            model,
+            list(getattr(job_config.training, "ttt_trainable_patterns", [])),
+        )
 
     # calculate model size and flops per token
     model_param_count, nparams_embedding, num_flops_per_token = get_nparams_and_flops(

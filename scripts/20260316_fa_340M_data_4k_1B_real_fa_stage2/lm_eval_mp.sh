@@ -33,16 +33,16 @@ eval_hf_path=${dump_folder}
 
 
 # tasks=winogrande,arc_easy,piqa,arc_challenge,mmlu,race #mathqa
-# accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
-#    --model hf-custom \
-#    --model_args pretrained=${eval_hf_path},trust_remote_code=True,dtype=bfloat16,torch_dtype=bfloat16,max_length=16384 \
-#    --tasks ${tasks} \
-#    --device cuda \
-#    --trust_remote_code \
-#    --batch_size 1 \
-#    --output_path $lm_eval_output_path/lm \
-#    --log_samples \
-#    --trust_remote_code
+accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
+   --model hf-custom \
+   --model_args pretrained=${eval_hf_path},trust_remote_code=True,dtype=bfloat16,torch_dtype=bfloat16,max_length=16384 \
+   --tasks ${tasks} \
+   --device cuda \
+   --trust_remote_code \
+   --batch_size 1 \
+   --output_path $lm_eval_output_path/lm \
+   --log_samples \
+   --trust_remote_code
 
 accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
    --model hf-custom \

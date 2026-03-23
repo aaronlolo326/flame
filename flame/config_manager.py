@@ -288,6 +288,33 @@ class JobConfig:
             help="Whether to truncate an instance via sampling if it is longer than the sequence length",
         )
         self.parser.add_argument(
+            "--training.freeze_non_ttt",
+            action="store_true",
+            help=(
+                "If set, freeze all parameters except those matching "
+                "`training.ttt_trainable_patterns`."
+            ),
+        )
+        self.parser.add_argument(
+            "--training.ttt_trainable_patterns",
+            type=string_list,
+            default=[
+                ".attn.w0",
+                ".attn.w1",
+                ".attn.w2",
+                ".attn.lr_proj",
+                ".attn.qk_scale",
+                ".attn.qk_offset",
+                ".attn.ttt_scale_proj",
+                ".attn.ttt_norm",
+                ".attn.momentum_proj",
+            ],
+            help=(
+                "Comma-separated substrings. Parameters with names containing any of "
+                "these patterns remain trainable when `training.freeze_non_ttt` is enabled."
+            ),
+        )
+        self.parser.add_argument(
             "--training.gradient_accumulation_steps",
             type=int,
             default=1,

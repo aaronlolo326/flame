@@ -26,7 +26,7 @@ checkpoints=()
 # tasks=gsm8k,winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,mathqa,race
 
 
-tasks=winogrande,arc_easy #,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,race,wikitext #social_iqa
+tasks=winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa,lambada_openai,mmlu,race,wikitext #social_iqa
 
 
 eval_hf_path=${dump_folder}
