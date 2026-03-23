@@ -16,11 +16,35 @@ import custom_models  # noqa: F401
 from torchtitan.tools.logging import init_logger, logger
 
 
+def _maybe_strip_outer_model_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """
+    Normalize state_dict keys by stripping one leading "model." when the input
+    clearly looks prefixed (e.g. "model.lm_head.weight", "model.model.layers...").
+    """
+    has_double_model_prefix = any(k.startswith("model.model.") for k in state_dict.keys())
+    has_prefixed_lm_head_only = (
+        "model.lm_head.weight" in state_dict and "lm_head.weight" not in state_dict
+    )
+    if not (has_double_model_prefix or has_prefixed_lm_head_only):
+        return state_dict
+
+    normalized: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key[6:] if key.startswith("model.") else key
+        normalized[new_key] = value
+    logger.info(
+        "Detected outer 'model.' prefix in checkpoint keys. "
+        "Stripped one leading prefix from all keys."
+    )
+    return normalized
+
+
 @torch.inference_mode()
 def convert_hf_weights(model: str, checkpoint: str):
     logger.info(f"Loading model from {model}")
     model = AutoModelForCausalLM.from_pretrained(model, trust_remote_code=True)
     state_dict = model.state_dict()
+    state_dict = _maybe_strip_outer_model_prefix(state_dict)
     logger.info(
         "Loaded HF model_type=%s tie_word_embeddings=%s",
         getattr(model.config, "model_type", None),
@@ -32,6 +56,11 @@ def convert_hf_weights(model: str, checkpoint: str):
         "lm_head.weight" in state_dict,
         any(k.endswith("embed_tokens.weight") or k.endswith("embeddings.weight") for k in state_dict),
     )
+
+    # Compatibility: accept both "lm_head.weight" and "model.lm_head.weight".
+    if "lm_head.weight" not in state_dict and "model.lm_head.weight" in state_dict:
+        logger.info("Found model.lm_head.weight; canonicalizing to lm_head.weight")
+        state_dict["lm_head.weight"] = state_dict["model.lm_head.weight"]
 
     # Some tied-weight models may not materialize lm_head.weight in the serialized
     # checkpoint even though the training-side model expects it in the DCP seed.
@@ -56,7 +85,9 @@ def convert_hf_weights(model: str, checkpoint: str):
     logger.info(f"Writing to DCP at '{checkpoint}'")
     checkpoint.mkdir(parents=True, exist_ok=True)
     storage_writer = DCP.filesystem.FileSystemWriter(checkpoint, thread_count=8)
-    DCP.save({"model": state_dict}, storage_writer=storage_writer)
+    # TorchTitan step-0 loads checkpoints in "model-only" mode and expects
+    # bare model FQNs (e.g. "lm_head.weight"), not an extra "model." prefix.
+    DCP.save(state_dict, storage_writer=storage_writer)
 
     # Verify what was actually written by round-tripping the DCP checkpoint back
     # to a torch-save file and checking the resulting keys.
@@ -65,7 +96,8 @@ def convert_hf_weights(model: str, checkpoint: str):
         logger.info("Round-tripping DCP checkpoint for verification: %s", roundtrip_path)
         dcp_to_torch_save(str(checkpoint), roundtrip_path)
         loaded = torch.load(roundtrip_path, map_location="cpu")
-        loaded_model_sd = loaded["model"]
+        # Backward compatibility for older seeds written as {"model": state_dict}.
+        loaded_model_sd = loaded["model"] if isinstance(loaded, dict) and "model" in loaded else loaded
         logger.info(
             "Round-trip verification: %d keys; lm_head.weight present=%s; sample keys=%s",
             len(loaded_model_sd),

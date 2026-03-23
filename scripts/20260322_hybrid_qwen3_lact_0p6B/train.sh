@@ -14,7 +14,11 @@ if [ ! -d "${seed_checkpoint_dir}" ]; then
 fi
 
 mkdir -p "${checkpoint_folder}"
-
+step0_checkpoint_dir="${checkpoint_folder}/step-0"
+if [ ! -d "${step0_checkpoint_dir}" ]; then
+  mkdir -p "${step0_checkpoint_dir}"
+  cp -a "${seed_checkpoint_dir}/." "${step0_checkpoint_dir}/"
+fi
 if [ "$debug" = true ]; then
   CUDA_VISIBLE_DEVICES=0
   batch_size=1
@@ -36,7 +40,7 @@ if $profile; then
   steps=10
 fi
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
+MASTER_ADDR=127.0.0.1 MASTER_PORT=29500 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
 NNODE=1 NGPU=${NGPU} LOG_RANK=0 bash train.sh \
   --job.dump_folder ${dump_folder} \
   --job.print_args \
@@ -57,7 +61,7 @@ NNODE=1 NGPU=${NGPU} LOG_RANK=0 bash train.sh \
   --training.steps ${steps} \
   --training.max_norm 1.0 \
   --training.skip_nan_inf \
-  --training.tokenized_dataset_dir /storage/backup/hei/data/qwen3-dclm-filter-16k_train \
+  --training.tokenized_dataset_dir /storage/backup/hei/data/HuggingFaceFW___fineweb-edu___sample-350BT \
   --training.num_workers 32 \
   --training.prefetch_factor 2 \
   --training.seed ${seed} \
@@ -66,16 +70,10 @@ NNODE=1 NGPU=${NGPU} LOG_RANK=0 bash train.sh \
   --training.data_parallel_replicate_degree 1 \
   --training.data_parallel_shard_degree -1 \
   --training.tensor_parallel_degree 1 \
-  --checkpoint.enable_checkpoint \
-  --checkpoint.folder checkpoint \
   --checkpoint.interval ${interval} \
-  --checkpoint.export_dtype float32 \
-  --checkpoint.async_mode disabled \
-  --checkpoint.initial_load_path ${seed_checkpoint_dir} \
-  --checkpoint.initial_load_model_weights_only \
+  --checkpoint.enable_checkpoint \
   --checkpoint.load_step -1 \
   --metrics.enable_wandb \
-  --metrics.log_freq 10 \
+  --metrics.log_freq 1 \
   --experimental.context_parallel_degree 1 \
   --experimental.pipeline_parallel_degree 1 \
-  --activation_checkpoint.mode none
