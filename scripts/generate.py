@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import random
 import sys
 from pathlib import Path
@@ -116,6 +117,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="The parameter for repetition penalty. 1.0 means no penalty.",
     )
+    parser.add_argument(
+        "--use_cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override generation cache usage. Defaults to the model/generate default.",
+    )
     return parser.parse_args()
 
 
@@ -139,6 +146,13 @@ def main(args: argparse.Namespace) -> None:
     device = "cuda"
     # torch_dtype = DTYPE_MAP[args.dtype]
 
+    logger.info(
+        "CUDA env: CUDA_VISIBLE_DEVICES=%s cuda_available=%s device_count=%s",
+        os.environ.get("CUDA_VISIBLE_DEVICES"),
+        torch.cuda.is_available(),
+        torch.cuda.device_count(),
+    )
+
     logger.info("Loading tokenizer from %s", tokenizer_path)
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
@@ -159,6 +173,13 @@ def main(args: argparse.Namespace) -> None:
     model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
     model.to(device)
     model.eval()
+    if torch.cuda.is_available():
+        logger.info(
+            "Resolved device=%s current_device=%s device_name=%s",
+            device,
+            torch.cuda.current_device(),
+            torch.cuda.get_device_name(torch.cuda.current_device()),
+        )
 
     model_inputs = tokenizer(prompt, return_tensors="pt").input_ids
 
@@ -179,12 +200,19 @@ def main(args: argparse.Namespace) -> None:
         "repetition_penalty": args.repetition_penalty,
     }
 
+    if args.use_cache is not None:
+        generation_kwargs["use_cache"] = args.use_cache
+
     if not args.do_sample:
         generation_kwargs.pop("temperature")
         generation_kwargs.pop("top_p")
         generation_kwargs.pop("top_k")
 
-    logger.info("Generating with device=%s", device)
+    logger.info(
+        "Generating with device=%s use_cache=%s",
+        device,
+        generation_kwargs.get("use_cache", "default"),
+    )
     outputs = model.generate(**generation_kwargs)
 
     prompt_length = model_inputs.shape[-1]

@@ -24,6 +24,7 @@ from fla.modules import GatedMLP as TransformerMLP
 from fla.modules import RMSNorm
 import torch.nn as nn
 
+from .cache_lact import LaCTCache
 from .layer_lact_swiglu import LaCTSWIGLULayer
 from .configuration_lact_swiglu import LaCTSWIGLUConfig
 
@@ -31,6 +32,43 @@ logger = logging.get_logger(__name__)
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
+
+
+def _cache_length(past_key_values: Optional[Union[LaCTCache, List[Any], Tuple[Any, ...]]]) -> int:
+    if past_key_values is None:
+        return 0
+    if isinstance(past_key_values, LaCTCache):
+        return int(past_key_values.get_seq_length())
+    if hasattr(past_key_values, "get_seq_length"):
+        try:
+            return int(past_key_values.get_seq_length())
+        except Exception:
+            pass
+    if isinstance(past_key_values, (list, tuple)):
+        return 1 if len(past_key_values) > 0 else 0
+    return 0
+
+
+def _has_past_tokens(past_key_values: Optional[Union[LaCTCache, List[Any], Tuple[Any, ...]]]) -> bool:
+    return _cache_length(past_key_values) > 0
+
+
+def _is_padding_free_attention_mask(attention_mask: Optional[torch.Tensor]) -> bool:
+    if attention_mask is None:
+        return True
+    return bool(torch.all(attention_mask.to(dtype=torch.bool)))
+
+
+def _normalize_cached_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    *,
+    use_cache: bool,
+) -> Optional[torch.Tensor]:
+    if not use_cache or attention_mask is None:
+        return attention_mask
+    if _is_padding_free_attention_mask(attention_mask):
+        return None
+    return attention_mask
 
 
 class LaCTBlock(nn.Module):
@@ -310,11 +348,21 @@ class LaCTModel(LaCTPreTrainedModel):
         elif input_ids is None and inputs_embeds is None:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        if use_cache and not isinstance(past_key_values, Cache):
-            past_key_values = Cache.from_legacy_cache(past_key_values)
+        if use_cache:
+            if past_key_values is None:
+                past_key_values = LaCTCache()
+            elif not isinstance(past_key_values, LaCTCache):
+                past_key_values = LaCTCache.from_legacy_cache(past_key_values)
+
+        attention_mask = _normalize_cached_attention_mask(
+            attention_mask,
+            use_cache=use_cache,
+        )
 
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
+
+        cache_step_length = inputs_embeds.shape[1]
 
         # embed positions
         hidden_states = inputs_embeds
@@ -363,6 +411,9 @@ class LaCTModel(LaCTPreTrainedModel):
                 all_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+
+        if use_cache and isinstance(next_cache, LaCTCache):
+            next_cache.advance_seq_length(cache_step_length)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -426,12 +477,15 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
         logits_to_keep: Optional[int] = None,
         **kwargs,
     ):
-        use_cache = False
-        # only last token for `inputs_ids` if the `past_key_values` is not empty.
-        if past_key_values is not None and len(past_key_values) > 0 and use_cache:
+        has_past = use_cache and _has_past_tokens(past_key_values)
+        attention_mask = _normalize_cached_attention_mask(
+            attention_mask,
+            use_cache=use_cache,
+        )
+        if has_past and input_ids is not None:
             input_ids = input_ids[:, -1:]
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and len(past_key_values) == 0:
+        if inputs_embeds is not None and not has_past:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
@@ -445,7 +499,7 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
 
         model_inputs.update(
             {
-                "past_key_values": None,  # past_key_values,
+                "past_key_values": past_key_values,
                 "use_cache": use_cache,
                 "attention_mask": attention_mask,
             }
@@ -467,7 +521,11 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
         logits_to_keep: Optional[int] = 0,
         **kwargs: Unpack[Any],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        use_cache = False
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        attention_mask = _normalize_cached_attention_mask(
+            attention_mask,
+            use_cache=use_cache,
+        )
         output_attentions = (
             output_attentions
             if output_attentions is not None
