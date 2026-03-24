@@ -1,0 +1,24 @@
+CUDA_VISIBLE_DEVICES=6,7 #0,1,3,4,5,6,7
+
+export USERNAME=$(whoami)
+
+flame_dir="."
+
+RUN_NAME=$(basename "$(dirname "$0")")
+
+
+
+cd ${flame_dir}
+
+MODEL_CONFIGS_DIR=configs
+MODEL_NAME=qwen3_lact_1B4
+MODEL_CONFIG_PATH=${MODEL_CONFIGS_DIR}/${MODEL_NAME}.json
+
+base_model_hfac="Qwen"
+base_model_name="Qwen3-1.7B-Base"
+TOKENIZER_PATH=${base_model_hfac}/${base_model_name}
+
+lm_eval_output_path=/work/ali/projects/flame/results/${RUN_NAME}
+dump_folder=/work/ali/projects/flame/exp/${RUN_NAME}
+
+seq_len=16384

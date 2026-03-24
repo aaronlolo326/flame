@@ -106,25 +106,34 @@ def _swiglu_bwd_bwd_fused_kernel(
 
     mask_l = offs_l < L_eff
     mask_d = offs_d < D
-    mask = mask_d[:, None] & mask_l[None, :]
+    if IS_VARLEN:
+        # [BLOCK_L, BLOCK_D] tile: D (stride-1) as columns for coalesced access to [T, D]
+        d2 = offs_d[None, :]
+        l2 = offs_l[:, None]
+        mask = mask_l[:, None] & mask_d[None, :]
+    else:
+        # [BLOCK_D, BLOCK_L] tile: L (stride-1) as columns for coalesced access to [B, D, L]
+        d2 = offs_d[:, None]
+        l2 = offs_l[None, :]
+        mask = mask_d[:, None] & mask_l[None, :]
 
     # ----- load input tiles (cast to fp32 for math) -----
     # dh [B, D, L] or [T, D]
-    dh_ptrs = DH + dh_off + offs_d[:, None] * s_dh_d + offs_l[None, :] * s_dh_l
+    dh_ptrs = DH + dh_off + d2 * s_dh_d + l2 * s_dh_l
     dh = tl.load(dh_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     # x0, x2 from [B, 2D, L] or [T, 2D]
     x0_ptrs = (
         X0X2
         + x0x2_off
-        + offs_d[:, None] * s_x0x2_d
-        + offs_l[None, :] * s_x0x2_l
+        + d2 * s_x0x2_d
+        + l2 * s_x0x2_l
     )
     x2_ptrs = (
         X0X2
         + x0x2_off
-        + (offs_d[:, None] + D) * s_x0x2_d
-        + offs_l[None, :] * s_x0x2_l
+        + (d2 + D) * s_x0x2_d
+        + l2 * s_x0x2_l
     )
     x0 = tl.load(x0_ptrs, mask=mask, other=0.0).to(tl.float32)
     x2 = tl.load(x2_ptrs, mask=mask, other=0.0).to(tl.float32)
@@ -133,14 +142,14 @@ def _swiglu_bwd_bwd_fused_kernel(
     gdx0_ptrs = (
         GDX0DX2
         + gdx0dx2_off
-        + offs_d[:, None] * s_gdx0dx2_d
-        + offs_l[None, :] * s_gdx0dx2_l
+        + d2 * s_gdx0dx2_d
+        + l2 * s_gdx0dx2_l
     )
     gdx2_ptrs = (
         GDX0DX2
         + gdx0dx2_off
-        + (offs_d[:, None] + D) * s_gdx0dx2_d
-        + offs_l[None, :] * s_gdx0dx2_l
+        + (d2 + D) * s_gdx0dx2_d
+        + l2 * s_gdx0dx2_l
     )
     grad_dx0 = tl.load(gdx0_ptrs, mask=mask, other=0.0).to(tl.float32)
     grad_dx2 = tl.load(gdx2_ptrs, mask=mask, other=0.0).to(tl.float32)
@@ -149,8 +158,8 @@ def _swiglu_bwd_bwd_fused_kernel(
     gh_ptrs = (
         GH_LR1
         + gh_lr1_off
-        + offs_d[:, None] * s_gh_lr1_d
-        + offs_l[None, :] * s_gh_lr1_l
+        + d2 * s_gh_lr1_d
+        + l2 * s_gh_lr1_l
     )
     grad_hidden_lr1 = tl.load(gh_ptrs, mask=mask, other=0.0).to(tl.float32)
 
@@ -158,11 +167,17 @@ def _swiglu_bwd_bwd_fused_kernel(
     lr0_ptrs = LR0 + lr_off + offs_l * s_lr_l
     lr1_ptrs = LR1 + lr_off + offs_l * s_lr_l
     lr2_ptrs = LR2 + lr_off + offs_l * s_lr_l
-    lr0 = tl.load(lr0_ptrs, mask=mask_l, other=0.0).to(tl.float32)[
-        None, :
-    ]  # [1, BLOCK_L]
-    lr1 = tl.load(lr1_ptrs, mask=mask_l, other=0.0).to(tl.float32)[None, :]
-    lr2 = tl.load(lr2_ptrs, mask=mask_l, other=0.0).to(tl.float32)[None, :]
+    lr0_1d = tl.load(lr0_ptrs, mask=mask_l, other=0.0).to(tl.float32)
+    lr1_1d = tl.load(lr1_ptrs, mask=mask_l, other=0.0).to(tl.float32)
+    lr2_1d = tl.load(lr2_ptrs, mask=mask_l, other=0.0).to(tl.float32)
+    if IS_VARLEN:
+        lr0 = lr0_1d[:, None]
+        lr1 = lr1_1d[:, None]
+        lr2 = lr2_1d[:, None]
+    else:
+        lr0 = lr0_1d[None, :]
+        lr1 = lr1_1d[None, :]
+        lr2 = lr2_1d[None, :]
 
     # ----- common terms -----
     sigma = tl.sigmoid(x0)  # [D,L]
@@ -192,9 +207,16 @@ def _swiglu_bwd_bwd_fused_kernel(
     part_lr2 = grad_dx2 * dh * silu_x0
 
     # Reduce along D-axis of the tile -> [BLOCK_L]
-    red_lr0 = tl.sum(part_lr0, axis=0)  # [Ltile]
-    red_lr1 = tl.sum(part_lr1, axis=0)
-    red_lr2 = tl.sum(part_lr2, axis=0)
+    if IS_VARLEN:
+        # [BLOCK_L, BLOCK_D] tile: sum over D is axis=1
+        red_lr0 = tl.sum(part_lr0, axis=1)
+        red_lr1 = tl.sum(part_lr1, axis=1)
+        red_lr2 = tl.sum(part_lr2, axis=1)
+    else:
+        # [BLOCK_D, BLOCK_L] tile: sum over D is axis=0
+        red_lr0 = tl.sum(part_lr0, axis=0)
+        red_lr1 = tl.sum(part_lr1, axis=0)
+        red_lr2 = tl.sum(part_lr2, axis=0)
 
     # Atomic add into [B, L] or [T]
     out_lr0_ptrs = OUT_GRAD_LR0 + out_lr_off + offs_l * s_out_grad_lr_l
@@ -216,8 +238,8 @@ def _swiglu_bwd_bwd_fused_kernel(
     out_gdh_ptrs = (
         OUT_GRAD_DH
         + dh_off
-        + offs_d[:, None] * s_dh_d
-        + offs_l[None, :] * s_dh_l
+        + d2 * s_dh_d
+        + l2 * s_dh_l
     )
     tl.store(out_gdh_ptrs, tl.cast(grad_dh, tl.bfloat16), mask=mask)
 
@@ -225,14 +247,14 @@ def _swiglu_bwd_bwd_fused_kernel(
     out_gx0_ptrs = (
         OUT_GRAD_X0X2
         + x0x2_off
-        + offs_d[:, None] * s_x0x2_d
-        + offs_l[None, :] * s_x0x2_l
+        + d2 * s_x0x2_d
+        + l2 * s_x0x2_l
     )
     out_gx2_ptrs = (
         OUT_GRAD_X0X2
         + x0x2_off
-        + (offs_d[:, None] + D) * s_x0x2_d
-        + offs_l[None, :] * s_x0x2_l
+        + (d2 + D) * s_x0x2_d
+        + l2 * s_x0x2_l
     )
     tl.store(out_gx0_ptrs, tl.cast(grad_x0, tl.bfloat16), mask=mask)
     tl.store(out_gx2_ptrs, tl.cast(grad_x2, tl.bfloat16), mask=mask)
@@ -241,14 +263,14 @@ def _swiglu_bwd_bwd_fused_kernel(
     out_dx0_ptrs = (
         OUT_DX0X2
         + x0x2_off
-        + offs_d[:, None] * s_x0x2_d
-        + offs_l[None, :] * s_x0x2_l
+        + d2 * s_x0x2_d
+        + l2 * s_x0x2_l
     )
     out_dx2_ptrs = (
         OUT_DX0X2
         + x0x2_off
-        + (offs_d[:, None] + D) * s_x0x2_d
-        + offs_l[None, :] * s_x0x2_l
+        + (d2 + D) * s_x0x2_d
+        + l2 * s_x0x2_l
     )
     tl.store(out_dx0_ptrs, tl.cast(dx0, tl.bfloat16), mask=mask)
     tl.store(out_dx2_ptrs, tl.cast(dx2, tl.bfloat16), mask=mask)
@@ -257,8 +279,8 @@ def _swiglu_bwd_bwd_fused_kernel(
     out_h_ptrs = (
         OUT_HIDDEN_LR1
         + gh_lr1_off
-        + offs_d[:, None] * s_gh_lr1_d
-        + offs_l[None, :] * s_gh_lr1_l
+        + d2 * s_gh_lr1_d
+        + l2 * s_gh_lr1_l
     )
     tl.store(out_h_ptrs, tl.cast(hidden_lr1, tl.bfloat16), mask=mask)
 
@@ -619,23 +641,29 @@ def _reference_varlen_padded(dh, x0_x2, lr0, lr1, lr2, grad_dx0_dx2, grad_hidden
 
 if __name__ == "__main__":
     import argparse
-    from kernel_test_utils import test_correctness, benchmark, get_chunk_info
+    from kernel_test_utils import (
+        test_correctness, benchmark, get_chunk_info,
+        BENCH_DOC_LENS, make_cu_seqlens,
+    )
+    from grouped_gemm import _pack_to_padded
+    from utils import compute_varlen_args
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     device = "cuda"
-    num_docs = 4
-    # doc_lens = [4096, 3072, 2048, 1024]
-    doc_lens=[1, 4213, 1906, 295, 537, 1580, 213, 475, 743, 659, 1414, 230, 1520, 116, 745, 327, 181, 193, 187, 96, 110, 303, 340]
-
     D = 512
-    cu_seqlens = torch.tensor(
-        [0] + list(torch.cumsum(torch.tensor(doc_lens), 0).tolist()),
-        dtype=torch.int32, device=device,
-    )
-    T = cu_seqlens[-1].item()
+    tol = dict(atol=1e-2, rtol=1e-2)
+
+    # ================================================================
+    #  CORRECTNESS
+    # ================================================================
+    doc_lens = [4096, 3072, 2048, 1024]
+    cu = make_cu_seqlens(doc_lens, device)
+    T = cu[-1].item()
+    G = len(doc_lens)
+    chunk_size = 2048
 
     dh = torch.randn(T, D, device=device, dtype=torch.bfloat16)
     x0_x2 = torch.randn(T, 2 * D, device=device, dtype=torch.bfloat16)
@@ -644,86 +672,84 @@ if __name__ == "__main__":
     lr2 = torch.randn(T, device=device, dtype=torch.float32) * 0.01
     gdx = torch.randn(T, 2 * D, device=device, dtype=torch.bfloat16)
     gh = torch.randn(T, D, device=device, dtype=torch.bfloat16)
+    varlen_args = (dh, x0_x2, lr0, lr1, lr2, gdx, gh, cu)
 
-    print(f"Config: {num_docs=}, {doc_lens=}, {D=}, {T=}")
-    print()
+    print(f"Correctness: doc_lens={doc_lens}, {D=}")
 
-    print("=" * 60)
-    print("Varlen correctness vs padded batched Triton kernel")
-    print("=" * 60)
-
-    triton_args = (dh, x0_x2, lr0, lr1, lr2, gdx, gh, cu_seqlens)
-
-    test_correctness(
-        lambda *a: triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(*a),
-        lambda *a: _reference_varlen_padded(*a),
-        triton_args, triton_args,
-        debug=args.debug, atol=1e-2, rtol=1e-2,
+    # varlen vs padded batched
+    print("\n  varlen vs padded: ", end="")
+    ok = test_correctness(
+        triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen,
+        _reference_varlen_padded,
+        varlen_args, varlen_args,
+        debug=args.debug, **tol,
     )
+    assert ok
 
-    print()
-    print("=" * 60)
-    print("Varlen benchmark vs padded batched kernel")
-    print("=" * 60)
-
-    from grouped_gemm import _pack_to_padded
-    max_len = max(doc_lens)
-    # Pre-pad for fair benchmark: [T, feat] -> [G, feat, max_len] (batched kernel layout)
-    dh_p = _pack_to_padded(dh, cu_seqlens, max_len).transpose(1, 2).contiguous()
-    x0_x2_p = _pack_to_padded(x0_x2, cu_seqlens, max_len).transpose(1, 2).contiguous()
-    gdx_p = _pack_to_padded(gdx, cu_seqlens, max_len).transpose(1, 2).contiguous()
-    gh_p = _pack_to_padded(gh, cu_seqlens, max_len).transpose(1, 2).contiguous()
-    lr0_p = _pack_to_padded(lr0.unsqueeze(1), cu_seqlens, max_len).squeeze(2).contiguous()
-    lr1_p = _pack_to_padded(lr1.unsqueeze(1), cu_seqlens, max_len).squeeze(2).contiguous()
-    lr2_p = _pack_to_padded(lr2.unsqueeze(1), cu_seqlens, max_len).squeeze(2).contiguous()
-
-    ref_bench_args = (dh_p, x0_x2_p, lr0_p, lr1_p, lr2_p, gdx_p, gh_p)
-
-    try:
-        from utils import compute_varlen_args
-    except ImportError:
-        from .utils import compute_varlen_args
-    eff_lens, bos_arr, max_sl_val = compute_varlen_args(cu_seqlens)
-
-    benchmark(
-        lambda *a: triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(
-            *a, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val,
-        ),
-        lambda *a: triton_swiglu_bwd_bwd_fused_cat_inp_out(*a),
-        triton_args, ref_bench_args,
-    )
-
-    # ===== Chunk correctness =====
-    chunk_size = 2048
-    _, _, max_chunks = get_chunk_info(cu_seqlens, chunk_size, 0)
-
-    print()
-    print("=" * 60)
-    print(f"Chunk correctness (chunk_size={chunk_size})")
-    print("=" * 60)
-
-    for chunk_index in range(max_chunks):
-        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
+    # chunk correctness
+    _, _, max_chunks = get_chunk_info(cu, chunk_size, 0)
+    out_names = ["grad_dh", "grad_x0_x2", "grad_lr0", "grad_lr1", "grad_lr2", "dx0_x2", "hidden_lr1"]
+    print(f"\n  chunk correctness (chunk_size={chunk_size}):")
+    for ci in range(max_chunks):
+        chunk_cu, idx, _ = get_chunk_info(cu, chunk_size, ci)
         if len(idx) == 0:
             break
-        # Reference: gather chunk tokens, call base varlen kernel
         ref_out = triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(
             dh[idx], x0_x2[idx], lr0[idx], lr1[idx], lr2[idx], gdx[idx], gh[idx], chunk_cu,
         )
-        # Test: call chunk kernel on full buffer
         test_out = triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(
-            dh, x0_x2, lr0, lr1, lr2, gdx, gh, cu_seqlens,
-            chunk_size=chunk_size, chunk_idx=chunk_index,
+            dh, x0_x2, lr0, lr1, lr2, gdx, gh, cu,
+            chunk_size=chunk_size, chunk_idx=ci,
         )
-        # 7 outputs: grad_dh[T,D], grad_x0_x2[T,2D], grad_lr0[T], grad_lr1[T], grad_lr2[T], dx0_x2[T,2D], hidden_lr1[T,D]
-        names = ["grad_dh", "grad_x0_x2", "grad_lr0", "grad_lr1", "grad_lr2", "dx0_x2", "hidden_lr1"]
-        diffs = []
-        for name, t, r in zip(names, test_out, ref_out):
-            d = (t[idx] - r).abs().max().item()
-            diffs.append(d)
+        diffs = [(t[idx] - r).abs().max().item() for t, r in zip(test_out, ref_out)]
         max_d = max(diffs)
-        print(f"  chunk_idx={chunk_index}: max_diff={max_d:.2e}, n_tokens={len(idx)}")
-        # grad_lr outputs use atomic_add — ordering differs between chunk and full, so allow tolerance
-        assert max_d < 1e-4, f"chunk_idx={chunk_index} mismatch! diffs={dict(zip(names, diffs))}"
+        # grad_lr outputs use atomic_add — ordering differs, so allow tolerance
+        assert max_d < 1e-4, f"ci={ci} mismatch! {dict(zip(out_names, diffs))}"
+        print(f"    ci={ci}: max_diff={max_d:.2e} (n={len(idx)})")
+    print("✓ All correctness tests passed\n")
 
-    print("✓ PASS")
+    # ================================================================
+    #  BENCHMARKS
+    # ================================================================
+    def _pad_for_batched(cu, max_len, dh, x0_x2, lr0, lr1, lr2, gdx, gh):
+        """Pad varlen tensors to [G, feat, max_len] layout for the batched kernel."""
+        dh_p = _pack_to_padded(dh, cu, max_len).transpose(1, 2).contiguous()
+        x0_x2_p = _pack_to_padded(x0_x2, cu, max_len).transpose(1, 2).contiguous()
+        gdx_p = _pack_to_padded(gdx, cu, max_len).transpose(1, 2).contiguous()
+        gh_p = _pack_to_padded(gh, cu, max_len).transpose(1, 2).contiguous()
+        lr0_p = _pack_to_padded(lr0.unsqueeze(1), cu, max_len).squeeze(2).contiguous()
+        lr1_p = _pack_to_padded(lr1.unsqueeze(1), cu, max_len).squeeze(2).contiguous()
+        lr2_p = _pack_to_padded(lr2.unsqueeze(1), cu, max_len).squeeze(2).contiguous()
+        return dh_p, x0_x2_p, lr0_p, lr1_p, lr2_p, gdx_p, gh_p
+
+    print("=" * 72)
+    print(f"{'Config':<16} {'Triton ms':>10} {'Padded ms':>10} {'Speedup':>8}")
+    print("=" * 72)
+
+    for cfg_name, dl in BENCH_DOC_LENS.items():
+        cu = make_cu_seqlens(dl, device)
+        T = cu[-1].item()
+        G = len(dl)
+        max_len = max(dl)
+        eff, bos, msl = compute_varlen_args(cu)
+
+        dh = torch.randn(T, D, device=device, dtype=torch.bfloat16)
+        x0_x2 = torch.randn(T, 2 * D, device=device, dtype=torch.bfloat16)
+        lr0 = torch.randn(T, device=device, dtype=torch.float32) * 0.01
+        lr1 = torch.randn(T, device=device, dtype=torch.float32) * 0.01
+        lr2 = torch.randn(T, device=device, dtype=torch.float32) * 0.01
+        gdx = torch.randn(T, 2 * D, device=device, dtype=torch.bfloat16)
+        gh = torch.randn(T, D, device=device, dtype=torch.bfloat16)
+
+        padded_args = _pad_for_batched(cu, max_len, dh, x0_x2, lr0, lr1, lr2, gdx, gh)
+
+        r = benchmark(
+            lambda *a, _e=eff, _b=bos, _m=msl: triton_swiglu_bwd_bwd_fused_cat_inp_out_varlen(
+                *a, eff_lens=_e, bos_arr=_b, max_sl=_m),
+            lambda *a: triton_swiglu_bwd_bwd_fused_cat_inp_out(*a),
+            (dh, x0_x2, lr0, lr1, lr2, gdx, gh, cu), padded_args,
+            verbose=False,
+        )
+        print(f"{cfg_name:<16} {r['time_triton']:>10.4f} {r['time_ref']:>10.4f} {r['speedup']:>7.2f}x")
+
+    print("=" * 72)

@@ -26,67 +26,105 @@ _TORCH_TO_TL = {
 
 @triton.autotune(
     configs=[
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=4),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=4),
     ],
     key=["N", "K"],
 )
+@triton.heuristics({
+    'EVEN_K': lambda args: args['K'] % args['BLOCK_K'] == 0,
+    'EVEN_N': lambda args: args['N'] % args['BLOCK_N'] == 0,
+})
 @triton.jit
 def _grouped_gemm_to_packed_kernel(
     X_ptr, W_ptr, Y_ptr, eff_lens_ptr, bos_arr_ptr,
-    N, K,
+    max_sl, N, K,
     stride_x_t, stride_x_k,
     stride_w_g, stride_w_k, stride_w_n,  # "effective" strides: W viewed as [G, K, N]
     stride_y_t, stride_y_n,
     OUT_DTYPE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    EVEN_N: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)  # token tile within doc
-    pid_n = tl.program_id(1)  # output feature tile
-    pid_g = tl.program_id(2)  # doc / group
+    # L2 cache swizzle: group M-tiles so adjacent PIDs share X rows across N-tiles
+    pid = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    num_pid_m = tl.cdiv(max_sl, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
     doc_len = tl.load(eff_lens_ptr + pid_g).to(tl.int32)
-
     m_start = pid_m * BLOCK_M
     if m_start >= doc_len:
         return
 
     doc_start = tl.load(bos_arr_ptr + pid_g).to(tl.int64)
 
-    offs_m = m_start + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < doc_len
-    glob_m = doc_start + offs_m.to(tl.int64)
+    # Stride hints for compiler address optimization
+    tl.assume(stride_x_t > 0)
+    tl.assume(stride_x_k > 0)
+    tl.assume(stride_w_k > 0)
+    tl.assume(stride_w_n > 0)
+    tl.assume(stride_y_t > 0)
+    tl.assume(stride_y_n > 0)
 
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_n = offs_n < N
+    # Modulo wrapping: edge tiles wrap to valid positions, masked only at store
+    offs_m = (m_start + tl.arange(0, BLOCK_M)) % doc_len
+    glob_m = doc_start + offs_m.to(tl.int64)
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Initialize pointer blocks — advance through K loop
+    x_ptrs = X_ptr + glob_m[:, None] * stride_x_t + offs_k[None, :] * stride_x_k
+    w_base = W_ptr + pid_g.to(tl.int64) * stride_w_g
+    w_ptrs = w_base + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    w_base = W_ptr + pid_g.to(tl.int64) * stride_w_g
-    for k0 in range(0, K, BLOCK_K):
-        offs_k = k0 + tl.arange(0, BLOCK_K)
-        mask_k = offs_k < K
+    if EVEN_K:
+        # Fast path: K perfectly tiles — zero masking on all loads
+        for _ in range(0, K, BLOCK_K):
+            x = tl.load(x_ptrs)
+            w = tl.load(w_ptrs)
+            acc = tl.dot(x, w, acc)
+            x_ptrs += BLOCK_K * stride_x_k
+            w_ptrs += BLOCK_K * stride_w_k
+    else:
+        # General path: K masking needed
+        for k0 in range(0, K, BLOCK_K):
+            mask_k = (k0 + offs_k) < K
+            x = tl.load(x_ptrs, mask=mask_k[None, :], other=0.0)
+            w = tl.load(w_ptrs, mask=mask_k[:, None], other=0.0)
+            acc = tl.dot(x, w, acc)
+            x_ptrs += BLOCK_K * stride_x_k
+            w_ptrs += BLOCK_K * stride_w_k
 
-        x = tl.load(
-            X_ptr + glob_m[:, None] * stride_x_t + offs_k[None, :] * stride_x_k,
-            mask=mask_m[:, None] & mask_k[None, :],
-            other=0.0,
-        )
-        w = tl.load(
-            w_base + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n,
-            mask=mask_k[:, None] & mask_n[None, :],
-            other=0.0,
-        )
-        acc += tl.dot(x, w)
-
-    y_ptrs = Y_ptr + glob_m[:, None] * stride_y_t + offs_n[None, :] * stride_y_n
-    tl.store(y_ptrs, acc.to(OUT_DTYPE), mask=mask_m[:, None] & mask_n[None, :])
+    # Store: mask only on M (wrapping requires real offsets for store)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_mask = (offs_cm[:, None] < doc_len) & (offs_cn[None, :] < N)
+    y_ptrs = Y_ptr + (doc_start + offs_cm.to(tl.int64))[:, None] * stride_y_t + offs_cn[None, :] * stride_y_n
+    tl.store(y_ptrs, acc.to(OUT_DTYPE), mask=c_mask)
 
 
 def grouped_gemm_to_packed(
@@ -129,17 +167,17 @@ def grouped_gemm_to_packed(
         eff_lens, bos_arr, max_sl = compute_varlen_args(cu_seqlens, chunk_size, chunk_idx)
 
     grid = lambda META: (
-        triton.cdiv(max_sl, META["BLOCK_M"]),
-        triton.cdiv(N, META["BLOCK_N"]),
+        triton.cdiv(max_sl, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
         G,
     )
     _grouped_gemm_to_packed_kernel[grid](
         X, W, Y, eff_lens, bos_arr,
-        N, Kx,
+        max_sl, N, Kx,
         X.stride(0), X.stride(1),
         sw_g, sw_k, sw_n,
         Y.stride(0), Y.stride(1),
         OUT_DTYPE=_TORCH_TO_TL[X.dtype],
+        GROUP_SIZE_M=8,
     )
     return Y
 
@@ -154,16 +192,31 @@ def grouped_gemm_to_packed(
 
 @triton.autotune(
     configs=[
+        triton.Config({"BLOCK_M": 128, "BLOCK_K": 128, "BLOCK_T": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_K": 128, "BLOCK_T": 32}, num_warps=8, num_stages=4),
         triton.Config({"BLOCK_M": 128, "BLOCK_K": 128, "BLOCK_T": 32}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_K": 64, "BLOCK_T": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_K": 64, "BLOCK_T": 32}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_M": 128, "BLOCK_K": 64, "BLOCK_T": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_K": 128, "BLOCK_T": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_K": 128, "BLOCK_T": 32}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_M": 64, "BLOCK_K": 128, "BLOCK_T": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_T": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_T": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_T": 64}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_T": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 32, "BLOCK_K": 64, "BLOCK_T": 32}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 32, "BLOCK_K": 32, "BLOCK_T": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_T": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_T": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32, "BLOCK_K": 64, "BLOCK_T": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_K": 64, "BLOCK_T": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_K": 32, "BLOCK_T": 64}, num_warps=4, num_stages=4),
     ],
     key=["M", "K"],
+    reset_to_zero=["C_ptr"],
 )
+@triton.heuristics({
+    'EVEN_M': lambda args: args['M'] % args['BLOCK_M'] == 0,
+    'EVEN_K': lambda args: args['K'] % args['BLOCK_K'] == 0,
+})
 @triton.jit
 def _grouped_gemm_reduce_kernel(
     A_ptr, B_ptr, C_ptr, eff_lens_ptr, bos_arr_ptr,
@@ -171,51 +224,88 @@ def _grouped_gemm_reduce_kernel(
     stride_a_t, stride_a_m,
     stride_b_t, stride_b_k,
     stride_c_g, stride_c_m, stride_c_k,
+    num_groups,
+    SPLIT_K: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     pid_m = tl.program_id(0)  # A-feature tile
     pid_k = tl.program_id(1)  # B-feature tile
-    pid_g = tl.program_id(2)  # doc / group
+    pid_z = tl.program_id(2)  # doc * split_k
 
-    doc_len = tl.load(eff_lens_ptr + pid_g).to(tl.int32)
-    doc_start = tl.load(bos_arr_ptr + pid_g).to(tl.int64)
+    # Split-K: divide token loop across split_k blocks per group
+    pid_g = pid_z % num_groups
+    split_idx = pid_z // num_groups
+
+    full_doc_len = tl.load(eff_lens_ptr + pid_g).to(tl.int32)
+    full_doc_start = tl.load(bos_arr_ptr + pid_g).to(tl.int64)
+
+    tokens_per_split = tl.cdiv(full_doc_len, SPLIT_K)
+    t_start = split_idx * tokens_per_split
+    t_end = min(t_start + tokens_per_split, full_doc_len)
+    doc_len = t_end - t_start
+    doc_start = full_doc_start + t_start.to(tl.int64)
+
+    # Stride hints
+    tl.assume(stride_a_t > 0)
+    tl.assume(stride_a_m > 0)
+    tl.assume(stride_b_t > 0)
+    tl.assume(stride_b_k > 0)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask_m = offs_m < M
-    mask_k = offs_k < K
+    offs_t = tl.arange(0, BLOCK_T)
 
     acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
 
-    for t0 in range(0, doc_len, BLOCK_T):
-        offs_t = t0 + tl.arange(0, BLOCK_T)
-        mask_t = offs_t < doc_len
-        glob_t = doc_start + offs_t.to(tl.int64)
+    if EVEN_M and EVEN_K:
+        # Fast path: no M/K masking, pointer advancement, split token loop
+        glob_t_init = doc_start + offs_t.to(tl.int64)
+        a_ptrs = A_ptr + glob_t_init[None, :] * stride_a_t + offs_m[:, None] * stride_a_m
+        b_ptrs = B_ptr + glob_t_init[:, None] * stride_b_t + offs_k[None, :] * stride_b_k
 
-        # A transposed: load as [BLOCK_M, BLOCK_T] from A stored as [T, M]
-        a_T = tl.load(
-            A_ptr + glob_t[None, :] * stride_a_t + offs_m[:, None] * stride_a_m,
-            mask=mask_m[:, None] & mask_t[None, :],
-            other=0.0,
-        )
-        # B: [BLOCK_T, BLOCK_K]
-        b = tl.load(
-            B_ptr + glob_t[:, None] * stride_b_t + offs_k[None, :] * stride_b_k,
-            mask=mask_t[:, None] & mask_k[None, :],
-            other=0.0,
-        )
-        acc += tl.dot(a_T, b)
-
-    c_ptrs = (
-        C_ptr
-        + pid_g.to(tl.int64) * stride_c_g
-        + offs_m[:, None] * stride_c_m
-        + offs_k[None, :] * stride_c_k
-    )
-    tl.store(c_ptrs, acc.to(OUT_DTYPE), mask=mask_m[:, None] & mask_k[None, :])
+        n_full_t = (doc_len // BLOCK_T) * BLOCK_T
+        for _ in range(0, n_full_t, BLOCK_T):
+            a_T = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            acc = tl.dot(a_T, b, acc)
+            a_ptrs += BLOCK_T * stride_a_t
+            b_ptrs += BLOCK_T * stride_b_t
+        # Remainder token tile (at most one, with token masking)
+        if n_full_t < doc_len:
+            rem_mask = offs_t < (doc_len - n_full_t)
+            a_T = tl.load(a_ptrs, mask=rem_mask[None, :], other=0.0)
+            b = tl.load(b_ptrs, mask=rem_mask[:, None], other=0.0)
+            acc = tl.dot(a_T, b, acc)
+        c_ptrs = (C_ptr + pid_g.to(tl.int64) * stride_c_g
+                  + offs_m[:, None] * stride_c_m + offs_k[None, :] * stride_c_k)
+        if SPLIT_K > 1:
+            tl.atomic_add(c_ptrs, acc.to(tl.float32))
+        else:
+            tl.store(c_ptrs, acc.to(OUT_DTYPE))
+    else:
+        # General path: full masking
+        mask_m = offs_m < M
+        mask_k = offs_k < K
+        for t0 in range(0, doc_len, BLOCK_T):
+            cur_offs_t = t0 + offs_t
+            mask_t = cur_offs_t < doc_len
+            glob_t = doc_start + cur_offs_t.to(tl.int64)
+            a_T = tl.load(A_ptr + glob_t[None, :] * stride_a_t + offs_m[:, None] * stride_a_m,
+                          mask=mask_m[:, None] & mask_t[None, :], other=0.0)
+            b = tl.load(B_ptr + glob_t[:, None] * stride_b_t + offs_k[None, :] * stride_b_k,
+                        mask=mask_t[:, None] & mask_k[None, :], other=0.0)
+            acc = tl.dot(a_T, b, acc)
+        c_ptrs = (C_ptr + pid_g.to(tl.int64) * stride_c_g
+                  + offs_m[:, None] * stride_c_m + offs_k[None, :] * stride_c_k)
+        if SPLIT_K > 1:
+            tl.atomic_add(c_ptrs, acc.to(tl.float32), mask=mask_m[:, None] & mask_k[None, :])
+        else:
+            tl.store(c_ptrs, acc.to(OUT_DTYPE), mask=mask_m[:, None] & mask_k[None, :])
 
 
 def grouped_gemm_reduce(
@@ -242,15 +332,27 @@ def grouped_gemm_reduce(
     _, K = B.shape
     G = cu_seqlens.shape[0] - 1
 
-    C = torch.empty(G, M, K, device=A.device, dtype=A.dtype)
-
     if eff_lens is None:
         eff_lens, bos_arr, max_sl = compute_varlen_args(cu_seqlens, chunk_size, chunk_idx)
+
+    # Split-K: increase parallelism only when severely underutilizing SMs
+    grid_tiles = triton.cdiv(M, 64) * triton.cdiv(K, 64) * G
+    split_k = 1
+    if grid_tiles < 200:
+        split_k = min(8, max(1, 512 // grid_tiles))
+        while split_k > 1 and max_sl // split_k < 128:
+            split_k //= 2
+
+    # split_k > 1: float32 output + atomic_add (reset_to_zero handles autotune)
+    if split_k > 1:
+        C = torch.zeros(G, M, K, device=A.device, dtype=torch.float32)
+    else:
+        C = torch.empty(G, M, K, device=A.device, dtype=A.dtype)
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]),
         triton.cdiv(K, META["BLOCK_K"]),
-        G,
+        G * split_k,
     )
     _grouped_gemm_reduce_kernel[grid](
         A, B, C, eff_lens, bos_arr,
@@ -258,8 +360,11 @@ def grouped_gemm_reduce(
         A.stride(0), A.stride(1),
         B.stride(0), B.stride(1),
         C.stride(0), C.stride(1), C.stride(2),
+        G, SPLIT_K=split_k,
         OUT_DTYPE=_TORCH_TO_TL[A.dtype],
     )
+    if split_k > 1:
+        return C.to(A.dtype)
     return C
 
 
@@ -324,7 +429,11 @@ def ref_grouped_gemm_reduce(A, B, cu_seqlens):
 
 if __name__ == "__main__":
     import argparse
-    from kernel_test_utils import test_correctness, benchmark, get_chunk_info
+    from kernel_test_utils import (
+        test_correctness, benchmark, get_chunk_info,
+        BENCH_DOC_LENS, make_cu_seqlens,
+    )
+    from utils import compute_varlen_args
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
@@ -333,139 +442,99 @@ if __name__ == "__main__":
 
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
     device = "cuda"
-
-    num_docs = 4
-    doc_lens = [4096, 3072, 2048, 1024]
     d, dh = 512, 512
-    cu_seqlens = torch.tensor(
-        [0] + list(torch.cumsum(torch.tensor(doc_lens), 0).tolist()),
-        dtype=torch.int32, device=device,
-    )
-    packed_len = cu_seqlens[-1].item()
     tol = dict(atol=1e-2, rtol=1e-2) if dtype == torch.bfloat16 else dict(atol=1e-4, rtol=1e-4)
 
-    print(f"Config: {num_docs=}, {doc_lens=}, {d=}, {dh=}, {dtype=}, {packed_len=}")
-    print()
-
-    # ===== Test 1: grouped_gemm_to_packed (X @ W) =====
-    print("=" * 60)
-    print("Test 1: grouped_gemm_to_packed  X @ W")
-    print("=" * 60)
-
-    X = torch.randn(packed_len, d, device=device, dtype=dtype)
-    W = torch.randn(num_docs, d, dh, device=device, dtype=dtype)
-
-    max_len = max(doc_lens)
-    X_pad = _pack_to_padded(X, cu_seqlens, max_len)
-
-    try:
-        from utils import compute_varlen_args
-    except ImportError:
-        from .utils import compute_varlen_args
-    eff_lens, bos_arr, max_sl_val = compute_varlen_args(cu_seqlens)
-
-    test_correctness(
-        grouped_gemm_to_packed, ref_grouped_gemm_to_packed,
-        (X, W, cu_seqlens), (X, W, cu_seqlens),
-        debug=args.debug, **tol,
-    )
-    benchmark(
-        lambda *a: grouped_gemm_to_packed(*a, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val),
-        lambda X_pad, W: torch.bmm(X_pad, W),
-        (X, W, cu_seqlens), (X_pad, W),
-    )
-
-    # ===== Test 2: grouped_gemm_to_packed (X @ W.T) =====
-    print()
-    print("=" * 60)
-    print("Test 2: grouped_gemm_to_packed  X @ W.T  (trans_W=True)")
-    print("=" * 60)
-
-    Wt = torch.randn(num_docs, dh, d, device=device, dtype=dtype)
-
-    test_correctness(
-        lambda *a: grouped_gemm_to_packed(*a, trans_W=True),
-        lambda *a: ref_grouped_gemm_to_packed(*a, trans_W=True),
-        (X, Wt, cu_seqlens), (X, Wt, cu_seqlens),
-        debug=args.debug, **tol,
-    )
-    benchmark(
-        lambda *a: grouped_gemm_to_packed(*a, trans_W=True, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val),
-        lambda X_pad, Wt: torch.bmm(X_pad, Wt.transpose(1, 2)),
-        (X, Wt, cu_seqlens), (X_pad, Wt),
-    )
-
-    # ===== Test 3: grouped_gemm_reduce (A.T @ B) =====
-    print()
-    print("=" * 60)
-    print("Test 3: grouped_gemm_reduce  A.T @ B")
-    print("=" * 60)
-
-    A = torch.randn(packed_len, 2 * dh, device=device, dtype=dtype)
-    B = torch.randn(packed_len, d, device=device, dtype=dtype)
-
-    A_pad = _pack_to_padded(A, cu_seqlens, max_len)
-    B_pad = _pack_to_padded(B, cu_seqlens, max_len)
-
-    test_correctness(
-        grouped_gemm_reduce, ref_grouped_gemm_reduce,
-        (A, B, cu_seqlens), (A, B, cu_seqlens),
-        debug=args.debug, **tol,
-    )
-    benchmark(
-        lambda *a: grouped_gemm_reduce(*a, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val),
-        lambda A_pad, B_pad: torch.bmm(A_pad.transpose(1, 2), B_pad),
-        (A, B, cu_seqlens), (A_pad, B_pad),
-    )
-
-    # ===== Test 4: chunk correctness for grouped_gemm_to_packed =====
+    # ================================================================
+    #  CORRECTNESS  (use varied-size config that exercises edge cases)
+    # ================================================================
+    doc_lens = [4096, 3072, 2048, 1024]
+    cu = make_cu_seqlens(doc_lens, device)
+    T = cu[-1].item()
+    G = len(doc_lens)
     chunk_size = 2048
-    _, _, max_chunks = get_chunk_info(cu_seqlens, chunk_size, 0)
 
-    print()
-    print("=" * 60)
-    print(f"Test 4: grouped_gemm_to_packed chunk correctness (chunk_size={chunk_size})")
-    print("=" * 60)
+    X = torch.randn(T, d, device=device, dtype=dtype)
+    W = torch.randn(G, d, dh, device=device, dtype=dtype)
+    Wt = torch.randn(G, dh, d, device=device, dtype=dtype)
+    A = torch.randn(T, 2 * dh, device=device, dtype=dtype)
+    B = torch.randn(T, d, device=device, dtype=dtype)
 
-    for chunk_index in range(max_chunks):
-        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
+    print(f"Correctness: doc_lens={doc_lens}, {d=}, {dh=}, {dtype=}")
+
+    # varlen correctness
+    for name, tri_fn, ref_fn, tri_a, ref_a in [
+        ("to_packed  X@W",     grouped_gemm_to_packed, ref_grouped_gemm_to_packed, (X, W, cu), (X, W, cu)),
+        ("to_packed  X@W.T",
+         lambda *a: grouped_gemm_to_packed(*a, trans_W=True),
+         lambda *a: ref_grouped_gemm_to_packed(*a, trans_W=True),
+         (X, Wt, cu), (X, Wt, cu)),
+        ("reduce     A.T@B",   grouped_gemm_reduce, ref_grouped_gemm_reduce, (A, B, cu), (A, B, cu)),
+    ]:
+        print(f"\n  {name}: ", end="")
+        ok = test_correctness(tri_fn, ref_fn, tri_a, ref_a, debug=args.debug, **tol)
+        assert ok, f"{name} failed!"
+
+    # chunk correctness
+    _, _, max_chunks = get_chunk_info(cu, chunk_size, 0)
+    print(f"\n  chunk correctness (chunk_size={chunk_size}):")
+    for ci in range(max_chunks):
+        chunk_cu, idx, _ = get_chunk_info(cu, chunk_size, ci)
         if len(idx) == 0:
             break
-        # Reference: gather chunk tokens, call base varlen kernel
-        ref_out = grouped_gemm_to_packed(X[idx], W, chunk_cu)
-        # Test: call chunk kernel on full buffer
-        test_out = grouped_gemm_to_packed(X, W, cu_seqlens, chunk_size=chunk_size, chunk_idx=chunk_index)
-        diff = (test_out[idx] - ref_out).abs().max().item()
-        print(f"  chunk_idx={chunk_index}: max_diff={diff:.2e}, n_tokens={len(idx)}")
-        assert diff == 0.0, f"chunk_idx={chunk_index} not exact match!"
+        for label, fn, kw, gather_input in [
+            ("to_packed",      grouped_gemm_to_packed, {},                [X, W]),
+            ("to_packed transW", grouped_gemm_to_packed, {"trans_W": True}, [X, Wt]),
+            ("reduce",         grouped_gemm_reduce,     {},                [A, B]),
+        ]:
+            is_reduce = "reduce" in label
+            ref_inputs = [t[idx] for t in gather_input] if is_reduce else [gather_input[0][idx], gather_input[1]]
+            ref_out = fn(*ref_inputs, chunk_cu, **kw)
+            test_out = fn(*gather_input, cu, chunk_size=chunk_size, chunk_idx=ci, **kw)
+            compare = test_out - ref_out if is_reduce else test_out[idx] - ref_out
+            diff = compare.abs().max().item()
+            assert diff == 0.0, f"{label} ci={ci} diff={diff}"
+        print(f"    ci={ci}: exact match (n={len(idx)})")
+    print("✓ All correctness tests passed\n")
 
-    # Also test trans_W
-    for chunk_index in range(max_chunks):
-        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
-        if len(idx) == 0:
-            break
-        ref_out = grouped_gemm_to_packed(X[idx], Wt, chunk_cu, trans_W=True)
-        test_out = grouped_gemm_to_packed(X, Wt, cu_seqlens, chunk_size=chunk_size, chunk_idx=chunk_index, trans_W=True)
-        diff = (test_out[idx] - ref_out).abs().max().item()
-        print(f"  chunk_idx={chunk_index} (trans_W): max_diff={diff:.2e}, n_tokens={len(idx)}")
-        assert diff == 0.0, f"chunk_idx={chunk_index} trans_W not exact match!"
+    # ================================================================
+    #  BENCHMARKS  (4 configurations)
+    # ================================================================
+    print("=" * 72)
+    print(f"{'Config':<16} {'Kernel':<20} {'Triton ms':>10} {'cuBLAS ms':>10} {'Speedup':>8}")
+    print("=" * 72)
 
-    print("✓ PASS (exact match)")
+    for cfg_name, dl in BENCH_DOC_LENS.items():
+        cu = make_cu_seqlens(dl, device)
+        T = cu[-1].item()
+        G = len(dl)
+        max_len = max(dl)
+        eff, bos, msl = compute_varlen_args(cu)
 
-    # ===== Test 5: chunk correctness for grouped_gemm_reduce =====
-    print()
-    print("=" * 60)
-    print(f"Test 5: grouped_gemm_reduce chunk correctness (chunk_size={chunk_size})")
-    print("=" * 60)
+        X = torch.randn(T, d, device=device, dtype=dtype)
+        W = torch.randn(G, d, dh, device=device, dtype=dtype)
+        Wt = torch.randn(G, dh, d, device=device, dtype=dtype)
+        A = torch.randn(T, 2 * dh, device=device, dtype=dtype)
+        B = torch.randn(T, d, device=device, dtype=dtype)
+        X_pad = _pack_to_padded(X, cu, max_len)
+        A_pad = _pack_to_padded(A, cu, max_len)
+        B_pad = _pack_to_padded(B, cu, max_len)
 
-    for chunk_index in range(max_chunks):
-        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
-        if len(idx) == 0:
-            break
-        ref_out = grouped_gemm_reduce(A[idx], B[idx], chunk_cu)
-        test_out = grouped_gemm_reduce(A, B, cu_seqlens, chunk_size=chunk_size, chunk_idx=chunk_index)
-        diff = (test_out - ref_out).abs().max().item()
-        print(f"  chunk_idx={chunk_index}: max_diff={diff:.2e}, n_tokens={len(idx)}")
-        assert diff == 0.0, f"chunk_idx={chunk_index} not exact match!"
+        for kernel_name, tri_fn, ref_fn, tri_a, ref_a in [
+            ("to_packed X@W",
+             lambda *a, _e=eff, _b=bos, _m=msl: grouped_gemm_to_packed(*a, eff_lens=_e, bos_arr=_b, max_sl=_m),
+             lambda Xp, W: torch.bmm(Xp, W),
+             (X, W, cu), (X_pad, W)),
+            ("to_packed X@W.T",
+             lambda *a, _e=eff, _b=bos, _m=msl: grouped_gemm_to_packed(*a, trans_W=True, eff_lens=_e, bos_arr=_b, max_sl=_m),
+             lambda Xp, Wt: torch.bmm(Xp, Wt.transpose(1, 2)),
+             (X, Wt, cu), (X_pad, Wt)),
+            ("reduce A.T@B",
+             lambda *a, _e=eff, _b=bos, _m=msl: grouped_gemm_reduce(*a, eff_lens=_e, bos_arr=_b, max_sl=_m),
+             lambda Ap, Bp: torch.bmm(Ap.transpose(1, 2), Bp),
+             (A, B, cu), (A_pad, B_pad)),
+        ]:
+            r = benchmark(tri_fn, ref_fn, tri_a, ref_a, verbose=False)
+            print(f"{cfg_name:<16} {kernel_name:<20} {r['time_triton']:>10.4f} {r['time_ref']:>10.4f} {r['speedup']:>7.2f}x")
 
-    print("✓ PASS (exact match)")
+        print("-" * 72)

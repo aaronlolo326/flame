@@ -25,19 +25,20 @@ from .ttt_operation import (
     l2_norm,
 )
 
+
 # from .ttt_operation_fused_kernel import (
 #     postnorm_block_causal_lact_swiglu_fused_kernel_triton,
-#     prenorm_block_causal_lact_swiglu_fused_kernel_triton,
+#     prenorm_block_causal_lact_swiglu_fused_kernel_triton as prenorm_fused_single,
 # )
 
 # from .ttt_operation_fused_kernel_padded import (
-#     postnorm_block_causal_lact_swiglu_fused_kernel_triton,
-#     prenorm_block_causal_lact_swiglu_fused_kernel_triton,
+    # postnorm_block_causal_lact_swiglu_fused_kernel_triton,
+#     prenorm_block_causal_lact_swiglu_fused_kernel_triton as prenorm_fused_padded
 # )
 
 from .ttt_operation_fused_kernel_varlen import (
     postnorm_block_causal_lact_swiglu_fused_kernel_triton,
-    prenorm_block_causal_lact_swiglu_fused_kernel_triton,
+    prenorm_block_causal_lact_swiglu_fused_kernel_triton as prenorm_fused_varlen,
 )
 
 try:
@@ -518,21 +519,59 @@ class LaCTSWIGLULayer(nn.Module):
                 # pre-norm version of ttt.   state = state + f(norm(state))
                 if self.use_fused_kernel:
                   with profile_range("prenorm_fused"):
-                    fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
-                        fw_w0,
-                        fw_w1,
-                        fw_w2,
-                        fast_q,
-                        fast_k,
-                        fast_v,
-                        fw_lr1,
-                        fw_lr2,
-                        fw_lr3,
+                    # num_docs = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else 1
+                    # if num_docs == 1:
+                    #     fw_x = prenorm_fused_single(
+                    #         fw_w0, fw_w1, fw_w2,
+                    #         fast_q, fast_k, fast_v,
+                    #         fw_lr1, fw_lr2, fw_lr3,
+                    #         chunk_size=self.lact_chunk_size,
+                    #         use_muon=self.use_muon,
+                    #         momentum=momentum,
+                    #     )
+                    # elif False and num_docs < 8:
+                    #     fw_x = prenorm_fused_padded(
+                    #         fw_w0, fw_w1, fw_w2,
+                    #         fast_q, fast_k, fast_v,
+                    #         fw_lr1, fw_lr2, fw_lr3,
+                    #         chunk_size=self.lact_chunk_size,
+                    #         use_muon=self.use_muon,
+                    #         momentum=momentum,
+                    #         cu_seqlens=cu_seqlens,
+                    #     )
+                    # else:
+                    #     fw_x = prenorm_fused_varlen(
+                    #         fw_w0, fw_w1, fw_w2,
+                    #         fast_q, fast_k, fast_v,
+                    #         fw_lr1, fw_lr2, fw_lr3,
+                    #         chunk_size=self.lact_chunk_size,
+                    #         use_muon=self.use_muon,
+                    #         momentum=momentum,
+                    #         cu_seqlens=cu_seqlens,
+                    #     )
+
+                    # with torch.no_grad():
+                    #     fw_x_padded = prenorm_fused_padded(
+                    #         fw_w0, fw_w1, fw_w2,
+                    #         fast_q, fast_k, fast_v,
+                    #         fw_lr1, fw_lr2, fw_lr3,
+                    #         chunk_size=self.lact_chunk_size,
+                    #         use_muon=self.use_muon,
+                    #         momentum=momentum,
+                    #         cu_seqlens=cu_seqlens,
+                    #     )
+                    fw_x = prenorm_fused_varlen(
+                        fw_w0, fw_w1, fw_w2,
+                        fast_q, fast_k, fast_v,
+                        fw_lr1, fw_lr2, fw_lr3,
                         chunk_size=self.lact_chunk_size,
                         use_muon=self.use_muon,
                         momentum=momentum,
                         cu_seqlens=cu_seqlens,
                     )
+                    # diff = (fw_x - fw_x_padded).abs()
+                    # print(f"varlen vs padded: mean={diff.mean().item():.2e} max={diff.max().item():.2e}")
+
                 else:
                   with profile_range("prenorm"):
                     fw_x = prenorm_block_causal_lact_swiglu(

@@ -1009,129 +1009,108 @@ def _reference_wT_x_varlen_padded(W0, X0, W1, X1, cu_seqlens):
 
 if __name__ == "__main__":
     import argparse
-    from kernel_test_utils import test_correctness, benchmark, get_chunk_info
+    from kernel_test_utils import (
+        test_correctness, benchmark, get_chunk_info,
+        BENCH_DOC_LENS, make_cu_seqlens,
+    )
+    from grouped_gemm import _pack_to_padded
+    from utils import compute_varlen_args
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     device = "cuda"
-    num_docs = 4
-    doc_lens = [4096, 3072, 2048, 1024]
     K, N = 512, 256
-    cu_seqlens = torch.tensor(
-        [0] + list(torch.cumsum(torch.tensor(doc_lens), 0).tolist()),
-        dtype=torch.int32, device=device,
-    )
-    T = cu_seqlens[-1].item()
+    tol = dict(atol=1e-2, rtol=1e-2)
+
+    # ================================================================
+    #  CORRECTNESS
+    # ================================================================
+    doc_lens = [4096, 3072, 2048, 1024]
+    cu = make_cu_seqlens(doc_lens, device)
+    T = cu[-1].item()
+    G = len(doc_lens)
+    chunk_size = 2048
 
     W0 = torch.randn(T, K, device=device, dtype=torch.bfloat16)
     W1 = torch.randn(T, K, device=device, dtype=torch.bfloat16)
+    X0T = torch.randn(G, N, K, device=device, dtype=torch.bfloat16)
+    X1T = torch.randn(G, N, K, device=device, dtype=torch.bfloat16)
+    X0 = torch.randn(G, K, N, device=device, dtype=torch.bfloat16)
+    X1 = torch.randn(G, K, N, device=device, dtype=torch.bfloat16)
 
-    print(f"Config: {num_docs=}, {doc_lens=}, {K=}, {N=}, {T=}")
-    print()
+    print(f"Correctness: doc_lens={doc_lens}, {K=}, {N=}")
 
-    # ===== wT_xT varlen =====
-    X0T = torch.randn(num_docs, N, K, device=device, dtype=torch.bfloat16)
-    X1T = torch.randn(num_docs, N, K, device=device, dtype=torch.bfloat16)
+    # varlen vs padded
+    for name, tri_fn, ref_fn, tri_a, ref_a in [
+        ("wT_xT varlen",
+         fused_two_mm_same_out_wT_xT_varlen_triton,
+         _reference_wT_xT_varlen_padded,
+         (W0, X0T, W1, X1T, cu), (W0, X0T, W1, X1T, cu)),
+        ("wT_x  varlen",
+         fused_two_mm_same_out_wT_x_varlen_triton,
+         _reference_wT_x_varlen_padded,
+         (W0, X0, W1, X1, cu), (W0, X0, W1, X1, cu)),
+    ]:
+        print(f"\n  {name}: ", end="")
+        ok = test_correctness(tri_fn, ref_fn, tri_a, ref_a, debug=args.debug, **tol)
+        assert ok, f"{name} failed!"
 
-    print("=" * 60)
-    print("fused_two_mm_wT_xT varlen correctness vs padded batched")
-    print("=" * 60)
-
-    from grouped_gemm import _pack_to_padded
-    max_len = max(doc_lens)
-
-    # Pre-pad W for fair benchmark: [T, K] -> [G, K, max_len]
-    W0_pad = _pack_to_padded(W0, cu_seqlens, max_len).transpose(1, 2).contiguous()
-    W1_pad = _pack_to_padded(W1, cu_seqlens, max_len).transpose(1, 2).contiguous()
-
-    test_correctness(
-        lambda *a: fused_two_mm_same_out_wT_xT_varlen_triton(*a),
-        lambda *a: _reference_wT_xT_varlen_padded(*a),
-        (W0, X0T, W1, X1T, cu_seqlens),
-        (W0, X0T, W1, X1T, cu_seqlens),
-        debug=args.debug, atol=1e-2, rtol=1e-2,
-    )
-
-    try:
-        from utils import compute_varlen_args
-    except ImportError:
-        from .utils import compute_varlen_args
-    eff_lens, bos_arr, max_sl_val = compute_varlen_args(cu_seqlens)
-
-    benchmark(
-        lambda *a: fused_two_mm_same_out_wT_xT_varlen_triton(
-            *a, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val,
-        ),
-        lambda W0p, X0T, W1p, X1T: fused_two_mm_same_out_wT_xT_triton(W0p, X0T, W1p, X1T),
-        (W0, X0T, W1, X1T, cu_seqlens),
-        (W0_pad, X0T, W1_pad, X1T),
-    )
-
-    # ===== wT_x varlen =====
-    X0 = torch.randn(num_docs, K, N, device=device, dtype=torch.bfloat16)
-    X1 = torch.randn(num_docs, K, N, device=device, dtype=torch.bfloat16)
-
-    print()
-    print("=" * 60)
-    print("fused_two_mm_wT_x varlen correctness vs padded batched")
-    print("=" * 60)
-
-    test_correctness(
-        lambda *a: fused_two_mm_same_out_wT_x_varlen_triton(*a),
-        lambda *a: _reference_wT_x_varlen_padded(*a),
-        (W0, X0, W1, X1, cu_seqlens),
-        (W0, X0, W1, X1, cu_seqlens),
-        debug=args.debug, atol=1e-2, rtol=1e-2,
-    )
-
-    benchmark(
-        lambda *a: fused_two_mm_same_out_wT_x_varlen_triton(
-            *a, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val,
-        ),
-        lambda W0p, X0, W1p, X1: fused_two_mm_same_out_wT_x_triton(W0p, X0, W1p, X1),
-        (W0, X0, W1, X1, cu_seqlens),
-        (W0_pad, X0, W1_pad, X1),
-    )
-
-    # ===== Chunk correctness: wT_xT =====
-    chunk_size = 2048
-    _, _, max_chunks = get_chunk_info(cu_seqlens, chunk_size, 0)
-
-    print()
-    print("=" * 60)
-    print(f"wT_xT chunk correctness (chunk_size={chunk_size})")
-    print("=" * 60)
-
-    for chunk_index in range(max_chunks):
-        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
+    # chunk correctness
+    _, _, max_chunks = get_chunk_info(cu, chunk_size, 0)
+    print(f"\n  chunk correctness (chunk_size={chunk_size}):")
+    for ci in range(max_chunks):
+        chunk_cu, idx, _ = get_chunk_info(cu, chunk_size, ci)
         if len(idx) == 0:
             break
-        # Reference: gather chunk tokens from W (packed), X is per-doc (unchanged)
-        ref_out = fused_two_mm_same_out_wT_xT_varlen_triton(W0[idx], X0T, W1[idx], X1T, chunk_cu)
-        # Test: call chunk kernel on full buffer
-        test_out = fused_two_mm_same_out_wT_xT_varlen_triton(W0, X0T, W1, X1T, cu_seqlens, chunk_size=chunk_size, chunk_idx=chunk_index)
-        diff = (test_out[idx] - ref_out).abs().max().item()
-        print(f"  chunk_idx={chunk_index}: max_diff={diff:.2e}, n_tokens={len(idx)}")
-        assert diff == 0.0, f"chunk_idx={chunk_index} not exact match!"
+        for label, fn, extra in [
+            ("wT_xT", fused_two_mm_same_out_wT_xT_varlen_triton, (X0T, W1, X1T)),
+            ("wT_x",  fused_two_mm_same_out_wT_x_varlen_triton,  (X0, W1, X1)),
+        ]:
+            ref_out = fn(W0[idx], extra[0], extra[1][idx], extra[2], chunk_cu)
+            test_out = fn(W0, extra[0], W1, extra[2], cu, chunk_size=chunk_size, chunk_idx=ci)
+            diff = (test_out[idx] - ref_out).abs().max().item()
+            assert diff == 0.0, f"{label} ci={ci} diff={diff}"
+        print(f"    ci={ci}: exact match (n={len(idx)})")
+    print("✓ All correctness tests passed\n")
 
-    print("✓ PASS (exact match)")
+    # ================================================================
+    #  BENCHMARKS
+    # ================================================================
+    print("=" * 72)
+    print(f"{'Config':<16} {'Kernel':<12} {'Triton ms':>10} {'Padded ms':>10} {'Speedup':>8}")
+    print("=" * 72)
 
-    # ===== Chunk correctness: wT_x =====
-    print()
-    print("=" * 60)
-    print(f"wT_x chunk correctness (chunk_size={chunk_size})")
-    print("=" * 60)
+    for cfg_name, dl in BENCH_DOC_LENS.items():
+        cu = make_cu_seqlens(dl, device)
+        T = cu[-1].item()
+        G = len(dl)
+        max_len = max(dl)
+        eff, bos, msl = compute_varlen_args(cu)
 
-    for chunk_index in range(max_chunks):
-        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
-        if len(idx) == 0:
-            break
-        ref_out = fused_two_mm_same_out_wT_x_varlen_triton(W0[idx], X0, W1[idx], X1, chunk_cu)
-        test_out = fused_two_mm_same_out_wT_x_varlen_triton(W0, X0, W1, X1, cu_seqlens, chunk_size=chunk_size, chunk_idx=chunk_index)
-        diff = (test_out[idx] - ref_out).abs().max().item()
-        print(f"  chunk_idx={chunk_index}: max_diff={diff:.2e}, n_tokens={len(idx)}")
-        assert diff == 0.0, f"chunk_idx={chunk_index} not exact match!"
+        W0 = torch.randn(T, K, device=device, dtype=torch.bfloat16)
+        W1 = torch.randn(T, K, device=device, dtype=torch.bfloat16)
+        X0T = torch.randn(G, N, K, device=device, dtype=torch.bfloat16)
+        X1T = torch.randn(G, N, K, device=device, dtype=torch.bfloat16)
+        X0 = torch.randn(G, K, N, device=device, dtype=torch.bfloat16)
+        X1 = torch.randn(G, K, N, device=device, dtype=torch.bfloat16)
+        W0_pad = _pack_to_padded(W0, cu, max_len).transpose(1, 2).contiguous()
+        W1_pad = _pack_to_padded(W1, cu, max_len).transpose(1, 2).contiguous()
 
-    print("✓ PASS (exact match)")
+        for kernel_name, tri_fn, ref_fn, tri_a, ref_a in [
+            ("wT_xT",
+             lambda *a, _e=eff, _b=bos, _m=msl: fused_two_mm_same_out_wT_xT_varlen_triton(
+                 *a, eff_lens=_e, bos_arr=_b, max_sl=_m),
+             lambda W0p, X0T, W1p, X1T: fused_two_mm_same_out_wT_xT_triton(W0p, X0T, W1p, X1T),
+             (W0, X0T, W1, X1T, cu), (W0_pad, X0T, W1_pad, X1T)),
+            ("wT_x",
+             lambda *a, _e=eff, _b=bos, _m=msl: fused_two_mm_same_out_wT_x_varlen_triton(
+                 *a, eff_lens=_e, bos_arr=_b, max_sl=_m),
+             lambda W0p, X0, W1p, X1: fused_two_mm_same_out_wT_x_triton(W0p, X0, W1p, X1),
+             (W0, X0, W1, X1, cu), (W0_pad, X0, W1_pad, X1)),
+        ]:
+            r = benchmark(tri_fn, ref_fn, tri_a, ref_a, verbose=False)
+            print(f"{cfg_name:<16} {kernel_name:<12} {r['time_triton']:>10.4f} {r['time_ref']:>10.4f} {r['speedup']:>7.2f}x")
+
+        print("-" * 72)

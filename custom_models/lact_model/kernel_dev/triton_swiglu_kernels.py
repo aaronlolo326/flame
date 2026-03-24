@@ -95,8 +95,13 @@ def _fused_two_mm_swiglu_kernel(
         x_base = X + pid_b * stride_x_b
 
     # Accumulators in fp32
-    acc0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if IS_VARLEN:
+        # Accumulate as [BLOCK_N, BLOCK_M] to match [T, M] output — no transpose on store
+        acc0 = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    else:
+        acc0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     # K loop
     for k0 in range(0, K, BLOCK_K):
@@ -121,22 +126,25 @@ def _fused_two_mm_swiglu_kernel(
         w2 = tl.load(w2_ptrs, mask=w_mask, other=0).to(tl.bfloat16)
         x = tl.load(x_ptrs, mask=x_mask, other=0).to(tl.bfloat16)  # (BLOCK_N, BLOCK_K)
 
-        # (M,K) x (K,N): we trans(x) to (BLOCK_K, BLOCK_N)
-        acc0 += tl.dot(w0, tl.trans(x), out_dtype=tl.float32)
-        acc2 += tl.dot(w2, tl.trans(x), out_dtype=tl.float32)
+        if IS_VARLEN:
+            # (N,K) x (K,M): x @ w^T -> [BLOCK_N, BLOCK_M]
+            acc0 += tl.dot(x, tl.trans(w0), out_dtype=tl.float32)
+            acc2 += tl.dot(x, tl.trans(w2), out_dtype=tl.float32)
+        else:
+            # (M,K) x (K,N): w @ x^T -> [BLOCK_M, BLOCK_N]
+            acc0 += tl.dot(w0, tl.trans(x), out_dtype=tl.float32)
+            acc2 += tl.dot(w2, tl.trans(x), out_dtype=tl.float32)
 
     # Apply SiLU in fp32 and fuse multiply
-    y0 = acc0  # fp32
-    y2 = acc2  # fp32
     # SiLU(x) = x * sigmoid(x)
-    out = y2 * (y0 * tl.sigmoid(y0))
+    out = acc2 * (acc0 * tl.sigmoid(acc0))
 
     # Store to bf16
     if IS_VARLEN:
-        # result is [BLOCK_M, BLOCK_N], output is [T, M] — store transposed
+        # out is [BLOCK_N, BLOCK_M], output is [T, M] — direct store
         glob_n = bos + offs_n.to(tl.int64)
         o_ptrs = O + glob_n[:, None] * stride_o_n + offs_m[None, :] * stride_o_m
-        tl.store(o_ptrs, tl.trans(out).to(tl.bfloat16), mask=mask_n[:, None] & mask_m[None, :])
+        tl.store(o_ptrs, out.to(tl.bfloat16), mask=mask_n[:, None] & mask_m[None, :])
     else:
         o_batch = O + pid_b * stride_o_b
         o_ptrs = o_batch + (offs_m[:, None] * stride_o_m) + (offs_n[None, :] * stride_o_n)
@@ -303,82 +311,82 @@ def _reference_varlen_padded(W0_W2, X, cu_seqlens):
 
 if __name__ == "__main__":
     import argparse
-    from kernel_test_utils import test_correctness, benchmark, get_chunk_info
+    from kernel_test_utils import (
+        test_correctness, benchmark, get_chunk_info,
+        BENCH_DOC_LENS, make_cu_seqlens,
+    )
+    from grouped_gemm import _pack_to_padded
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     device = "cuda"
-    num_docs = 4
-    doc_lens = [4096, 3072, 2048, 1024]
     d, dh = 512, 512
-    cu_seqlens = torch.tensor(
-        [0] + list(torch.cumsum(torch.tensor(doc_lens), 0).tolist()),
-        dtype=torch.int32, device=device,
-    )
-    packed_len = cu_seqlens[-1].item()
+    tol = dict(atol=1e-2, rtol=1e-2)
 
-    W0_W2 = torch.randn(num_docs, 2 * dh, d, device=device, dtype=torch.bfloat16)
-    X = torch.randn(packed_len, d, device=device, dtype=torch.bfloat16)
-
-    print(f"Config: {num_docs=}, {doc_lens=}, {d=}, {dh=}, {packed_len=}")
-    print()
-
-    # ===== Correctness vs padded batched kernel (same precision) =====
-    print("=" * 60)
-    print("Varlen correctness vs padded batched Triton kernel")
-    print("=" * 60)
-
-    test_correctness(
-        fused_two_mm_swiglu_varlen_triton,
-        _reference_varlen_padded,
-        (W0_W2, X, cu_seqlens),
-        (W0_W2, X, cu_seqlens),
-        debug=args.debug, atol=1e-2, rtol=1e-2,
-    )
-
-    # ===== Benchmark vs padded batched kernel =====
-    print()
-    print("=" * 60)
-    print("Varlen benchmark vs padded batched kernel")
-    print("=" * 60)
-
-    from grouped_gemm import _pack_to_padded
-    max_len = max(doc_lens)
-    X_pad = _pack_to_padded(X, cu_seqlens, max_len)
-
-    # Precompute varlen args so benchmark measures only the kernel launch
-    eff_lens, bos_arr, max_sl_val = compute_varlen_args(cu_seqlens)
-
-    benchmark(
-        lambda W0_W2, X, cu_seqlens: fused_two_mm_swiglu_varlen_triton(
-            W0_W2, X, cu_seqlens, eff_lens=eff_lens, bos_arr=bos_arr, max_sl=max_sl_val,
-        ),
-        lambda W0_W2, X_pad: fused_two_mm_swiglu_triton(W0_W2, X_pad),
-        (W0_W2, X, cu_seqlens),
-        (W0_W2, X_pad),
-    )
-
-    # ===== Chunk correctness =====
+    # ================================================================
+    #  CORRECTNESS
+    # ================================================================
+    doc_lens = [4096, 3072, 2048, 1024]
+    cu = make_cu_seqlens(doc_lens, device)
+    T = cu[-1].item()
+    G = len(doc_lens)
     chunk_size = 2048
-    _, _, max_chunks = get_chunk_info(cu_seqlens, chunk_size, 0)
 
-    print()
-    print("=" * 60)
-    print(f"Chunk correctness (chunk_size={chunk_size})")
-    print("=" * 60)
+    W0_W2 = torch.randn(G, 2 * dh, d, device=device, dtype=torch.bfloat16)
+    X = torch.randn(T, d, device=device, dtype=torch.bfloat16)
 
-    for chunk_index in range(max_chunks):
-        chunk_cu, idx, _ = get_chunk_info(cu_seqlens, chunk_size, chunk_index)
+    print(f"Correctness: doc_lens={doc_lens}, {d=}, {dh=}")
+
+    # varlen vs padded batched
+    print("\n  varlen vs padded: ", end="")
+    ok = test_correctness(
+        fused_two_mm_swiglu_varlen_triton, _reference_varlen_padded,
+        (W0_W2, X, cu), (W0_W2, X, cu),
+        debug=args.debug, **tol,
+    )
+    assert ok
+
+    # chunk correctness
+    _, _, max_chunks = get_chunk_info(cu, chunk_size, 0)
+    print(f"\n  chunk correctness (chunk_size={chunk_size}):")
+    for ci in range(max_chunks):
+        chunk_cu, idx, _ = get_chunk_info(cu, chunk_size, ci)
         if len(idx) == 0:
             break
-        # Reference: gather chunk tokens, call base varlen kernel
         ref_out = fused_two_mm_swiglu_varlen_triton(W0_W2, X[idx], chunk_cu)
-        # Test: call chunk kernel on full buffer
-        test_out = fused_two_mm_swiglu_varlen_triton(W0_W2, X, cu_seqlens, chunk_size=chunk_size, chunk_idx=chunk_index)
+        test_out = fused_two_mm_swiglu_varlen_triton(W0_W2, X, cu, chunk_size=chunk_size, chunk_idx=ci)
         diff = (test_out[idx] - ref_out).abs().max().item()
-        print(f"  chunk_idx={chunk_index}: max_diff={diff:.2e}, n_tokens={len(idx)}")
-        assert diff == 0.0, f"chunk_idx={chunk_index} not exact match!"
+        assert diff == 0.0, f"ci={ci} diff={diff}"
+        print(f"    ci={ci}: exact match (n={len(idx)})")
+    print("✓ All correctness tests passed\n")
 
-    print("✓ PASS (exact match)")
+    # ================================================================
+    #  BENCHMARKS
+    # ================================================================
+    print("=" * 72)
+    print(f"{'Config':<16} {'Triton ms':>10} {'Padded ms':>10} {'Speedup':>8}")
+    print("=" * 72)
+
+    for cfg_name, dl in BENCH_DOC_LENS.items():
+        cu = make_cu_seqlens(dl, device)
+        T = cu[-1].item()
+        G = len(dl)
+        max_len = max(dl)
+        eff, bos, msl = compute_varlen_args(cu)
+
+        W0_W2 = torch.randn(G, 2 * dh, d, device=device, dtype=torch.bfloat16)
+        X = torch.randn(T, d, device=device, dtype=torch.bfloat16)
+        X_pad = _pack_to_padded(X, cu, max_len)
+
+        r = benchmark(
+            lambda W, Xv, c, _e=eff, _b=bos, _m=msl: fused_two_mm_swiglu_varlen_triton(
+                W, Xv, c, eff_lens=_e, bos_arr=_b, max_sl=_m),
+            lambda W, Xp: fused_two_mm_swiglu_triton(W, Xp),
+            (W0_W2, X, cu), (W0_W2, X_pad),
+            verbose=False,
+        )
+        print(f"{cfg_name:<16} {r['time_triton']:>10.4f} {r['time_ref']:>10.4f} {r['speedup']:>7.2f}x")
+
+    print("=" * 72)

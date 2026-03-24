@@ -427,7 +427,7 @@ def reference_lact_swiglu_ffn_fast_weight_grads(W0_W2, W1, K, V, lr0, lr1, lr2):
 
 
 if __name__ == "__main__":
-    from kernel_test_utils import test_correctness, benchmark, get_chunk_info
+    from kernel_test_utils import test_correctness, benchmark, get_chunk_info, BENCH_DOC_LENS, make_cu_seqlens
     from grouped_gemm import _pack_to_padded, _padded_to_pack
 
     device = "cuda"
@@ -489,7 +489,6 @@ if __name__ == "__main__":
     fwd_args = (W0_W2, W1, K_tok, V_tok, lr0, lr1, lr2)
     fwd_bench_ref_args = (W0_W2, W1, K_pad, V_pad, lr0_pad, lr1_pad, lr2_pad)
     test_correctness(varlen_fwd, ref_fwd_for_test, fwd_args, fwd_args, atol=1e-2, rtol=1e-2)
-    benchmark(varlen_fwd, ref_fwd_bench, fwd_args, fwd_bench_ref_args)
 
     # ===== Backward =====
     print()
@@ -500,10 +499,14 @@ if __name__ == "__main__":
     grad_dw0_dw2 = torch.randn(num_docs, 2 * dh, d, device=device, dtype=torch.bfloat16) * 0.1
     grad_dw1 = torch.randn(num_docs, d, dh, device=device, dtype=torch.bfloat16) * 0.1
 
+    # needs_input_grad: 11 inputs (W0_W2, W1, K, V, lr0, lr1, lr2, cu_seqlens, eff_lens, bos_arr, max_sl)
+    _nig = (True, True, True, True, True, True, True, False, False, False, False)
+
     def varlen_bwd(grad_dw0_dw2, grad_dw1):
         ctx = FakeCtx()
         ctx.saved_tensors = (W0_W2, W1, K_tok, V_tok, lr0, lr1, lr2, cu_seqlens, eff_lens, bos_arr)
         ctx.max_sl = max_sl_val
+        ctx.needs_input_grad = _nig
         return FusedLactSwiGLUFFNVarlenBwd.backward(ctx, grad_dw0_dw2, grad_dw1)[:7]
 
     def ref_bwd_for_test(grad_dw0_dw2, grad_dw1):
@@ -519,14 +522,69 @@ if __name__ == "__main__":
             _padded_to_pack(grads[6].unsqueeze(2), cu_seqlens, T).squeeze(1),
         )
 
-    def ref_bwd_bench(grad_dw0_dw2, grad_dw1):
-        ctx = FakeCtx()
-        ctx.saved_tensors = (W0_W2, W1, K_pad, V_pad, lr0_pad, lr1_pad, lr2_pad)
-        return FusedLactSwiGLUFFNBwd.backward(ctx, grad_dw0_dw2, grad_dw1)
-
     bwd_args = (grad_dw0_dw2, grad_dw1)
     test_correctness(varlen_bwd, ref_bwd_for_test, bwd_args, bwd_args, atol=1e-2, rtol=1e-2)
-    benchmark(varlen_bwd, ref_bwd_bench, bwd_args, bwd_args)
+
+    # ===== Benchmarks: forward + backward across configs =====
+    print()
+    print("=" * 72)
+    print(f"{'Config':<16} {'Fwd ms':>10} {'Fwd Pad':>10} {'Fwd Spd':>8}   {'Bwd ms':>10} {'Bwd Pad':>10} {'Bwd Spd':>8}")
+    print("=" * 72)
+
+    for cfg_name, dl in BENCH_DOC_LENS.items():
+        cu = make_cu_seqlens(dl, device)
+        T_b = cu[-1].item()
+        G = len(dl)
+        ml = max(dl)
+        eff, bos, msl = compute_varlen_args(cu)
+
+        W_b = torch.randn(G, 2 * dh, d, device=device, dtype=torch.bfloat16)
+        W1_b = torch.randn(G, d, dh, device=device, dtype=torch.bfloat16)
+        Kb = torch.randn(T_b, d, device=device, dtype=torch.bfloat16)
+        Vb = torch.randn(T_b, d, device=device, dtype=torch.bfloat16)
+        l0 = torch.randn(T_b, device=device, dtype=torch.float32) * 0.01
+        l1 = torch.randn(T_b, device=device, dtype=torch.float32) * 0.01
+        l2 = torch.randn(T_b, device=device, dtype=torch.float32) * 0.01
+        Kp = _pack_to_padded(Kb, cu, ml)
+        Vp = _pack_to_padded(Vb, cu, ml)
+        l0p = _pack_to_padded(l0.unsqueeze(1), cu, ml).squeeze(2)
+        l1p = _pack_to_padded(l1.unsqueeze(1), cu, ml).squeeze(2)
+        l2p = _pack_to_padded(l2.unsqueeze(1), cu, ml).squeeze(2)
+        gdw = torch.randn(G, 2 * dh, d, device=device, dtype=torch.bfloat16) * 0.1
+        gdw1 = torch.randn(G, d, dh, device=device, dtype=torch.bfloat16) * 0.1
+
+        def _vfwd(W, W1, K, V, l0, l1, l2, _cu=cu, _e=eff, _b=bos, _m=msl):
+            ctx = FakeCtx()
+            return FusedLactSwiGLUFFNVarlenBwd.forward(ctx, W, W1, K, V, l0, l1, l2, _cu, _e, _b, _m)
+
+        def _rfwd(W, W1, K, V, l0, l1, l2):
+            ctx = FakeCtx()
+            return FusedLactSwiGLUFFNBwd.forward(ctx, W, W1, K, V, l0, l1, l2)
+
+        rf = benchmark(_vfwd, _rfwd,
+                       (W_b, W1_b, Kb, Vb, l0, l1, l2),
+                       (W_b, W1_b, Kp, Vp, l0p, l1p, l2p), verbose=False)
+
+        def _vbwd(gdw, gdw1, _W=W_b, _W1=W1_b, _K=Kb, _V=Vb,
+                  _l0=l0, _l1=l1, _l2=l2, _cu=cu, _e=eff, _b=bos, _m=msl):
+            ctx = FakeCtx()
+            ctx.saved_tensors = (_W, _W1, _K, _V, _l0, _l1, _l2, _cu, _e, _b)
+            ctx.max_sl = _m
+            ctx.needs_input_grad = _nig
+            return FusedLactSwiGLUFFNVarlenBwd.backward(ctx, gdw, gdw1)[:7]
+
+        def _rbwd(gdw, gdw1, _W=W_b, _W1=W1_b, _K=Kp, _V=Vp,
+                  _l0=l0p, _l1=l1p, _l2=l2p):
+            ctx = FakeCtx()
+            ctx.saved_tensors = (_W, _W1, _K, _V, _l0, _l1, _l2)
+            return FusedLactSwiGLUFFNBwd.backward(ctx, gdw, gdw1)
+
+        rb = benchmark(_vbwd, _rbwd, (gdw, gdw1), (gdw, gdw1), verbose=False)
+
+        print(f"{cfg_name:<16} {rf['time_triton']:>10.4f} {rf['time_ref']:>10.4f} {rf['speedup']:>7.2f}x"
+              f"   {rb['time_triton']:>10.4f} {rb['time_ref']:>10.4f} {rb['speedup']:>7.2f}x")
+
+    print("=" * 72)
 
     # ===== Chunk correctness: forward =====
     chunk_size = 2048
