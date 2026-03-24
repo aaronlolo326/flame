@@ -1,0 +1,213 @@
+import argparse
+import logging
+import random
+import sys
+from pathlib import Path
+
+import fla  # noqa: F401
+import torch
+from torchtitan.tools.logging import init_logger, logger
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+import custom_models  # noqa: F401
+
+
+DTYPE_MAP = {
+    "auto": "auto",
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate text with a Hugging Face causal language model."
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="Path or Hugging Face repo id for the model.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Optional tokenizer path or repo id. Defaults to --model.",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Prompt text. If omitted, the script reads from --prompt_file or stdin.",
+    )
+    parser.add_argument(
+        "--prompt_file",
+        type=Path,
+        default=None,
+        help="Optional path to a UTF-8 prompt file.",
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=128,
+        help="Maximum number of new tokens to generate.",
+    )
+    parser.add_argument(
+        "--min_new_tokens",
+        type=int,
+        default=0,
+        help="Minimum number of new tokens to generate.",
+    )
+    parser.add_argument(
+        "--do_sample",
+        action="store_true",
+        help="Enable sampling. Otherwise greedy decoding is used unless num_beams > 1.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature.",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=1.0,
+        help="Top-p nucleus sampling threshold.",
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=50,
+        help="Top-k sampling threshold.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed.",
+    )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="Allow custom modeling/tokenizer code from HF repos.",
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default=None,
+        help="Optional attention implementation override passed to from_pretrained.",
+    )
+    parser.add_argument(
+        "--print_prompt",
+        action="store_true",
+        help="Print the full decoded text including the prompt.",
+    )
+    parser.add_argument(
+        "--skip_special_tokens",
+        action="store_true",
+        help="Skip special tokens when decoding generated text.",
+    )
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.0,
+        help="The parameter for repetition penalty. 1.0 means no penalty.",
+    )
+    return parser.parse_args()
+
+
+def resolve_device(device_arg: str) -> str:
+    if device_arg != "auto":
+        return device_arg
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def maybe_set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+@torch.inference_mode()
+def main(args: argparse.Namespace) -> None:
+    prompt = args.prompt
+    tokenizer_path = args.tokenizer or args.model
+    device = "cuda"
+    # torch_dtype = DTYPE_MAP[args.dtype]
+
+    logger.info("Loading tokenizer from %s", tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=args.trust_remote_code,
+    )
+
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_kwargs = {
+        "trust_remote_code": args.trust_remote_code,
+        # "torch_dtype": torch_dtype,
+    }
+    if args.attn_implementation is not None:
+        model_kwargs["attn_implementation"] = args.attn_implementation
+
+    logger.info("Loading model from %s", args.model)
+    model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+    model.to(device)
+    model.eval()
+
+    model_inputs = tokenizer(prompt, return_tensors="pt").input_ids
+
+    model_inputs = model_inputs.to(device)
+    attention_mask = torch.ones_like(model_inputs, device=device)
+
+    generation_kwargs = {
+        "input_ids": model_inputs,
+        "attention_mask": attention_mask,
+        "max_new_tokens": args.max_new_tokens,
+        "min_new_tokens": args.min_new_tokens,
+        "do_sample": args.do_sample,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "repetition_penalty": args.repetition_penalty,
+    }
+
+    if not args.do_sample:
+        generation_kwargs.pop("temperature")
+        generation_kwargs.pop("top_p")
+        generation_kwargs.pop("top_k")
+
+    logger.info("Generating with device=%s", device)
+    outputs = model.generate(**generation_kwargs)
+
+    prompt_length = model_inputs.shape[-1]
+    sequences = outputs if args.print_prompt else outputs[:, prompt_length:]
+
+    for idx, sequence in enumerate(sequences, start=1):
+        text = tokenizer.decode(
+            sequence,
+            skip_special_tokens=args.skip_special_tokens,
+        )
+        # if args.num_return_sequences > 1:
+        #     print(f"===== Generation {idx} =====")
+        print(text)
+
+
+if __name__ == "__main__":
+    init_logger()
+    formatter = logging.Formatter(
+        "[titan] %(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+    )
+    for handler in logger.handlers:
+        handler.setFormatter(formatter)
+
+    cli_args = parse_args()
+    maybe_set_seed(cli_args.seed)
+    main(cli_args)
