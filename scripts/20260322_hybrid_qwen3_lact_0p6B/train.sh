@@ -57,7 +57,7 @@ NNODE=1 NGPU=${NGPU} LOG_RANK=0 bash train.sh \
   --training.steps ${steps} \
   --training.max_norm 1.0 \
   --training.skip_nan_inf \
-  --training.tokenized_dataset_dir /storage/backup/hei/data/qwen3-dclm-filter-16k_train \
+  --training.tokenized_dataset_dir /storage/backup/hei/data/HuggingFaceFW___fineweb-edu___sample-350BT \
   --training.num_workers 32 \
   --training.prefetch_factor 2 \
   --training.seed ${seed} \
