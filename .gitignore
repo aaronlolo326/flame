@@ -48,3 +48,5 @@ __pycache__
 .DS_Store
 *.whl
 lm-evaluation-harness/*
+
+checkpoints
