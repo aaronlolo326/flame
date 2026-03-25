@@ -11,15 +11,15 @@ export WANDB_NAME=${RUN_NAME}
 export WANDB_RUN_ID=${RUN_NAME}
 export WANDB_RESUME=allow
 
-MODEL_CONFIG_PATH=configs/qwen3_hybrid_qwen3_lact_4B.json
-BASE_MODEL_ID=Qwen/Qwen3-4B-Base
-HYBRID_HF_DIR=${flame_dir}/checkpoints/qwen3_hybrid_qwen3_lact_4B_init
+MODEL_CONFIG_PATH=configs/qwen3_hybrid_qwen3_lact_1_7B.json
+BASE_MODEL_ID=Qwen/Qwen3-1.7B-Base
+HYBRID_HF_DIR=${flame_dir}/checkpoints/qwen3_hybrid_qwen3_lact_1_7B_init
 
 TOKENIZER_PATH=${HYBRID_HF_DIR}
 
 dump_folder=/storage/backup/${USERNAME}/ttt/flame/exp/${RUN_NAME}
 checkpoint_folder=${dump_folder}/checkpoint
-seed_root=/storage/backup/${USERNAME}/ttt/flame/seeds/qwen3_hybrid_qwen3_lact_4B
+seed_root=/storage/backup/${USERNAME}/ttt/flame/seeds/qwen3_hybrid_qwen3_lact_1_7B
 seed_checkpoint_dir=${seed_root}/step-0
 lm_eval_output_path=/work/mingze/flame/results/${RUN_NAME}
 
