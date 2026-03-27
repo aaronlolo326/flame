@@ -84,6 +84,7 @@ if $train; then
   cp * $path
   cp -r configs $path
   cp -r flame   $path
+  cp -r custom_models   $path
   cp -r 3rdparty/flash-linear-attention/fla $path
   cp -r 3rdparty/torchtitan/torchtitan $path
 
