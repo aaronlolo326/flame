@@ -1,5 +1,6 @@
 import torch.nn.functional as F
 import torch
+from typing import Any, Dict, Optional
 
 
 @torch.compile()
@@ -362,3 +363,388 @@ def prenorm_block_causal_lact_swiglu(
     output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
     return output.transpose(1, 2)
+
+
+def _clone_optional_tensor(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Clone an optional tensor while preserving ``None`` for missing state."""
+    return None if x is None else x.clone()
+
+
+def _empty_pending_like(x: torch.Tensor) -> torch.Tensor:
+    """Create an empty ``[batch, 0, dim]`` buffer that matches an existing tensor."""
+    return x[:, :0, :].clone()
+
+
+def _clear_pending_buffers(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Reset the buffered partial chunk after it has been consumed by an update."""
+    state["pending_k"] = None
+    state["pending_v"] = None
+    state["pending_lr0"] = None
+    state["pending_lr1"] = None
+    state["pending_lr2"] = None
+    state["pending_momentum"] = None
+    state["pending_len"] = 0
+    return state
+
+
+def init_lact_decode_state(
+    fw_w0: torch.Tensor,
+    fw_w1: torch.Tensor,
+    fw_w2: torch.Tensor,
+    *,
+    ttt_prenorm: bool,
+    use_momentum: bool,
+) -> Dict[str, Any]:
+    """Initialize the persistent decode state from the slow-weight snapshot."""
+    state: Dict[str, Any] = {
+        "fw_w0": fw_w0.clone(),
+        "fw_w1": fw_w1.clone(),
+        "fw_w2": fw_w2.clone(),
+        "pending_k": None,
+        "pending_v": None,
+        "pending_lr0": None,
+        "pending_lr1": None,
+        "pending_lr2": None,
+        "pending_momentum": None,
+        "pending_len": 0,
+    }
+    if ttt_prenorm:
+        state["fw_w0_main"] = fw_w0.clone()
+        state["fw_w1_main"] = fw_w1.clone()
+        state["fw_w2_main"] = fw_w2.clone()
+    if use_momentum:
+        state["dw0_momentum"] = torch.zeros_like(fw_w0)
+        state["dw1_momentum"] = torch.zeros_like(fw_w1)
+        state["dw2_momentum"] = torch.zeros_like(fw_w2)
+    else:
+        state["dw0_momentum"] = None
+        state["dw1_momentum"] = None
+        state["dw2_momentum"] = None
+    return state
+
+
+def pending_chunk_ready(state: Dict[str, Any], chunk_size: int) -> bool:
+    """Return whether the buffered tokens are enough to close one update chunk."""
+    return int(state["pending_len"]) >= int(chunk_size)
+
+
+def append_token_to_pending(
+    state: Dict[str, Any],
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lr0: torch.Tensor,
+    lr1: torch.Tensor,
+    lr2: torch.Tensor,
+    momentum: Optional[torch.Tensor] = None,
+) -> Dict[str, Any]:
+    """Append newly decoded tokens into the pending chunk buffer."""
+    if state["pending_k"] is None:
+        state["pending_k"] = k.clone()
+        state["pending_v"] = v.clone()
+        state["pending_lr0"] = lr0.clone()
+        state["pending_lr1"] = lr1.clone()
+        state["pending_lr2"] = lr2.clone()
+        state["pending_momentum"] = _clone_optional_tensor(momentum)
+    else:
+        state["pending_k"] = torch.cat([state["pending_k"], k], dim=1)
+        state["pending_v"] = torch.cat([state["pending_v"], v], dim=1)
+        state["pending_lr0"] = torch.cat([state["pending_lr0"], lr0], dim=1)
+        state["pending_lr1"] = torch.cat([state["pending_lr1"], lr1], dim=1)
+        state["pending_lr2"] = torch.cat([state["pending_lr2"], lr2], dim=1)
+        if momentum is not None:
+            if state["pending_momentum"] is None:
+                state["pending_momentum"] = momentum.clone()
+            else:
+                state["pending_momentum"] = torch.cat(
+                    [state["pending_momentum"], momentum], dim=1
+                )
+    state["pending_len"] = int(state["pending_k"].shape[1])
+    return state
+
+
+def _apply_fast_weights(
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Run the fast SwiGLU network on queries without mutating the cached state."""
+    w0_compute = w0.to(q.dtype)
+    w1_compute = w1.to(q.dtype)
+    w2_compute = w2.to(q.dtype)
+    q = q.transpose(1, 2)
+    h = torch.bmm(w2_compute, q)
+    gate = F.silu(torch.bmm(w0_compute, q), inplace=True)
+    return torch.bmm(w1_compute, gate * h).transpose(1, 2)
+
+
+def lact_apply_only_postnorm(
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Apply-only step for post-norm TTT; identical math, different caller semantics."""
+    return _apply_fast_weights(w0, w1, w2, q)
+
+
+def lact_apply_only_prenorm(
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Apply-only step for pre-norm TTT; identical math, different caller semantics."""
+    return _apply_fast_weights(w0, w1, w2, q)
+
+
+def lact_update_chunk_postnorm(
+    state: Dict[str, Any],
+    k_chunk: torch.Tensor,
+    v_chunk: torch.Tensor,
+    lr0_chunk: torch.Tensor,
+    lr1_chunk: torch.Tensor,
+    lr2_chunk: torch.Tensor,
+    momentum_chunk: Optional[torch.Tensor] = None,
+    *,
+    use_muon: bool = False,
+) -> Dict[str, Any]:
+    """Update one closed chunk of post-norm fast weights and write the next state in place."""
+    w0 = state["fw_w0"]
+    w1 = state["fw_w1"]
+    w2 = state["fw_w2"]
+    compute_dtype = k_chunk.dtype
+    state_dtype = w0.dtype
+    w0_compute = w0.to(compute_dtype)
+    w1_compute = w1.to(compute_dtype)
+    w2_compute = w2.to(compute_dtype)
+
+    w0_norm = w0.norm(dim=2, keepdim=True)
+    w1_norm = w1.norm(dim=2, keepdim=True)
+    w2_norm = w2.norm(dim=2, keepdim=True)
+
+    vi = v_chunk.transpose(1, 2)
+    ki_t = k_chunk.transpose(1, 2)
+
+    gate_before_act = torch.bmm(w0_compute, ki_t)
+    hidden_before_mul = torch.bmm(w2_compute, ki_t)
+    hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+    dhidden = torch.bmm(w1_compute.transpose(1, 2), vi)
+    dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+    dgate = dhidden * hidden_before_mul
+    dgate_before_act = silu_backprop(dgate, gate_before_act)
+
+    dw1 = torch.bmm(vi, (hidden.transpose(1, 2) * lr1_chunk).type_as(vi)).to(state_dtype)
+    dw0 = torch.bmm(
+        dgate_before_act,
+        (k_chunk * lr0_chunk).type_as(dgate_before_act),
+    ).to(state_dtype)
+    dw2 = torch.bmm(
+        dhidden_before_mul,
+        (k_chunk * lr2_chunk).type_as(dhidden_before_mul),
+    ).to(state_dtype)
+
+    if momentum_chunk is not None:
+        m_i = momentum_chunk.mean(dim=1, keepdim=True).to(state_dtype)
+        dw0 = dw0 + state["dw0_momentum"] * m_i
+        dw1 = dw1 + state["dw1_momentum"] * m_i
+        dw2 = dw2 + state["dw2_momentum"] * m_i
+        state["dw0_momentum"] = dw0
+        state["dw1_momentum"] = dw1
+        state["dw2_momentum"] = dw2
+
+    if use_muon:
+        dw1 = zeropower_via_newtonschulz5(dw1)
+        dw0 = zeropower_via_newtonschulz5(dw0)
+        dw2 = zeropower_via_newtonschulz5(dw2)
+
+    w0 = w0 + dw0
+    w1 = w1 + dw1
+    w2 = w2 + dw2
+
+    state["fw_w0"] = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
+    state["fw_w1"] = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
+    state["fw_w2"] = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
+    return state
+
+
+def lact_update_chunk_prenorm(
+    state: Dict[str, Any],
+    k_chunk: torch.Tensor,
+    v_chunk: torch.Tensor,
+    lr0_chunk: torch.Tensor,
+    lr1_chunk: torch.Tensor,
+    lr2_chunk: torch.Tensor,
+    momentum_chunk: Optional[torch.Tensor] = None,
+    *,
+    use_muon: bool = False,
+) -> Dict[str, Any]:
+    """Update one closed chunk of pre-norm fast weights, keeping both main and normalized states."""
+    w0 = state["fw_w0"]
+    w1 = state["fw_w1"]
+    w2 = state["fw_w2"]
+    w0_main = state["fw_w0_main"]
+    w1_main = state["fw_w1_main"]
+    w2_main = state["fw_w2_main"]
+    compute_dtype = k_chunk.dtype
+    state_dtype = w0_main.dtype
+    w0_compute = w0.to(compute_dtype)
+    w1_compute = w1.to(compute_dtype)
+    w2_compute = w2.to(compute_dtype)
+
+    w0_norm = w0.norm(dim=2, keepdim=True)
+    w1_norm = w1.norm(dim=2, keepdim=True)
+    w2_norm = w2.norm(dim=2, keepdim=True)
+
+    vi = v_chunk.transpose(1, 2)
+    ki_t = k_chunk.transpose(1, 2)
+
+    gate_before_act = torch.bmm(w0_compute, ki_t)
+    hidden_before_mul = torch.bmm(w2_compute, ki_t)
+    hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+    dhidden = torch.bmm(w1_compute.transpose(1, 2), vi)
+    dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+    dgate = dhidden * hidden_before_mul
+    dgate_before_act = silu_backprop(dgate, gate_before_act)
+
+    dw1 = torch.bmm(vi, (hidden.transpose(1, 2) * lr1_chunk).type_as(vi)).to(state_dtype)
+    dw0 = torch.bmm(
+        dgate_before_act,
+        (k_chunk * lr0_chunk).type_as(dgate_before_act),
+    ).to(state_dtype)
+    dw2 = torch.bmm(
+        dhidden_before_mul,
+        (k_chunk * lr2_chunk).type_as(dhidden_before_mul),
+    ).to(state_dtype)
+
+    if momentum_chunk is not None:
+        m_i = momentum_chunk.mean(dim=1, keepdim=True).to(state_dtype)
+        dw0 = dw0 + state["dw0_momentum"] * m_i
+        dw1 = dw1 + state["dw1_momentum"] * m_i
+        dw2 = dw2 + state["dw2_momentum"] * m_i
+        state["dw0_momentum"] = dw0
+        state["dw1_momentum"] = dw1
+        state["dw2_momentum"] = dw2
+
+    if use_muon:
+        dw1 = zeropower_via_newtonschulz5(dw1)
+        dw0 = zeropower_via_newtonschulz5(dw0)
+        dw2 = zeropower_via_newtonschulz5(dw2)
+
+    w0_main = w0_main + dw0
+    w1_main = w1_main + dw1
+    w2_main = w2_main + dw2
+
+    state["fw_w0_main"] = w0_main
+    state["fw_w1_main"] = w1_main
+    state["fw_w2_main"] = w2_main
+    state["fw_w0"] = w0_main / (w0_main.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
+    state["fw_w1"] = w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
+    state["fw_w2"] = w2_main / (w2_main.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
+    return state
+
+
+def _take_pending_chunk(
+    state: Dict[str, Any],
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Pop one full chunk from the pending buffer and keep any leftover tail buffered."""
+    if not pending_chunk_ready(state, chunk_size):
+        raise ValueError("Pending chunk is not ready yet")
+    k_chunk = state["pending_k"][:, :chunk_size, :]
+    v_chunk = state["pending_v"][:, :chunk_size, :]
+    lr0_chunk = state["pending_lr0"][:, :chunk_size, :]
+    lr1_chunk = state["pending_lr1"][:, :chunk_size, :]
+    lr2_chunk = state["pending_lr2"][:, :chunk_size, :]
+    momentum_chunk = None
+    if state["pending_momentum"] is not None:
+        momentum_chunk = state["pending_momentum"][:, :chunk_size, :]
+
+    remaining = state["pending_len"] - chunk_size
+    if remaining > 0:
+        state["pending_k"] = state["pending_k"][:, chunk_size:, :]
+        state["pending_v"] = state["pending_v"][:, chunk_size:, :]
+        state["pending_lr0"] = state["pending_lr0"][:, chunk_size:, :]
+        state["pending_lr1"] = state["pending_lr1"][:, chunk_size:, :]
+        state["pending_lr2"] = state["pending_lr2"][:, chunk_size:, :]
+        if state["pending_momentum"] is not None:
+            state["pending_momentum"] = state["pending_momentum"][:, chunk_size:, :]
+        state["pending_len"] = remaining
+    else:
+        _clear_pending_buffers(state)
+
+    return k_chunk, v_chunk, lr0_chunk, lr1_chunk, lr2_chunk, momentum_chunk
+
+
+def run_lact_sequence_with_state(
+    state: Dict[str, Any],
+    q_seq: torch.Tensor,
+    k_seq: torch.Tensor,
+    v_seq: torch.Tensor,
+    lr0_seq: torch.Tensor,
+    lr1_seq: torch.Tensor,
+    lr2_seq: torch.Tensor,
+    momentum_seq: Optional[torch.Tensor] = None,
+    *,
+    chunk_size: int,
+    ttt_prenorm: bool,
+    use_muon: bool = False,
+) -> tuple[torch.Tensor, Dict[str, Any]]:
+    """Advance the decode state over a sequence using apply-then-update chunk semantics."""
+    if q_seq.shape[1] == 0:
+        return q_seq, state
+
+    apply_fn = lact_apply_only_prenorm if ttt_prenorm else lact_apply_only_postnorm
+    update_fn = lact_update_chunk_prenorm if ttt_prenorm else lact_update_chunk_postnorm
+
+    outputs = []
+    seq_len = q_seq.shape[1]
+    pos = 0
+
+    if state["pending_len"] > 0:
+        take = min(chunk_size - state["pending_len"], seq_len)
+        outputs.append(apply_fn(state["fw_w0"], state["fw_w1"], state["fw_w2"], q_seq[:, :take, :]))
+        append_token_to_pending(
+            state,
+            k_seq[:, :take, :],
+            v_seq[:, :take, :],
+            lr0_seq[:, :take, :],
+            lr1_seq[:, :take, :],
+            lr2_seq[:, :take, :],
+            None if momentum_seq is None else momentum_seq[:, :take, :],
+        )
+        if pending_chunk_ready(state, chunk_size):
+            chunk = _take_pending_chunk(state, chunk_size)
+            # print("--------------------update_fn--------------------")
+            update_fn(state, *chunk, use_muon=use_muon)
+        pos = take
+
+    while pos + chunk_size <= seq_len:
+        q_chunk = q_seq[:, pos:pos + chunk_size, :]
+        outputs.append(apply_fn(state["fw_w0"], state["fw_w1"], state["fw_w2"], q_chunk))
+        # print("--------------------update_fn--------------------")
+        update_fn(
+            state,
+            k_seq[:, pos:pos + chunk_size, :],
+            v_seq[:, pos:pos + chunk_size, :],
+            lr0_seq[:, pos:pos + chunk_size, :],
+            lr1_seq[:, pos:pos + chunk_size, :],
+            lr2_seq[:, pos:pos + chunk_size, :],
+            None if momentum_seq is None else momentum_seq[:, pos:pos + chunk_size, :],
+            use_muon=use_muon,
+        )
+        pos += chunk_size
+
+    if pos < seq_len:
+        outputs.append(apply_fn(state["fw_w0"], state["fw_w1"], state["fw_w2"], q_seq[:, pos:, :]))
+        append_token_to_pending(
+            state,
+            k_seq[:, pos:, :],
+            v_seq[:, pos:, :],
+            lr0_seq[:, pos:, :],
+            lr1_seq[:, pos:, :],
+            lr2_seq[:, pos:, :],
+            None if momentum_seq is None else momentum_seq[:, pos:, :],
+        )
+
+    return torch.cat(outputs, dim=1), state

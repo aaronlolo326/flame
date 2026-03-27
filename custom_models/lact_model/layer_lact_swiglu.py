@@ -21,7 +21,9 @@ from einops import rearrange, repeat
 from .ttt_operation import (
     block_causal_lact_swiglu,
     prenorm_block_causal_lact_swiglu,
+    init_lact_decode_state,
     l2_norm,
+    run_lact_sequence_with_state,
 )
 
 from .ttt_operation_fused_kernel import (
@@ -424,6 +426,56 @@ class LaCTSWIGLULayer(nn.Module):
         k = k * qk_scale[:, :, :, 1] + qk_offset[:, :, :, 1]
         return q, k
 
+    def _materialize_initial_fast_weights(self, batch_size: int):
+        if self.w0_w2_low_rank > 0:
+            fw_w0 = self.w0().repeat(batch_size, 1, 1)
+            fw_w2 = self.w2().repeat(batch_size, 1, 1)
+        else:
+            fw_w0 = self.w0.repeat(batch_size, 1, 1)
+            fw_w2 = self.w2.repeat(batch_size, 1, 1)
+        fw_w1 = self.w1.repeat(batch_size, 1, 1)
+
+        if self.fp32_states:
+            fw_w0 = fw_w0.to(torch.float32)
+            fw_w1 = fw_w1.to(torch.float32)
+            fw_w2 = fw_w2.to(torch.float32)
+
+        return fw_w0, fw_w1, fw_w2
+
+    def _build_token_lrs(self, hidden_states: torch.Tensor):
+        lr = self.lr_proj(hidden_states)
+        if self.lr_parameterization == "mamba":
+            lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
+        else:
+            raise NotImplementedError(
+                f"LR parameterization {self.lr_parameterization} not implemented"
+            )
+        fw_lr = rearrange(
+            lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=self.num_fw_heads
+        )
+        return fw_lr.chunk(3, dim=-1)
+
+    def _build_token_momentum(self, hidden_states: torch.Tensor):
+        if not self.use_momentum:
+            return None
+        momentum = self.momentum_proj(hidden_states).float()
+        return rearrange(
+            momentum, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
+        )
+
+    def _apply_ttt_postprocess(self, fw_x: torch.Tensor, hidden_states: torch.Tensor):
+        ttt_x_normed = self.ttt_norm(fw_x)
+        if self.learnable_ttt_scale:
+            ttt_scale = F.silu(self.ttt_scale_proj(hidden_states), inplace=False)
+            ttt_scale = rearrange(
+                ttt_scale, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
+            )
+            ttt_x_normed = ttt_x_normed * ttt_scale
+
+        return rearrange(
+            ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,  # [b, s, d]
@@ -599,127 +651,117 @@ class LaCTSWIGLULayer(nn.Module):
                 #### RoPE done. ####
 
             self._log_fast_kv_chunk_diversity(fast_k, fast_v)
+            fw_lr0, fw_lr1, fw_lr2 = self._build_token_lrs(hidden_states)
+            momentum = self._build_token_momentum(hidden_states)
 
-            if self.w0_w2_low_rank > 0:
-                fw_w0 = self.w0().repeat(batch_size, 1, 1)
-                fw_w2 = self.w2().repeat(batch_size, 1, 1)
-            else:
-                fw_w0 = self.w0.repeat(
-                    batch_size, 1, 1
-                )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
-                fw_w2 = self.w2.repeat(
-                    batch_size, 1, 1
-                )  # [nh, d_h, d_in] -> [b*nh, d_h, d_in]
+            if use_cache:
+                if batch_size != 1:
+                    raise NotImplementedError(
+                        "LaCT cached decoding only supports batch_size=1."
+                    )
+                if attention_mask is not None:
+                    raise NotImplementedError(
+                        "LaCT cached decoding does not support padded prompts."
+                    )
+                if past_key_values is None:
+                    raise ValueError(
+                        "LaCT cached decoding requires a cache object when use_cache=True."
+                    )
 
-            fw_w1 = self.w1.repeat(
-                batch_size, 1, 1
-            )  # [nh, d_out, d_h] -> [b*nh, d_out, d_h]
-
-            lr = self.lr_proj(hidden_states)  # [b, s, num_heads * lr_dim_per_head]
-            if self.lr_parameterization == "mamba":
-                lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
-            else:
-                raise NotImplementedError(
-                    f"LR parameterization {self.lr_parameterization} not implemented"
-                )
-            fw_lr = rearrange(
-                lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=self.num_fw_heads
-            )
-            fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
-
-            if self.use_momentum:
-                momentum = self.momentum_proj(hidden_states).float()  # [b, s, nh]
-                momentum = rearrange(
-                    momentum, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
-                )
-            else:
-                momentum = None
-
-            if self.fp32_states:
-                # here we cast the fast weights to fp32, but all matmuls are still in bf16
-                # only fast weight updates are in fp32.  This is similar to bf16 training of slow weights.
-                fw_w0 = fw_w0.to(torch.float32)
-                fw_w1 = fw_w1.to(torch.float32)
-                fw_w2 = fw_w2.to(torch.float32)
-
-            # [b * nh, s, d_ttt_head]
-            if self.ttt_prenorm:
-                # pre-norm version of ttt.   state = state + f(norm(state))
-                if self.use_fused_kernel:
-                    fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
+                state = past_key_values.get_lact_state(self.layer_idx)
+                if state is None:
+                    fw_w0, fw_w1, fw_w2 = self._materialize_initial_fast_weights(batch_size)
+                    state = init_lact_decode_state(
                         fw_w0,
                         fw_w1,
                         fw_w2,
-                        fast_q,
-                        fast_k,
-                        fast_v,
-                        fw_lr1,
-                        fw_lr2,
-                        fw_lr3,
-                        chunk_size=self.lact_chunk_size,
-                        use_muon=self.use_muon,
-                        momentum=momentum,
+                        ttt_prenorm=self.ttt_prenorm,
+                        use_momentum=self.use_momentum,
                     )
+
+                fw_x, state = run_lact_sequence_with_state(
+                    state,
+                    fast_q,
+                    fast_k,
+                    fast_v,
+                    fw_lr0,
+                    fw_lr1,
+                    fw_lr2,
+                    momentum,
+                    chunk_size=self.lact_chunk_size,
+                    ttt_prenorm=self.ttt_prenorm,
+                    use_muon=self.use_muon,
+                )
+                past_key_values.set_lact_state(self.layer_idx, state)
+            else:
+                fw_w0, fw_w1, fw_w2 = self._materialize_initial_fast_weights(batch_size)
+                # [b * nh, s, d_ttt_head]
+                if self.ttt_prenorm:
+                    # pre-norm version of ttt.   state = state + f(norm(state))
+                    if self.use_fused_kernel:
+                        fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
+                            fw_w0,
+                            fw_w1,
+                            fw_w2,
+                            fast_q,
+                            fast_k,
+                            fast_v,
+                            fw_lr0,
+                            fw_lr1,
+                            fw_lr2,
+                            chunk_size=self.lact_chunk_size,
+                            use_muon=self.use_muon,
+                            momentum=momentum,
+                        )
+                    else:
+                        fw_x = prenorm_block_causal_lact_swiglu(
+                            fw_w0,
+                            fw_w1,
+                            fw_w2,
+                            fast_q,
+                            fast_k,
+                            fast_v,
+                            fw_lr0,
+                            fw_lr1,
+                            fw_lr2,
+                            chunk_size=self.lact_chunk_size,
+                            use_muon=self.use_muon,
+                            momentum=momentum,
+                        )
                 else:
-                    fw_x = prenorm_block_causal_lact_swiglu(
-                        fw_w0,
-                        fw_w1,
-                        fw_w2,
-                        fast_q,
-                        fast_k,
-                        fast_v,
-                        fw_lr1,
-                        fw_lr2,
-                        fw_lr3,
-                        chunk_size=self.lact_chunk_size,
-                        use_muon=self.use_muon,
-                        momentum=momentum,
-                    )
-            else:
-                # post-norm version of ttt.   state = norm(state + f(state))
-                if self.use_fused_kernel:
-                    fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
-                        fw_w0,
-                        fw_w1,
-                        fw_w2,
-                        fast_q,
-                        fast_k,
-                        fast_v,
-                        fw_lr1,
-                        fw_lr2,
-                        fw_lr3,
-                        chunk_size=self.lact_chunk_size,
-                        use_muon=self.use_muon,
-                        momentum=momentum,
-                    )
-                else:
-                    fw_x = block_causal_lact_swiglu(
-                        fw_w0,
-                        fw_w1,
-                        fw_w2,
-                        fast_q,
-                        fast_k,
-                        fast_v,
-                        fw_lr1,
-                        fw_lr2,
-                        fw_lr3,
-                        chunk_size=self.lact_chunk_size,
-                        use_muon=self.use_muon,
-                        momentum=momentum,
-                    )
+                    # post-norm version of ttt.   state = norm(state + f(state))
+                    if self.use_fused_kernel:
+                        fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
+                            fw_w0,
+                            fw_w1,
+                            fw_w2,
+                            fast_q,
+                            fast_k,
+                            fast_v,
+                            fw_lr0,
+                            fw_lr1,
+                            fw_lr2,
+                            chunk_size=self.lact_chunk_size,
+                            use_muon=self.use_muon,
+                            momentum=momentum,
+                        )
+                    else:
+                        fw_x = block_causal_lact_swiglu(
+                            fw_w0,
+                            fw_w1,
+                            fw_w2,
+                            fast_q,
+                            fast_k,
+                            fast_v,
+                            fw_lr0,
+                            fw_lr1,
+                            fw_lr2,
+                            chunk_size=self.lact_chunk_size,
+                            use_muon=self.use_muon,
+                            momentum=momentum,
+                        )
 
-            # per-head output norm for ttt layer.
-            ttt_x_normed = self.ttt_norm(fw_x)
-            if self.learnable_ttt_scale:
-                ttt_scale = F.silu(self.ttt_scale_proj(hidden_states), inplace=False)
-                ttt_scale = rearrange(
-                    ttt_scale, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
-                )
-                ttt_x_normed = ttt_x_normed * ttt_scale
-
-            ttt_x_normed = rearrange(
-                ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
-            )
+            ttt_x_normed = self._apply_ttt_postprocess(fw_x, hidden_states)
             o = o + ttt_x_normed
         ### TTT ends ###
         
