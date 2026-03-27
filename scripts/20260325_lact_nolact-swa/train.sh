@@ -3,13 +3,13 @@ source "$(dirname "$0")/vars.sh"
 debug=false
 profile=false
 
-available_nodes=(12 14) # first is master node
+available_nodes=(1 4) # first is master node
 # based on env var $THIS_NODE, set local rank according to the order, e.g., THIS_NODE is 0 means local_rank = 0
 local_rank=$(echo ${available_nodes[@]} | tr ' ' '\n' | grep -n "^${THIS_NODE}$" | cut -d: -f1)
 local_rank=$((local_rank - 1))
 echo "THIS_NODE=${THIS_NODE}; local_rank=$local_rank"
 
-MASTER_ADDR=192.168.240.149 # 192.168.240.169 for node 1; 192.168.241.41  for node 10
+MASTER_ADDR=192.168.240.169 # 192.168.240.149 for node 12; 192.168.241.41  for node 10
 MASTER_PORT=29500
 
 NNODE=${#available_nodes[@]}
