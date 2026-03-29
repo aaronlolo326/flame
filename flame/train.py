@@ -211,6 +211,7 @@ def main(job_config: JobConfig):
         snapshot_every_n_steps=job_config.checkpoint.interval,
         sample_trunc_seq=job_config.training.sample_trunc_seq,
         add_eos_token=job_config.training.add_eos_token_to_sample,
+        sft_assistant_only=job_config.training.sft_assistant_only,
     )
     # breakpoint()
     # data_iterator = iter(dataloader)

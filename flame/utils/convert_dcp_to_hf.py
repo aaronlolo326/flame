@@ -22,17 +22,20 @@ def save_pretrained(
     path: str,
     step: int,
     config: str,
-    tokenizer: str
+    tokenizer: str,
+    save_path: str | None = None
 ):
+    output_path = save_path or path
+
     logger.info(f"Loading the config from {config}")
     config = AutoConfig.from_pretrained(config, trust_remote_code=True)
 
-    logger.info(f"Saving the config to {path}")
-    config.save_pretrained(path)
+    logger.info(f"Saving the config to {output_path}")
+    config.save_pretrained(output_path)
     logger.info(f"Loading the tokenizer from {tokenizer}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=True)
-    logger.info(f"Saving the tokenizer to {path}")
-    tokenizer.save_pretrained(path)
+    logger.info(f"Saving the tokenizer to {output_path}")
+    tokenizer.save_pretrained(output_path)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         checkpoint = os.path.join(path, f'checkpoint/step-{step}')
@@ -49,9 +52,8 @@ def save_pretrained(
         torch.serialization.add_safe_globals([timedelta, io.BytesIO])
         # torch.load now with default weights_only=True will work
         model.load_state_dict(torch.load(checkpoint_path, map_location='cpu')['model'])
-
-        logger.info(f"Saving the model to {path}")
-        model.save_pretrained(path)
+        logger.info(f"Saving the model to {output_path}")
+        model.save_pretrained(output_path)
 
 
 if __name__ == "__main__":
@@ -61,5 +63,6 @@ if __name__ == "__main__":
     parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, required=True)
+    parser.add_argument("--save_path", type=str)
     args = parser.parse_args()
-    save_pretrained(args.path, args.step, args.config, args.tokenizer)
+    save_pretrained(args.path, args.step, args.config, args.tokenizer, args.save_path)

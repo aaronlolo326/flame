@@ -294,6 +294,11 @@ class JobConfig:
             help="Whether to add an eos token at the end of each sample (after truncation if sample_trunc_seq is applied)",
         )
         self.parser.add_argument(
+            "--training.sft_assistant_only",
+            action="store_true",
+            help="Enable assistant-only SFT loss masking. Only effective for pre-tokenized datasets that already contain `labels`.",
+        )
+        self.parser.add_argument(
             "--training.gradient_accumulation_steps",
             type=int,
             default=1,

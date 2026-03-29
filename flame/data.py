@@ -391,7 +391,7 @@ class DataCollatorForLanguageModeling:
 
         def tensorize(example: Dict[str, Any]) -> Dict[str, Any]:
             tensorized = {}
-            for key in ['input_ids', 'cu_seqlens']:
+            for key in ['input_ids', 'labels', 'cu_seqlens']:
                 if key not in example:
                     continue
                 if isinstance(example[key], List):
@@ -406,6 +406,10 @@ class DataCollatorForLanguageModeling:
 
         if not self.varlen:
             # --- Handling for varlen=False (Batch Padding) ---
+            has_precomputed_labels = all('labels' in example for example in examples)
+            if any('labels' in example for example in examples) and not has_precomputed_labels:
+                raise ValueError('Either all examples should contain labels or none should contain labels.')
+
             length_of_first = examples[0]['input_ids'].size(0)
             needs_padding = not all(example['input_ids'].size(0) == length_of_first for example in examples)
 
@@ -420,8 +424,12 @@ class DataCollatorForLanguageModeling:
                         f'You are attempting to pad samples but the tokenizer you are using '
                         f'({self.tokenizer.__class__.__name__}) does not have a pad token.'
                     )
-                # Pad using the tokenizer, ensuring attention_mask is returned
-                batch = self.tokenizer.pad(examples, return_tensors='pt', return_attention_mask=True)
+                # Pad input ids using tokenizer and pad labels manually if provided.
+                batch = self.tokenizer.pad(
+                    [{'input_ids': example['input_ids']} for example in examples],
+                    return_tensors='pt',
+                    return_attention_mask=True
+                )
             else:
                 # No padding needed, stack directly and create a full attention mask
                 input_ids = torch.stack([example['input_ids'] for example in examples], dim=0)
@@ -431,8 +439,30 @@ class DataCollatorForLanguageModeling:
                     'attention_mask': torch.ones_like(input_ids),
                 }
 
-            # Create labels by cloning input_ids
-            labels = batch['input_ids'].clone()
+            if has_precomputed_labels:
+                if needs_padding:
+                    max_len = batch['input_ids'].size(1)
+                    pad_left = self.tokenizer is not None and self.tokenizer.padding_side == 'left'
+                    padded_labels = []
+                    for example in examples:
+                        labels = example['labels']
+                        pad_len = max_len - labels.size(0)
+                        if pad_len < 0:
+                            raise ValueError(
+                                f'Label length {labels.size(0)} exceeds padded input length {max_len}.'
+                            )
+                        if pad_len == 0:
+                            padded_labels.append(labels)
+                            continue
+                        pad = torch.full((pad_len,), -100, dtype=labels.dtype)
+                        padded_labels.append(torch.cat([pad, labels], dim=0) if pad_left else torch.cat([labels, pad], dim=0))
+                    labels = torch.stack(padded_labels, dim=0)
+                else:
+                    labels = torch.stack([example['labels'] for example in examples], dim=0)
+            else:
+                # Create labels by cloning input_ids
+                labels = batch['input_ids'].clone()
+
             # Mask labels only where attention_mask is 0 (padding positions)
             if 'attention_mask' in batch:
                 labels[batch['attention_mask'] == 0] = -100
@@ -442,6 +472,10 @@ class DataCollatorForLanguageModeling:
             # --- Handling for varlen=True (Concatenated Sequences) ---
             if len(examples) > 1:
                 raise ValueError('The batch size must be 1 for inputs with variable lengths (varlen=True).')
+
+            has_precomputed_labels = all('labels' in example for example in examples)
+            if any('labels' in example for example in examples) and not has_precomputed_labels:
+                raise ValueError('Either all examples should contain labels or none should contain labels.')
 
             batch = {'input_ids': torch.cat([example['input_ids'] for example in examples], dim=0).unsqueeze(0)}
 
@@ -543,8 +577,11 @@ class DataCollatorForLanguageModeling:
                         # Ensure uniqueness and sort, as arange might duplicate the endpoint
                         batch['cu_seqlens'] = torch.unique(batch['cu_seqlens'])
 
-            # Create labels directly from input_ids, NO padding mask needed for varlen
-            labels = batch['input_ids'].clone()
+            if has_precomputed_labels:
+                labels = torch.cat([example['labels'] for example in examples], dim=0).unsqueeze(0)
+            else:
+                # Create labels directly from input_ids, NO padding mask needed for varlen
+                labels = batch['input_ids'].clone()
             batch['labels'] = labels
         # # Save batch to file for debugging/inspection
         # with open('batch.pkl', 'wb') as f:
@@ -876,10 +913,18 @@ def build_dataloader(
     snapshot_every_n_steps: Optional[int] = 1,
     sample_trunc_seq: int = 1,
     add_eos_token: int = 0,
+    sft_assistant_only: bool = False,
 ):
-    dataset = OnlineTokenizedIterableDataset(
-        dataset=dataset, tokenizer=tokenizer, is_tokenized=is_tokenized, seq_len=seq_len, rank=rank, world_size=world_size, sample_trunc_seq=sample_trunc_seq, add_eos_token=add_eos_token
-    )
+    if sft_assistant_only:
+        if not is_tokenized:
+            raise ValueError(
+                "training.sft_assistant_only requires a pre-tokenized dataset containing `labels`."
+            )
+        dataset = dataset.shard(world_size, rank)
+    else:
+        dataset = OnlineTokenizedIterableDataset(
+            dataset=dataset, tokenizer=tokenizer, is_tokenized=is_tokenized, seq_len=seq_len, rank=rank, world_size=world_size, sample_trunc_seq=sample_trunc_seq, add_eos_token=add_eos_token
+        )
     return ParallelAwareDataLoader(
         rank=rank,
         dataset=dataset,
