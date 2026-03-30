@@ -8,7 +8,7 @@ from pathlib import Path
 import fla  # noqa: F401
 import torch
 from torchtitan.tools.logging import init_logger, logger
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 import custom_models  # noqa: F401
 
@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--use_cache",
-        action=argparse.BooleanOptionalAction,
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
         default=None,
         help="Override generation cache usage. Defaults to the model/generate default.",
     )
@@ -133,10 +133,11 @@ def resolve_device(device_arg: str) -> str:
 
 
 def maybe_set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    set_seed(seed)
+    # random.seed(seed)
+    # torch.manual_seed(seed)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed_all(seed)
 
 
 @torch.inference_mode()

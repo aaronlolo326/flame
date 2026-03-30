@@ -4,6 +4,7 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any
+import random
 
 import fla  # noqa: F401
 import numpy as np
@@ -11,8 +12,7 @@ import torch
 import torch.multiprocessing as mp
 from datasets import Dataset, load_dataset, load_from_disk
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 import custom_models  # noqa: F401
 
 
@@ -33,7 +33,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--do_sample", type=int, default=1)
     parser.add_argument("--repetition_penalty", type=float, default=1.1)
     parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--temperature", type=float, default=1)
+    parser.add_argument("--use_cache", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--trust_remote_code", action="store_true")
     return parser.parse_args()
@@ -157,19 +159,27 @@ def generate_continuation(
     top_p: float | None,
     repetition_penalty: int | None,
     top_k: int | None = None,
+    use_cache: bool = False,
+    sample_seed: int | None = None,
 ) -> torch.Tensor:
+    if sample_seed is not None:
+        torch.manual_seed(sample_seed)
+        if prefix_ids.is_cuda:
+            torch.cuda.manual_seed(sample_seed)
+            torch.cuda.manual_seed_all(sample_seed)
+
     outputs = model.generate(
         input_ids=prefix_ids.unsqueeze(0),
         attention_mask=torch.ones_like(prefix_ids, dtype=torch.long).unsqueeze(0),
         max_new_tokens=decode_len,
         do_sample=(do_sample==1),
-        use_cache=True,
+        use_cache=use_cache,
         pad_token_id=pad_token_id,
         eos_token_id=eos_token_id,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        repetition_penalty=repetition_penalty
+        repetition_penalty=repetition_penalty,
     )
     continuation = outputs[0, prefix_ids.shape[0] :]
     if continuation.shape[0] != decode_len:
@@ -275,6 +285,7 @@ def worker_main(
     torch.set_grad_enabled(False)
     if device.startswith("cuda"):
         torch.cuda.set_device(device)
+    maybe_set_seed(args.seed)
 
     gen_tokenizer = _load_tokenizer(args.model_path, args.trust_remote_code)
     gen_tokenizer.eos_token_id = gen_tokenizer.pad_token_id # for qwen3 base
@@ -310,8 +321,10 @@ def worker_main(
             do_sample=args.do_sample,
             temperature= args.temperature,
             top_p= args.top_p,
-            # top_k= args.top_k,
-            repetition_penalty= args.repetition_penalty
+            top_k= args.top_k,
+            repetition_penalty= args.repetition_penalty,
+            use_cache = False if args.use_cache == 0 else True,
+            sample_seed=args.seed,
         )
         # losses[local_row] = score_with_ref_lm(
         #     ref_model=ref_model,
@@ -332,9 +345,17 @@ def worker_main(
         np.asarray(sample_indices, dtype=np.int64),
     )
 
+def maybe_set_seed(seed: int) -> None:
+    set_seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def main() -> None:
     args = parse_args()
+    
+    maybe_set_seed(args.seed)
     args.ref_lm = _normalize_ref_lm_name(args.ref_lm)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -385,6 +406,7 @@ def main() -> None:
 
     loss_data_path = f"{args.output_dir}/loss_qwen3.npy"
     np.save(loss_data_path, all_losses)
+    print (f"np saved at {loss_data_path}")
 
     samples_path = f"{args.output_dir}/samples.json"
     samples: list[dict[str, Any]] = []
