@@ -26,6 +26,7 @@ import torch.nn as nn
 
 from .cache_lact import LaCTCache
 from .layer_lact_swiglu import LaCTSWIGLULayer
+from .layer_srlact_swiglu import SRLaCTSWIGLULayer
 from .configuration_lact_swiglu import LaCTSWIGLUConfig
 
 logger = logging.get_logger(__name__)
@@ -115,7 +116,7 @@ class LaCTBlock(nn.Module):
             )
             num_lact_heads = config.num_lact_heads
 
-        self.attn = LaCTSWIGLULayer(
+        _layer_kwargs = dict(
             hidden_size=config.hidden_size,
             num_attn_heads=config.num_attn_heads,
             num_lact_heads=num_lact_heads,
@@ -142,6 +143,11 @@ class LaCTBlock(nn.Module):
             use_fused_kernel=config.use_fused_kernel,
             fp32_states=config.fp32_states,
         )
+        num_slots = getattr(config, "num_slots", 1)
+        if num_slots > 1:
+            self.attn = SRLaCTSWIGLULayer(num_slots=num_slots, **_layer_kwargs)
+        else:
+            self.attn = LaCTSWIGLULayer(**_layer_kwargs)
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
             config.hidden_size, eps=config.norm_eps
@@ -257,11 +263,24 @@ class LaCTPreTrainedModel(PreTrainedModel):
             # logger.info(
             #     f"in PreTrainedModel initialize fast weights for LaCTSWIGLULayer"
             # )
-            # init w0, w1, w2
+            # init w0, w1, w2 (or slotted w0s, w1s, w2s for SR-LaCT)
             if module.num_fw_heads > 0:
-                if module.w0_w2_low_rank > 0:
+                if hasattr(module, "w0s"):
+                    # SR-LaCT: slotted fast weights
+                    d_slot = module.d_slot
+                    nn.init.normal_(
+                        module.w0s, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
+                    )
+                    nn.init.normal_(
+                        module.w1s, mean=0.0, std=1.0 / math.sqrt(d_slot)
+                    )
+                    nn.init.normal_(
+                        module.w2s, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
+                    )
+                elif module.w0_w2_low_rank > 0:
                     module.w0._init_weights()
                     module.w2._init_weights()
+                    nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
                 else:
                     nn.init.normal_(
                         module.w0, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
@@ -269,8 +288,7 @@ class LaCTPreTrainedModel(PreTrainedModel):
                     nn.init.normal_(
                         module.w2, mean=0.0, std=1.0 / math.sqrt(module.fw_head_dim)
                     )
-
-                nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
+                    nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
 
 
 class LaCTModel(LaCTPreTrainedModel):
@@ -586,6 +604,15 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
                 )
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
+
+            # Collect routing load-balance losses from SR-LaCT layers
+            lb_weight = getattr(self.config, "lb_loss_weight", 0.0)
+            if lb_weight > 0.0:
+                for module in self.model.modules():
+                    aux = getattr(module, "_aux_loss", None)
+                    if aux is not None:
+                        loss = loss + lb_weight * aux
+                        module._aux_loss = None
 
         if not return_dict:
             output = (logits,) + outputs[1:]

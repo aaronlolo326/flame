@@ -67,6 +67,10 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         fw_init_gain: float = 0.5,
         use_fused_kernel: bool = False,  # use triton kernel for ttt implementation
         fp32_states: bool = False,  # whether to keep the fast weights in fp32
+        # SR-LaCT: number of write slots (1 = standard LaCT, >1 = slot routing)
+        num_slots: int = 1,
+        # Load-balance loss weight for slot routing (α in the paper)
+        lb_loss_weight: float = 0.01,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -122,6 +126,8 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.fw_init_gain = fw_init_gain
         self.use_fused_kernel = use_fused_kernel
         self.fp32_states = fp32_states
+        self.num_slots = num_slots
+        self.lb_loss_weight = lb_loss_weight
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
