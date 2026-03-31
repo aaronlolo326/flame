@@ -28,6 +28,19 @@ def l2_norm(x: torch.Tensor):
     return ret.type(x_type)
 
 
+def expand_group_lr(lr: torch.Tensor, target_dim: int) -> torch.Tensor:
+    """Expand a grouped per-token LR to the feature dimension expected by a kernel."""
+    lr_dim = int(lr.shape[-1])
+    if lr_dim == 1 or lr_dim == target_dim:
+        return lr
+    if target_dim % lr_dim != 0:
+        raise ValueError(
+            f"lr_dim={lr_dim} cannot be broadcast to target_dim={target_dim}."
+        )
+    repeat = target_dim // lr_dim
+    return lr.repeat_interleave(repeat, dim=-1)
+
+
 @torch.compile()
 def zeropower_via_newtonschulz5(G):
     """

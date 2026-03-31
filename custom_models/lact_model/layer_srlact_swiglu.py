@@ -13,7 +13,7 @@ from einops import rearrange
 from fla.models.utils import Cache
 
 from .layer_lact_swiglu import LaCTSWIGLULayer, LowRankFastWeight
-from .ttt_operation import l2_norm
+from .ttt_operation import expand_group_lr, l2_norm
 from .ttt_operation_srlact import (
     block_causal_srlact_swiglu,
     prenorm_block_causal_srlact_swiglu,
@@ -112,6 +112,20 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
             fw_w2s = fw_w2s.to(torch.float32)
 
         return fw_w0s, fw_w1s, fw_w2s
+
+    def _align_token_lrs(
+        self,
+        fw_lr0: torch.Tensor,
+        fw_lr1: torch.Tensor,
+        fw_lr2: torch.Tensor,
+    ):
+        if self.num_slots <= 1 or not self.use_ttt:
+            return super()._align_token_lrs(fw_lr0, fw_lr1, fw_lr2)
+        return (
+            expand_group_lr(fw_lr0, self.d_in),
+            expand_group_lr(fw_lr1, self.d_slot),
+            expand_group_lr(fw_lr2, self.d_in),
+        )
 
     def _build_router_gates(
         self,

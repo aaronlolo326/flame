@@ -20,6 +20,7 @@ from einops import rearrange, repeat
 
 from .ttt_operation import (
     block_causal_lact_swiglu,
+    expand_group_lr,
     prenorm_block_causal_lact_swiglu,
     init_lact_decode_state,
     l2_norm,
@@ -453,7 +454,19 @@ class LaCTSWIGLULayer(nn.Module):
         fw_lr = rearrange(
             lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=self.num_fw_heads
         )
-        return fw_lr.chunk(3, dim=-1)
+        return self._align_token_lrs(*fw_lr.chunk(3, dim=-1))
+
+    def _align_token_lrs(
+        self,
+        fw_lr0: torch.Tensor,
+        fw_lr1: torch.Tensor,
+        fw_lr2: torch.Tensor,
+    ):
+        return (
+            expand_group_lr(fw_lr0, self.d_in),
+            expand_group_lr(fw_lr1, self.d_h),
+            expand_group_lr(fw_lr2, self.d_in),
+        )
 
     def _build_token_momentum(self, hidden_states: torch.Tensor):
         if not self.use_momentum:
@@ -653,6 +666,7 @@ class LaCTSWIGLULayer(nn.Module):
             self._log_fast_kv_chunk_diversity(fast_k, fast_v)
             fw_lr0, fw_lr1, fw_lr2 = self._build_token_lrs(hidden_states)
             momentum = self._build_token_momentum(hidden_states)
+            use_fused_ttt_kernel = self.use_fused_kernel and fw_lr0.shape[-1] == 1
 
             if use_cache:
                 if batch_size != 1:
@@ -698,7 +712,7 @@ class LaCTSWIGLULayer(nn.Module):
                 # [b * nh, s, d_ttt_head]
                 if self.ttt_prenorm:
                     # pre-norm version of ttt.   state = state + f(norm(state))
-                    if self.use_fused_kernel:
+                    if use_fused_ttt_kernel:
                         fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
                             fw_w0,
                             fw_w1,
@@ -730,7 +744,7 @@ class LaCTSWIGLULayer(nn.Module):
                         )
                 else:
                     # post-norm version of ttt.   state = norm(state + f(state))
-                    if self.use_fused_kernel:
+                    if use_fused_ttt_kernel:
                         fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
                             fw_w0,
                             fw_w1,
