@@ -144,8 +144,13 @@ class LaCTBlock(nn.Module):
             fp32_states=config.fp32_states,
         )
         num_slots = getattr(config, "num_slots", 1)
+        slot_iso_param = getattr(config, "slot_iso_param", True)
         if num_slots > 1:
-            self.attn = SRLaCTSWIGLULayer(num_slots=num_slots, **_layer_kwargs)
+            self.attn = SRLaCTSWIGLULayer(
+                num_slots=num_slots,
+                slot_iso_param=slot_iso_param,
+                **_layer_kwargs,
+            )
         else:
             self.attn = LaCTSWIGLULayer(**_layer_kwargs)
 

@@ -34,10 +34,11 @@ except ImportError:
 class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
     """Write-routed Slot LaCT layered on top of the base LaCT implementation."""
 
-    def __init__(self, num_slots: int = 2, **kwargs):
+    def __init__(self, num_slots: int = 2, slot_iso_param: bool = True, **kwargs):
         super().__init__(**kwargs)
 
         self.num_slots = int(num_slots)
+        self.slot_iso_param = bool(slot_iso_param)
         self._aux_loss: Optional[torch.Tensor] = None
 
         if self.num_slots <= 1 or not self.use_ttt:
@@ -48,12 +49,12 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
                 "SR-LaCT currently requires full-rank fast weights; set w0_w2_low_rank=-1."
             )
 
-        if self.d_h % self.num_slots != 0:
+        if self.slot_iso_param and self.d_h % self.num_slots != 0:
             raise ValueError(
                 f"d_h={self.d_h} must be divisible by num_slots={self.num_slots}"
             )
 
-        self.d_slot = self.d_h // self.num_slots
+        self.d_slot = self.d_h // self.num_slots if self.slot_iso_param else self.d_h
 
         del self.w0, self.w1, self.w2
 

@@ -188,7 +188,7 @@ class LaCTSWIGLULayer(nn.Module):
         ### Fast Weight init
         self.use_muon = use_muon
         self.lact_chunk_size = lact_chunk_size
-        self.num_fw_heads = int(num_lact_heads)
+        self.num_fw_heads = int(num_lact_heads) # 4
         self.use_ttt = self.num_fw_heads > 0
         self.fw_head_dim = self.hidden_size // self.num_fw_heads if self.use_ttt else 0
         self.qkv_silu = qkv_silu
@@ -196,13 +196,13 @@ class LaCTSWIGLULayer(nn.Module):
         self.ttt_prenorm = ttt_prenorm
         self.ttt_nope = ttt_nope
 
-        d_in, d_out = self.fw_head_dim, self.fw_head_dim
-        d_h = int(d_in * inter_multi) if self.use_ttt else 0
+        d_in, d_out = self.fw_head_dim, self.fw_head_dim # 256, 256
+        d_h = int(d_in * inter_multi) if self.use_ttt else 0 # 256 * 1 = 256
 
         self.d_h = d_h
         self.d_in = d_in
         self.d_out = d_out
-        self.w0_w2_low_rank = w0_w2_low_rank
+        self.w0_w2_low_rank = w0_w2_low_rank # 32
         self.fw_init_gain = fw_init_gain
 
         # Low Rank parameterization of the fast weights.
