@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from fla.models.utils import Cache
 
-from .layer_lact_swiglu import LaCTSWIGLULayer
+from .layer_lact_swiglu import LaCTSWIGLULayer, LowRankFastWeight
 from .ttt_operation import l2_norm
 from .ttt_operation_srlact import (
     block_causal_srlact_swiglu,
@@ -44,11 +44,6 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
         if self.num_slots <= 1 or not self.use_ttt:
             return
 
-        if self.w0_w2_low_rank > 0:
-            raise NotImplementedError(
-                "SR-LaCT currently requires full-rank fast weights; set w0_w2_low_rank=-1."
-            )
-
         if self.slot_iso_param and self.d_h % self.num_slots != 0:
             raise ValueError(
                 f"d_h={self.d_h} must be divisible by num_slots={self.num_slots}"
@@ -58,20 +53,38 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
 
         del self.w0, self.w1, self.w2
 
-        self.w0s = nn.Parameter(
-            torch.randn(
-                self.num_fw_heads, self.num_slots, self.d_slot, self.d_in
-            ) / math.sqrt(self.d_in)
-        )
+        if self.w0_w2_low_rank > 0:
+            self.w0s = LowRankFastWeight(
+                self.num_fw_heads * self.num_slots,
+                self.d_slot,
+                self.d_in,
+                self.w0_w2_low_rank,
+                init_gain=self.fw_init_gain,
+                add_identity=True,
+            )
+            self.w2s = LowRankFastWeight(
+                self.num_fw_heads * self.num_slots,
+                self.d_slot,
+                self.d_in,
+                self.w0_w2_low_rank,
+                init_gain=self.fw_init_gain,
+                add_identity=True,
+            )
+        else:
+            self.w0s = nn.Parameter(
+                torch.randn(
+                    self.num_fw_heads, self.num_slots, self.d_slot, self.d_in
+                ) / math.sqrt(self.d_in)
+            )
+            self.w2s = nn.Parameter(
+                torch.randn(
+                    self.num_fw_heads, self.num_slots, self.d_slot, self.d_in
+                ) / math.sqrt(self.d_in)
+            )
         self.w1s = nn.Parameter(
             torch.randn(
                 self.num_fw_heads, self.num_slots, self.d_out, self.d_slot
             ) / math.sqrt(self.d_slot)
-        )
-        self.w2s = nn.Parameter(
-            torch.randn(
-                self.num_fw_heads, self.num_slots, self.d_slot, self.d_in
-            ) / math.sqrt(self.d_in)
         )
 
         self.slot_router = nn.Linear(
@@ -81,9 +94,17 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
         self.register_buffer("router_temp", torch.tensor(1.0))
 
     def _materialize_initial_slot_fast_weights(self, batch_size: int):
-        fw_w0s = self.w0s.repeat(batch_size, 1, 1, 1)
+        if self.w0_w2_low_rank > 0:
+            fw_w0s = self.w0s().reshape(
+                self.num_fw_heads, self.num_slots, self.d_slot, self.d_in
+            ).repeat(batch_size, 1, 1, 1)
+            fw_w2s = self.w2s().reshape(
+                self.num_fw_heads, self.num_slots, self.d_slot, self.d_in
+            ).repeat(batch_size, 1, 1, 1)
+        else:
+            fw_w0s = self.w0s.repeat(batch_size, 1, 1, 1)
+            fw_w2s = self.w2s.repeat(batch_size, 1, 1, 1)
         fw_w1s = self.w1s.repeat(batch_size, 1, 1, 1)
-        fw_w2s = self.w2s.repeat(batch_size, 1, 1, 1)
 
         if self.fp32_states:
             fw_w0s = fw_w0s.to(torch.float32)
