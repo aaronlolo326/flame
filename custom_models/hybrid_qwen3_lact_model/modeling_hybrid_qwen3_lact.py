@@ -575,18 +575,31 @@ class HybridQwen3LaCTModel(HybridQwen3LaCTPreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[object] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
         **kwargs,
     ) -> BaseModelOutputWithPast:
-        del kwargs
+        del kwargs, past_key_values, use_cache, cache_position
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds")
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("You must specify either input_ids or inputs_embeds")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         batch_size, seq_len, _ = inputs_embeds.shape
-        position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
+        if position_ids is None:
+            if attention_mask is not None:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 0)
+            else:
+                position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
+        else:
+            position_ids = position_ids.to(device=inputs_embeds.device, dtype=torch.long)
 
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
@@ -657,15 +670,23 @@ class HybridQwen3LaCTForCausalLM(HybridQwen3LaCTPreTrainedModel, GenerationMixin
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[object] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         logits_to_keep: int = 0,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        del past_key_values, cache_position
+        use_cache = False
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            use_cache=use_cache,
             output_hidden_states=output_hidden_states if output_hidden_states is not None else False,
             return_dict=True if return_dict is None else return_dict,
             **kwargs,
@@ -699,3 +720,43 @@ class HybridQwen3LaCTForCausalLM(HybridQwen3LaCTPreTrainedModel, GenerationMixin
             hidden_states=outputs.hidden_states,
             attentions=None,
         )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[object] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        use_cache: bool = True,
+        logits_to_keep: Optional[int] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> dict[str, Optional[torch.Tensor] | bool | int | object]:
+        del past_key_values, use_cache, kwargs
+        if inputs_embeds is not None and input_ids is None:
+            model_inputs: dict[str, Optional[torch.Tensor] | bool | int | object] = {
+                "inputs_embeds": inputs_embeds,
+                "input_ids": None,
+            }
+        else:
+            if input_ids is None:
+                raise ValueError("You must specify input_ids when inputs_embeds is not provided.")
+            model_inputs = {
+                "input_ids": input_ids.contiguous(),
+                "inputs_embeds": None,
+            }
+
+        if logits_to_keep is not None:
+            model_inputs["logits_to_keep"] = logits_to_keep
+
+        model_inputs.update(
+            {
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "past_key_values": None,
+                "use_cache": False,
+                "cache_position": cache_position,
+            }
+        )
+        return model_inputs

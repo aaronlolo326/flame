@@ -212,6 +212,7 @@ def main(job_config: JobConfig):
         sample_trunc_seq=job_config.training.sample_trunc_seq,
         add_eos_token=job_config.training.add_eos_token_to_sample,
         sft_assistant_only=job_config.training.sft_assistant_only,
+        sft_pad_to_seq_len=job_config.training.sft_pad_to_seq_len,
     )
     # breakpoint()
     # data_iterator = iter(dataloader)
@@ -614,6 +615,11 @@ def main(job_config: JobConfig):
 
                 """
                 labels = labels.to(device_type)
+                attention_mask = (
+                    batch["attention_mask"].to(device_type)
+                    if "attention_mask" in batch
+                    else None
+                )
                 cu_seqlens = (
                     batch["cu_seqlens"].to(device_type)
                     if "cu_seqlens" in batch
@@ -673,6 +679,7 @@ def main(job_config: JobConfig):
                             output = model(
                                 input_ids=input_ids,
                                 labels=labels,
+                                attention_mask=attention_mask,
                                 position_ids=position_ids,
                                 cu_seqlens=cu_seqlens,
                         )

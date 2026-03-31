@@ -384,6 +384,9 @@ class DataCollatorForLanguageModeling:
     tokenizer: PreTrainedTokenizer | None
     context_len: Optional[int] = None
     varlen: bool = False
+    truncate_to_length: Optional[int] = None
+    pad_to_length: Optional[int] = None
+    warn_on_truncation: bool = True
 
     def __call__(self, examples: List[Union[List[int], Dict[str, Any]]]) -> Dict[str, Any]:
         if not isinstance(examples[0], Dict):
@@ -410,8 +413,27 @@ class DataCollatorForLanguageModeling:
             if any('labels' in example for example in examples) and not has_precomputed_labels:
                 raise ValueError('Either all examples should contain labels or none should contain labels.')
 
-            length_of_first = examples[0]['input_ids'].size(0)
-            needs_padding = not all(example['input_ids'].size(0) == length_of_first for example in examples)
+            if self.truncate_to_length is not None:
+                truncated_any = False
+                for example in examples:
+                    if example['input_ids'].size(0) > self.truncate_to_length:
+                        example['input_ids'] = example['input_ids'][:self.truncate_to_length]
+                        if 'labels' in example:
+                            example['labels'] = example['labels'][:self.truncate_to_length]
+                        truncated_any = True
+                if truncated_any and self.warn_on_truncation:
+                    logger.warning(
+                        f"Truncated one or more samples to truncate_to_length={self.truncate_to_length}. "
+                        "Consider increasing training.seq_len if this is frequent."
+                    )
+                    self.warn_on_truncation = False
+
+            batch_max_len = max(example['input_ids'].size(0) for example in examples)
+            if self.pad_to_length is not None:
+                target_len = self.pad_to_length
+            else:
+                target_len = batch_max_len
+            needs_padding = not all(example['input_ids'].size(0) == target_len for example in examples)
 
             if needs_padding:
                 # Check for pad token if padding is actually required
@@ -427,8 +449,10 @@ class DataCollatorForLanguageModeling:
                 # Pad input ids using tokenizer and pad labels manually if provided.
                 batch = self.tokenizer.pad(
                     [{'input_ids': example['input_ids']} for example in examples],
+                    padding='max_length' if self.pad_to_length is not None else True,
+                    max_length=target_len if self.pad_to_length is not None else None,
                     return_tensors='pt',
-                    return_attention_mask=True
+                    return_attention_mask=True,
                 )
             else:
                 # No padding needed, stack directly and create a full attention mask
@@ -914,7 +938,11 @@ def build_dataloader(
     sample_trunc_seq: int = 1,
     add_eos_token: int = 0,
     sft_assistant_only: bool = False,
+    sft_pad_to_seq_len: bool = False,
 ):
+    if varlen and sft_pad_to_seq_len:
+        raise ValueError("training.sft_pad_to_seq_len is incompatible with training.varlen.")
+
     if sft_assistant_only:
         if not is_tokenized:
             raise ValueError(
@@ -929,7 +957,13 @@ def build_dataloader(
         rank=rank,
         dataset=dataset,
         batch_size=batch_size,
-        collate_fn=DataCollatorForLanguageModeling(tokenizer=tokenizer, context_len=context_len, varlen=varlen),
+        collate_fn=DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            context_len=context_len,
+            varlen=varlen,
+            truncate_to_length=seq_len if sft_assistant_only else None,
+            pad_to_length=seq_len if sft_pad_to_seq_len else None,
+        ),
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,

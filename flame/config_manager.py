@@ -299,6 +299,11 @@ class JobConfig:
             help="Enable assistant-only SFT loss masking. Only effective for pre-tokenized datasets that already contain `labels`.",
         )
         self.parser.add_argument(
+            "--training.sft_pad_to_seq_len",
+            action="store_true",
+            help="For SFT-style variable-length samples, pad every batch to `training.seq_len` so the model always sees fixed-length inputs.",
+        )
+        self.parser.add_argument(
             "--training.gradient_accumulation_steps",
             type=int,
             default=1,

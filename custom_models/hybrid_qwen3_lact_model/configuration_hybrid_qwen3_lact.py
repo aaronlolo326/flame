@@ -24,7 +24,7 @@ class HybridQwen3LaCTConfig(PretrainedConfig):
         max_position_embeddings: int = 32768,
         initializer_range: float = 0.02,
         rms_norm_eps: float = 1e-6,
-        use_cache: bool = True,
+        use_cache: bool = False,
         tie_word_embeddings: bool = False,
         rope_theta: float = 1000000.0,
         attention_bias: bool = False,
