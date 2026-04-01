@@ -149,6 +149,9 @@ class LaCTBlock(nn.Module):
             self.attn = SRLaCTSWIGLULayer(
                 num_slots=num_slots,
                 slot_iso_param=slot_iso_param,
+                router_tau_start=getattr(config, "router_tau_start", 1.0),
+                router_tau_end=getattr(config, "router_tau_end", 0.2),
+                router_tau_anneal_ratio=getattr(config, "router_tau_anneal_ratio", 0.2),
                 **_layer_kwargs,
             )
         else:

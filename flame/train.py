@@ -674,6 +674,8 @@ def main(job_config: JobConfig):
                                 labels=labels,
                                 position_ids=position_ids,
                                 cu_seqlens=cu_seqlens,
+                                train_step=train_state.step,
+                                train_total_steps=job_config.training.steps,
                         )
                         loss = (
                             output.loss

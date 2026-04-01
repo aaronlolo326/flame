@@ -34,11 +34,22 @@ except ImportError:
 class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
     """Write-routed Slot LaCT layered on top of the base LaCT implementation."""
 
-    def __init__(self, num_slots: int = 2, slot_iso_param: bool = True, **kwargs):
+    def __init__(
+        self,
+        num_slots: int = 2,
+        slot_iso_param: bool = True,
+        router_tau_start: float = 1.0,
+        router_tau_end: float = 0.2,
+        router_tau_anneal_ratio: float = 0.2,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
 
         self.num_slots = int(num_slots)
         self.slot_iso_param = bool(slot_iso_param)
+        self.router_tau_start = float(router_tau_start)
+        self.router_tau_end = float(router_tau_end)
+        self.router_tau_anneal_ratio = float(router_tau_anneal_ratio)
         self._aux_loss: Optional[torch.Tensor] = None
 
         if self.num_slots <= 1 or not self.use_ttt:
@@ -91,7 +102,7 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
             self.hidden_size, self.num_fw_heads * self.num_slots, bias=False
         )
         nn.init.zeros_(self.slot_router.weight)
-        self.register_buffer("router_temp", torch.tensor(1.0))
+        self.register_buffer("router_temp", torch.tensor(self.router_tau_start))
 
     def _materialize_initial_slot_fast_weights(self, batch_size: int):
         if self.w0_w2_low_rank > 0:
@@ -172,6 +183,29 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
 
         return gates
 
+    def _maybe_update_router_temp(
+        self,
+        train_step: Optional[int],
+        train_total_steps: Optional[int],
+    ) -> None:
+        if not self.training:
+            return
+        if train_step is None or train_total_steps is None:
+            return
+        if train_total_steps <= 0:
+            return
+
+        anneal_steps = max(
+            1,
+            int(math.ceil(float(train_total_steps) * self.router_tau_anneal_ratio)),
+        )
+        zero_based_step = max(int(train_step) - 1, 0)
+        progress = min(float(zero_based_step) / float(anneal_steps), 1.0)
+        tau = self.router_tau_start + (
+            self.router_tau_end - self.router_tau_start
+        ) * progress
+        self.router_temp.fill_(tau)
+
     def _run_slotted_ttt(
         self,
         hidden_states: torch.Tensor,
@@ -241,6 +275,11 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
             )
 
         self._aux_loss = None
+
+        self._maybe_update_router_temp(
+            kwargs.get("train_step"),
+            kwargs.get("train_total_steps"),
+        )
 
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (

@@ -71,6 +71,10 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         num_slots: int = 1,
         # Whether SR-LaCT splits d_h across slots to keep fast-weight params iso-param.
         slot_iso_param: bool = True,
+        # Router temperature schedule for SR-LaCT.
+        router_tau_start: float = 1.0,
+        router_tau_end: float = 0.2,
+        router_tau_anneal_ratio: float = 0.2,
         # Load-balance loss weight for slot routing (α in the paper)
         lb_loss_weight: float = 0.01,
         **kwargs,
@@ -130,6 +134,9 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.fp32_states = fp32_states
         self.num_slots = num_slots
         self.slot_iso_param = slot_iso_param
+        self.router_tau_start = router_tau_start
+        self.router_tau_end = router_tau_end
+        self.router_tau_anneal_ratio = router_tau_anneal_ratio
         self.lb_loss_weight = lb_loss_weight
         super().__init__(
             pad_token_id=pad_token_id,
