@@ -63,6 +63,7 @@ register_train_spec(
 @record
 def main(job_config: JobConfig):
 
+
     # torch.cuda.memory._record_memory_history(max_entries=100000)
 
     # # get model_type attr from the json file at job_config.model.config, and import
@@ -217,6 +218,7 @@ def main(job_config: JobConfig):
 
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
+    model_type = model_config.model_type
     # set the model configs from training inputs:
     # 1. norm type to decide which norm layer to use
     # 2. disable fused norm if TP is enabled
@@ -355,15 +357,26 @@ def main(job_config: JobConfig):
                 for idx, layer_type in enumerate(layer_types)
                 if layer_type == 'linear_attention'
             }
-        # train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config, ignored_params=ignored_params)
-        train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config)
+        if model_type == 'my_hymba':
+            # print (f"{len(model.model.layers)=}")
+            ignored_params = {
+                model.model.layers[idx].mamba.A_log[0]
+                for idx in range(len(model.model.layers))
+            }
+            print (f"{ignored_params=}")
+        ignored_params = None
+        train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config, ignored_params=ignored_params)
+        # train_spec.parallelize_fn(model, world_mesh, parallel_dims, job_config)
         model.to_empty(device=init_device)
         with torch.no_grad():
             model.post_init()
+        
+        logger.info(
+            f"model.post_init() done; {model.device=}"
+        )
         model.train()
 
         model_parts = [model]
-
     ###
     from collections import defaultdict
 
@@ -388,7 +401,6 @@ def main(job_config: JobConfig):
 
     # build optimizer after applying parallelisms to the model
     optimizers = train_spec.build_optimizers_fn(model_parts, job_config, ft_manager)
-
 
     # # Sanity check: ensure lr_proj / momentum_proj params are covered by the optimizer
     # name_to_param = dict(model.named_parameters())
@@ -437,7 +449,6 @@ def main(job_config: JobConfig):
         checkpoint.save(curr_step=0, force=True)
         logger.info("Created seed checkpoint")
         return
-
 
 
     checkpoint.load(step=job_config.checkpoint.load_step)
@@ -564,7 +575,7 @@ def main(job_config: JobConfig):
         logger.info(f"Number of distinct parameters = {model_param_count - nparams_embedding:,}")
     else:
         logger.info(f"Model does not tie input and output word embeddings, so the number of unique model parameters is the above.")
-    
+
 
     with (
         maybe_enable_profiling(

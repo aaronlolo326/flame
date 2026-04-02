@@ -715,14 +715,14 @@ def run_lact_sequence_with_state(
         )
         if pending_chunk_ready(state, chunk_size):
             chunk = _take_pending_chunk(state, chunk_size)
-            # print("--------------------update_fn--------------------")
+            # print("--------------------decode update_fn--------------------")
             update_fn(state, *chunk, use_muon=use_muon)
         pos = take
 
     while pos + chunk_size <= seq_len:
         q_chunk = q_seq[:, pos:pos + chunk_size, :]
         outputs.append(apply_fn(state["fw_w0"], state["fw_w1"], state["fw_w2"], q_chunk))
-        # print("--------------------update_fn--------------------")
+        # print("--------------------prefill update_fn--------------------")
         update_fn(
             state,
             k_seq[:, pos:pos + chunk_size, :],

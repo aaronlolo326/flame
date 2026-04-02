@@ -653,7 +653,7 @@ class LaCTSWIGLULayer(nn.Module):
             self._log_fast_kv_chunk_diversity(fast_k, fast_v)
             fw_lr0, fw_lr1, fw_lr2 = self._build_token_lrs(hidden_states)
             momentum = self._build_token_momentum(hidden_states)
-            
+
             if use_cache:
                 if batch_size != 1:
                     raise NotImplementedError(
