@@ -41,6 +41,9 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
         router_tau_start: float = 1.0,
         router_tau_end: float = 0.2,
         router_tau_anneal_ratio: float = 0.2,
+        slot_read_scale_mode: str = "inv_sqrt",
+        slot_read_scale_value: float = 1.0,
+        router_sparse_warmup_ratio: float = 0.05,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,6 +53,9 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
         self.router_tau_start = float(router_tau_start)
         self.router_tau_end = float(router_tau_end)
         self.router_tau_anneal_ratio = float(router_tau_anneal_ratio)
+        self.slot_read_scale_mode = str(slot_read_scale_mode)
+        self.slot_read_scale_value = float(slot_read_scale_value)
+        self.router_sparse_warmup_ratio = float(router_sparse_warmup_ratio)
         self._aux_loss: Optional[torch.Tensor] = None
 
         if self.num_slots <= 1 or not self.use_ttt:
@@ -103,6 +109,7 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
         )
         nn.init.zeros_(self.slot_router.weight)
         self.register_buffer("router_temp", torch.tensor(self.router_tau_start))
+        self.register_buffer("router_sparse_mix", torch.tensor(1.0))
 
     def _materialize_initial_slot_fast_weights(self, batch_size: int):
         if self.w0_w2_low_rank > 0:
@@ -173,17 +180,35 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
         )
 
         tau = self.router_temp.to(router_logits.dtype).clamp_min(1e-5)
-        gates = topk_sparse_softmax(
+        dense_gates = torch.softmax(router_logits / tau, dim=-1)
+        sparse_gates = topk_sparse_softmax(
             router_logits / tau,
             topk=min(2, self.num_slots),
         )
+        sparse_mix = self.router_sparse_mix.to(router_logits.dtype).clamp(0.0, 1.0)
+        gates = dense_gates * (1.0 - sparse_mix) + sparse_gates * sparse_mix
 
         if self.training:
             self._aux_loss = self.num_slots * (gates.mean(dim=(0, 1)) ** 2).sum()
 
         return gates
 
-    def _maybe_update_router_temp(
+    def _resolve_read_scale(self) -> float:
+        if self.num_slots <= 1:
+            return 1.0
+        if self.slot_read_scale_mode == "none":
+            return 1.0
+        if self.slot_read_scale_mode == "inv":
+            return 1.0 / float(self.num_slots)
+        if self.slot_read_scale_mode == "inv_sqrt":
+            return 1.0 / math.sqrt(float(self.num_slots))
+        if self.slot_read_scale_mode == "fixed":
+            return self.slot_read_scale_value
+        raise ValueError(
+            f"Unsupported slot_read_scale_mode={self.slot_read_scale_mode!r}"
+        )
+
+    def _maybe_update_router_schedule(
         self,
         train_step: Optional[int],
         train_total_steps: Optional[int],
@@ -206,6 +231,13 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
         ) * progress
         self.router_temp.fill_(tau)
 
+        sparse_warmup_steps = max(
+            1,
+            int(math.ceil(float(train_total_steps) * self.router_sparse_warmup_ratio)),
+        )
+        sparse_progress = min(float(zero_based_step) / float(sparse_warmup_steps), 1.0)
+        self.router_sparse_mix.fill_(sparse_progress)
+
     def _run_slotted_ttt(
         self,
         hidden_states: torch.Tensor,
@@ -221,6 +253,7 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
     ) -> torch.Tensor:
         router_gates = self._build_router_gates(hidden_states, batch_size, q_len)
         fw_w0s, fw_w1s, fw_w2s = self._materialize_initial_slot_fast_weights(batch_size)
+        read_scale = self._resolve_read_scale()
 
         if self.ttt_prenorm:
             return prenorm_block_causal_srlact_swiglu(
@@ -237,6 +270,7 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
                 chunk_size=self.lact_chunk_size,
                 use_muon=self.use_muon,
                 momentum=momentum,
+                read_scale=read_scale,
             )
 
         return block_causal_srlact_swiglu(
@@ -253,6 +287,7 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
             chunk_size=self.lact_chunk_size,
             use_muon=self.use_muon,
             momentum=momentum,
+            read_scale=read_scale,
         )
 
     def forward(
@@ -276,7 +311,7 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
 
         self._aux_loss = None
 
-        self._maybe_update_router_temp(
+        self._maybe_update_router_schedule(
             kwargs.get("train_step"),
             kwargs.get("train_total_steps"),
         )

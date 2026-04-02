@@ -75,6 +75,11 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         router_tau_start: float = 1.0,
         router_tau_end: float = 0.2,
         router_tau_anneal_ratio: float = 0.2,
+        # Read-side aggregation scale for SR-LaCT multi-slot reads.
+        slot_read_scale_mode: str = "inv_sqrt",
+        slot_read_scale_value: float = 1.0,
+        # Smooth router warm start: interpolate dense softmax -> sparse top-k.
+        router_sparse_warmup_ratio: float = 0.05,
         # Load-balance loss weight for slot routing (α in the paper)
         lb_loss_weight: float = 0.01,
         **kwargs,
@@ -137,6 +142,9 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.router_tau_start = router_tau_start
         self.router_tau_end = router_tau_end
         self.router_tau_anneal_ratio = router_tau_anneal_ratio
+        self.slot_read_scale_mode = slot_read_scale_mode
+        self.slot_read_scale_value = slot_read_scale_value
+        self.router_sparse_warmup_ratio = router_sparse_warmup_ratio
         self.lb_loss_weight = lb_loss_weight
         super().__init__(
             pad_token_id=pad_token_id,

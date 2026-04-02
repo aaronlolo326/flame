@@ -21,12 +21,13 @@ def _apply_slot_fast_weights(
     w1s: torch.Tensor,
     w2s: torch.Tensor,
     q: torch.Tensor,
+    read_scale: float = 1.0,
 ) -> torch.Tensor:
     compute_dtype = q.dtype
     q_t = q.transpose(1, 2).unsqueeze(1)
     h = torch.matmul(w2s.to(compute_dtype), q_t)
     gate = F.silu(torch.matmul(w0s.to(compute_dtype), q_t), inplace=True)
-    return torch.matmul(w1s.to(compute_dtype), gate * h).sum(dim=1)
+    return torch.matmul(w1s.to(compute_dtype), gate * h).sum(dim=1) * read_scale
 
 
 def _apply_muon_over_slots(dw: torch.Tensor) -> torch.Tensor:
@@ -52,6 +53,7 @@ def block_causal_srlact_swiglu(
     chunk_size: int = 2048,
     use_muon: bool = False,
     momentum: Optional[torch.Tensor] = None,
+    read_scale: float = 1.0,
 ) -> torch.Tensor:
     batch_size, num_slots, _, _ = w0s.shape
 
@@ -90,6 +92,7 @@ def block_causal_srlact_swiglu(
             w1s,
             w2s,
             qi.transpose(1, 2),
+            read_scale=read_scale,
         )
 
         ki_t = ki.transpose(1, 2).unsqueeze(1)
@@ -158,6 +161,7 @@ def block_causal_srlact_swiglu(
             w1s,
             w2s,
             qi.transpose(1, 2),
+            read_scale=read_scale,
         )
 
     return output.transpose(1, 2)
@@ -179,6 +183,7 @@ def prenorm_block_causal_srlact_swiglu(
     chunk_size: int = 2048,
     use_muon: bool = False,
     momentum: Optional[torch.Tensor] = None,
+    read_scale: float = 1.0,
 ) -> torch.Tensor:
     batch_size, num_slots, _, _ = w0s.shape
     w0s_main = w0s
@@ -220,6 +225,7 @@ def prenorm_block_causal_srlact_swiglu(
             w1s,
             w2s,
             qi.transpose(1, 2),
+            read_scale=read_scale,
         )
 
         ki_t = ki.transpose(1, 2).unsqueeze(1)
@@ -288,6 +294,7 @@ def prenorm_block_causal_srlact_swiglu(
             w1s,
             w2s,
             qi.transpose(1, 2),
+            read_scale=read_scale,
         )
 
     return output.transpose(1, 2)

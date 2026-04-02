@@ -152,6 +152,9 @@ class LaCTBlock(nn.Module):
                 router_tau_start=getattr(config, "router_tau_start", 1.0),
                 router_tau_end=getattr(config, "router_tau_end", 0.2),
                 router_tau_anneal_ratio=getattr(config, "router_tau_anneal_ratio", 0.2),
+                slot_read_scale_mode=getattr(config, "slot_read_scale_mode", "inv_sqrt"),
+                slot_read_scale_value=getattr(config, "slot_read_scale_value", 1.0),
+                router_sparse_warmup_ratio=getattr(config, "router_sparse_warmup_ratio", 0.05),
                 **_layer_kwargs,
             )
         else:
