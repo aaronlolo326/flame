@@ -583,6 +583,8 @@ def main(job_config: JobConfig):
             optimizers.zero_grad()
 
             losses = []
+            router_metric_totals = {}
+            router_metric_count = 0
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
@@ -681,6 +683,16 @@ def main(job_config: JobConfig):
                             output.loss
                             / job_config.training.gradient_accumulation_steps
                         )
+                        router_metrics = getattr(output, "router_metrics", None)
+                        if router_metrics:
+                            router_metric_count += 1
+                            for key, value in router_metrics.items():
+                                value = value.detach().float()
+                                router_metric_totals[key] = (
+                                    value
+                                    if key not in router_metric_totals
+                                    else router_metric_totals[key] + value
+                                )
                         loss.backward()
 
                 losses.append(loss)
@@ -763,6 +775,25 @@ def main(job_config: JobConfig):
                         "optimizer/lr": last_lr,
                         "optimizer/grad_norm": grad_norm.item(),
                         "optimizer/skipped_step": train_state.skipped_step,
+                        **(
+                            {
+                                key: (
+                                    dist_utils.dist_mean(
+                                        value / float(router_metric_count),
+                                        world_mesh["dp_cp"],
+                                    ).item()
+                                    if (
+                                        parallel_dims.dp_replicate_enabled
+                                        or parallel_dims.dp_shard_enabled
+                                        or parallel_dims.cp_enabled
+                                    )
+                                    else (value / float(router_metric_count)).item()
+                                )
+                                for key, value in router_metric_totals.items()
+                            }
+                            if router_metric_count > 0
+                            else {}
+                        ),
                     },
                 )
 
