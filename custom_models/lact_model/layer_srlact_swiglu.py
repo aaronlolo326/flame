@@ -57,6 +57,7 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
         self.slot_read_scale_value = float(slot_read_scale_value)
         self.router_sparse_warmup_ratio = float(router_sparse_warmup_ratio)
         self._aux_loss: Optional[torch.Tensor] = None
+        self._router_stats: Optional[dict[str, torch.Tensor]] = None
 
         if self.num_slots <= 1 or not self.use_ttt:
             return
@@ -157,6 +158,14 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
         if num_update_chunks == 0:
             if self.training:
                 self._aux_loss = hidden_states.new_zeros(())
+                self._router_stats = {
+                    "temp": self.router_temp.detach().float(),
+                    "sparse_mix": self.router_sparse_mix.detach().float(),
+                    "entropy": hidden_states.new_zeros((), dtype=torch.float32),
+                    "top1": hidden_states.new_zeros((), dtype=torch.float32),
+                    "active_slots": hidden_states.new_zeros((), dtype=torch.float32),
+                    "slot_usage": hidden_states.new_zeros(self.num_slots, dtype=torch.float32),
+                }
             return hidden_states.new_zeros(
                 batch_size * self.num_fw_heads,
                 0,
@@ -190,6 +199,15 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
 
         if self.training:
             self._aux_loss = self.num_slots * (gates.mean(dim=(0, 1)) ** 2).sum()
+            gate_probs = gates.clamp_min(1e-8)
+            self._router_stats = {
+                "temp": self.router_temp.detach().float(),
+                "sparse_mix": self.router_sparse_mix.detach().float(),
+                "entropy": (-(gate_probs * gate_probs.log()).sum(dim=-1).mean()).detach().float(),
+                "top1": gates.max(dim=-1).values.mean().detach().float(),
+                "active_slots": (gates > 1e-6).float().sum(dim=-1).mean().detach().float(),
+                "slot_usage": gates.mean(dim=(0, 1)).detach().float(),
+            }
 
         return gates
 
@@ -310,6 +328,7 @@ class SRLaCTSWIGLULayer(LaCTSWIGLULayer):
             )
 
         self._aux_loss = None
+        self._router_stats = None
 
         self._maybe_update_router_schedule(
             kwargs.get("train_step"),

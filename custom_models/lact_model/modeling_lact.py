@@ -495,6 +495,48 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
+    def _collect_router_metrics(self, device: torch.device) -> dict[str, torch.Tensor]:
+        aux_losses = []
+        scalar_sums: dict[str, torch.Tensor] = {}
+        slot_usage_sum = None
+        num_router_layers = 0
+
+        for module in self.model.modules():
+            aux = getattr(module, "_aux_loss", None)
+            if aux is not None:
+                aux_losses.append(aux.detach().float())
+
+            stats = getattr(module, "_router_stats", None)
+            if stats is not None:
+                num_router_layers += 1
+                for key, value in stats.items():
+                    value = value.detach().float()
+                    if key == "slot_usage":
+                        slot_usage_sum = value if slot_usage_sum is None else slot_usage_sum + value
+                    else:
+                        scalar_sums[key] = value if key not in scalar_sums else scalar_sums[key] + value
+                module._router_stats = None
+
+            if aux is not None:
+                module._aux_loss = None
+
+        metrics: dict[str, torch.Tensor] = {}
+        if aux_losses:
+            aux_stack = torch.stack(aux_losses)
+            metrics["router/aux_loss_mean"] = aux_stack.mean()
+            metrics["router/aux_loss_sum"] = aux_stack.sum()
+
+        if num_router_layers > 0:
+            denom = float(num_router_layers)
+            for key, value in scalar_sums.items():
+                metrics[f"router/{key}_mean"] = value / denom
+            if slot_usage_sum is not None:
+                slot_usage_mean = slot_usage_sum / denom
+                for slot_idx in range(int(slot_usage_mean.shape[0])):
+                    metrics[f"router/slot_{slot_idx}_usage_mean"] = slot_usage_mean[slot_idx]
+
+        return {key: value.to(device=device) for key, value in metrics.items()}
+
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     def prepare_inputs_for_generation(
         self,
@@ -582,6 +624,15 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
+        router_metrics = self._collect_router_metrics(hidden_states.device)
+        lb_weight = getattr(self.config, "lb_loss_weight", 0.0)
+        if "router/aux_loss_sum" in router_metrics:
+            router_metrics["router/aux_loss_weighted_sum"] = (
+                router_metrics["router/aux_loss_sum"] * lb_weight
+            )
+            router_metrics["router/aux_loss_weighted_mean"] = (
+                router_metrics["router/aux_loss_mean"] * lb_weight
+            )
         fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
         logits = (
             None
@@ -616,23 +667,19 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
 
-            # Collect routing load-balance losses from SR-LaCT layers
-            lb_weight = getattr(self.config, "lb_loss_weight", 0.0)
-            if lb_weight > 0.0:
-                for module in self.model.modules():
-                    aux = getattr(module, "_aux_loss", None)
-                    if aux is not None:
-                        loss = loss + lb_weight * aux
-                        module._aux_loss = None
+            if lb_weight > 0.0 and "router/aux_loss_sum" in router_metrics:
+                loss = loss + lb_weight * router_metrics["router/aux_loss_sum"]
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        setattr(output, "router_metrics", router_metrics)
+        return output
