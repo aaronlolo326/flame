@@ -36,6 +36,7 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         no_v_silu: bool = False,  # if True, don't apply silu to v, will overwrite qkv_silu.
         lr_parameterization: str = "mamba",
         learnable_ttt_scale: bool = True,
+        ttt_inner_steps: int = 1,
         use_momentum: bool = True,
         ttt_loss_type: str = "dot_product",  # "l2"
         ttt_prenorm: bool = True,  # pre-norm or post-norm for ttt.
@@ -97,6 +98,7 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.layer_types = layer_types
         self.lr_parameterization = lr_parameterization
         self.learnable_ttt_scale = learnable_ttt_scale
+        self.ttt_inner_steps = ttt_inner_steps
         self.ttt_prenorm = ttt_prenorm
         self.memory_update_phases = memory_update_phases
         self.ttt_nope = ttt_nope

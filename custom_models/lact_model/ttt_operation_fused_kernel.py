@@ -84,6 +84,7 @@ def postnorm_block_causal_lact_swiglu_fused_kernel_triton(
     lr1: torch.Tensor,  # [b, l, 1], fp32
     lr2: torch.Tensor,  # [b, l, 1], fp32
     chunk_size: int = 2048,  # test-time training chunk size
+    ttt_inner_steps: int = 1,
     use_muon: bool = False,
     momentum: torch.Tensor = None,  # [b, s, 1], fp32 or bf16
 ):
@@ -162,25 +163,29 @@ def postnorm_block_causal_lact_swiglu_fused_kernel_triton(
         output[chunk_idx] = fused_swiglu_ffn_fwd(w0_w2_bf16, w1_bf16, qi)
 
         # then, compute test-time training gradients for w0, w1, w2. under negative dot product loss.
-        dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
-            w0_w2_bf16, w1_bf16, ki, vi, lr0i, lr1i, lr2i
-        )
-
+        m_i = None
         if momentum is not None:
-            m_i = momentum[chunk_idx].contiguous()
-            m_i = m_i.mean(dim=1, keepdim=True)  # [b, 1, 1]
+            m_i = momentum[chunk_idx].contiguous().mean(dim=1, keepdim=True)
 
-            dw0_w2 = dw0_w2 + dw0_dw2_momentum * m_i
-            dw1 = dw1 + dw1_momentum * m_i
-            dw0_dw2_momentum = dw0_w2
-            dw1_momentum = dw1
+        for _ in range(ttt_inner_steps):
+            dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
+                w0_w2_bf16, w1_bf16, ki, vi, lr0i, lr1i, lr2i
+            )
 
-        if use_muon:
-            dw1 = zeropower_via_newtonschulz5(dw1)
-            dw0_w2 = zeropower_via_newtonschulz5(dw0_w2)
+            if m_i is not None:
+                dw0_w2 = dw0_w2 + dw0_dw2_momentum * m_i
+                dw1 = dw1 + dw1_momentum * m_i
+                dw0_dw2_momentum = dw0_w2
+                dw1_momentum = dw1
 
-        w0_w2 = l2_norm_add_fused(w0_w2, dw0_w2, w0_w2_norm, eps=1e-5)
-        w1 = l2_norm_add_fused(w1, dw1, w1_norm, eps=1e-5)
+            if use_muon:
+                dw1 = zeropower_via_newtonschulz5(dw1)
+                dw0_w2 = zeropower_via_newtonschulz5(dw0_w2)
+
+            w0_w2 = l2_norm_add_fused(w0_w2, dw0_w2, w0_w2_norm, eps=1e-5)
+            w1 = l2_norm_add_fused(w1, dw1, w1_norm, eps=1e-5)
+            w0_w2_bf16 = w0_w2.to(torch.bfloat16)
+            w1_bf16 = w1.to(torch.bfloat16)
 
     # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
 
@@ -207,6 +212,7 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
     lr1: torch.Tensor,  # [b, l, 1], fp32
     lr2: torch.Tensor,  # [b, l, 1], fp32
     chunk_size: int = 2048,  # test-time training chunk size
+    ttt_inner_steps: int = 1,
     use_muon: bool = False,
     momentum: torch.Tensor = None,  # [b, s, 1], fp32 or bf16
 ):
@@ -287,33 +293,34 @@ def prenorm_block_causal_lact_swiglu_fused_kernel_triton(
         output[chunk_idx] = fused_swiglu_ffn_fwd(w0_w2, w1, qi)
 
         # then, compute test-time training gradients for w0, w1, w2. under negative dot product loss.
-        dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
-            w0_w2.to(torch.bfloat16), w1.to(torch.bfloat16), ki, vi, lr0i, lr1i, lr2i
-        )
-
+        m_i = None
         if momentum is not None:
-            m_i = momentum[chunk_idx].contiguous()
-            m_i = m_i.mean(dim=1, keepdim=True)  # [b, 1, 1]
+            m_i = momentum[chunk_idx].contiguous().mean(dim=1, keepdim=True)
 
-            dw0_w2 = dw0_w2 + dw0_dw2_momentum * m_i
-            dw1 = dw1 + dw1_momentum * m_i
-            dw0_dw2_momentum = dw0_w2
-            dw1_momentum = dw1
+        for _ in range(ttt_inner_steps):
+            dw0_w2, dw1 = fused_lact_swiglu_ffn_fast_weight_grads(
+                w0_w2.to(torch.bfloat16), w1.to(torch.bfloat16), ki, vi, lr0i, lr1i, lr2i
+            )
 
-        if use_muon:
-            dw1 = zeropower_via_newtonschulz5(dw1)
-            dw0_w2 = zeropower_via_newtonschulz5(dw0_w2)
+            if m_i is not None:
+                dw0_w2 = dw0_w2 + dw0_dw2_momentum * m_i
+                dw1 = dw1 + dw1_momentum * m_i
+                dw0_dw2_momentum = dw0_w2
+                dw1_momentum = dw1
 
-        w0_w2_main = w0_w2_main + dw0_w2
-        w1_main = w1_main + dw1
+            if use_muon:
+                dw1 = zeropower_via_newtonschulz5(dw1)
+                dw0_w2 = zeropower_via_newtonschulz5(dw0_w2)
 
-        # cast to bf16
-        w0_w2 = (
-            w0_w2_main / (w0_w2_main.norm(dim=2, keepdim=True) + 1e-5) * w0_w2_norm
-        ).to(torch.bfloat16)
-        w1 = (w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm).to(
-            torch.bfloat16
-        )
+            w0_w2_main = w0_w2_main + dw0_w2
+            w1_main = w1_main + dw1
+
+            w0_w2 = (
+                w0_w2_main / (w0_w2_main.norm(dim=2, keepdim=True) + 1e-5) * w0_w2_norm
+            ).to(torch.bfloat16)
+            w1 = (w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm).to(
+                torch.bfloat16
+            )
 
     # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
     qi = q[-1].contiguous()

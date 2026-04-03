@@ -13,7 +13,23 @@ from transformers import AutoConfig
 def build_hybrid_layer_types(num_hidden_layers: int, recurrent_ratio: float = 0.75) -> list[str]:
     num_lact_layers = math.ceil(num_hidden_layers * recurrent_ratio)
     num_fa_layers = num_hidden_layers - num_lact_layers
-    return ["fa"] * num_fa_layers + ["lact"] * num_lact_layers
+    if num_fa_layers <= 0:
+        return ["lact"] * num_hidden_layers
+    if num_fa_layers >= num_hidden_layers:
+        return ["fa"] * num_hidden_layers
+
+    layer_types = ["lact"] * num_hidden_layers
+    if num_fa_layers == 1:
+        layer_types[0] = "fa"
+        return layer_types
+
+    fa_positions = {
+        round(i * (num_hidden_layers - 1) / (num_fa_layers - 1))
+        for i in range(num_fa_layers)
+    }
+    for idx in fa_positions:
+        layer_types[idx] = "fa"
+    return layer_types
 
 
 def main() -> None:
@@ -22,6 +38,7 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--num-lact-heads", type=int, default=4)
     parser.add_argument("--lact-chunk-size", type=int, default=1024)
+    parser.add_argument("--ttt-inner-steps", type=int, default=1)
     parser.add_argument("--window-size", type=int, default=16834)
     parser.add_argument("--w0-init-strategy", type=str, default="random_small")
     parser.add_argument("--w0-init-scale", type=float, default=0.1)
@@ -66,6 +83,7 @@ def main() -> None:
         "no_v_silu": False,
         "lr_parameterization": "mamba",
         "learnable_ttt_scale": True,
+        "ttt_inner_steps": int(args.ttt_inner_steps),
         "use_momentum": True,
         "ttt_loss_type": "dot_product",
         "ttt_prenorm": True,

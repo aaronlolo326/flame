@@ -136,6 +136,7 @@ class LaCTSWIGLULayer(nn.Module):
         use_muon: bool = False,
         lr_parameterization: str = "mamba",
         learnable_ttt_scale: bool = False,
+        ttt_inner_steps: int = 1,
         ttt_prenorm: bool = False,
         ttt_nope: bool = False,
         rope_theta: float = 500000.0,
@@ -181,6 +182,7 @@ class LaCTSWIGLULayer(nn.Module):
         self.no_v_silu = no_v_silu
         self.ttt_prenorm = ttt_prenorm
         self.ttt_nope = ttt_nope
+        self.ttt_inner_steps = ttt_inner_steps
 
         d_in, d_out = self.fw_head_dim, self.fw_head_dim
         d_h = int(d_in * inter_multi)
@@ -264,6 +266,10 @@ class LaCTSWIGLULayer(nn.Module):
             raise ValueError(
                 "memory_update_phase must be in [0, lact_chunk_size). "
                 f"Got {self.memory_update_phase} with lact_chunk_size={self.lact_chunk_size}."
+            )
+        if self.ttt_inner_steps < 1:
+            raise ValueError(
+                f"ttt_inner_steps must be >= 1, got {self.ttt_inner_steps}."
             )
 
     def _rescale_qk(self, q, k):
@@ -520,6 +526,7 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr2,
                         fw_lr3,
                         chunk_size=self.lact_chunk_size,
+                        ttt_inner_steps=self.ttt_inner_steps,
                         use_muon=self.use_muon,
                         momentum=momentum,
                     )
@@ -535,6 +542,7 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr2,
                         fw_lr3,
                         chunk_size=self.lact_chunk_size,
+                        ttt_inner_steps=self.ttt_inner_steps,
                         update_phase=self.memory_update_phase,
                         use_muon=self.use_muon,
                         momentum=momentum,
@@ -553,6 +561,7 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr2,
                         fw_lr3,
                         chunk_size=self.lact_chunk_size,
+                        ttt_inner_steps=self.ttt_inner_steps,
                         use_muon=self.use_muon,
                         momentum=momentum,
                     )
@@ -568,6 +577,7 @@ class LaCTSWIGLULayer(nn.Module):
                         fw_lr2,
                         fw_lr3,
                         chunk_size=self.lact_chunk_size,
+                        ttt_inner_steps=self.ttt_inner_steps,
                         update_phase=self.memory_update_phase,
                         use_muon=self.use_muon,
                         momentum=momentum,

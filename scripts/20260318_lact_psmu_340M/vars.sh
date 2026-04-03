@@ -4,7 +4,7 @@ export USERNAME=$(whoami)
 
 flame_dir="/work/yufei/projects/flame"
 
-RUN_NAME=$(basename "$(dirname "$0")")_swa_2k_chunk_1k_nonfused_top8layer-0-256-0-256-0-256-0-256
+RUN_NAME=$(basename "$(dirname "$0")")_swa_2k_chunk_1k_nonfused_top12layer-0-256-512-768-x3
 
 
 

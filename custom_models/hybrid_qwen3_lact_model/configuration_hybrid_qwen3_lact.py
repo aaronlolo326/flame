@@ -43,6 +43,7 @@ class HybridQwen3LaCTConfig(PretrainedConfig):
         no_v_silu: bool = False,
         lr_parameterization: str = "mamba",
         learnable_ttt_scale: bool = True,
+        ttt_inner_steps: int = 1,
         use_momentum: bool = True,
         ttt_loss_type: str = "dot_product",
         ttt_prenorm: bool = True,
@@ -104,6 +105,7 @@ class HybridQwen3LaCTConfig(PretrainedConfig):
         self.no_v_silu = no_v_silu
         self.lr_parameterization = lr_parameterization
         self.learnable_ttt_scale = learnable_ttt_scale
+        self.ttt_inner_steps = ttt_inner_steps
         self.use_momentum = use_momentum
         self.ttt_loss_type = ttt_loss_type
         self.ttt_prenorm = ttt_prenorm

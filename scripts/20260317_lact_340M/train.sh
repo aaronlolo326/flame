@@ -4,9 +4,9 @@ echo $RUN_NAME
 debug=false
 profile=false
 
-batch_size=4
+batch_size=2
 seq_len=4096
-grad_accum=4
+grad_accum=8
 no_tokens=$(( 15 * 10**9 ))
 
 if [ "$debug" = true ]; then

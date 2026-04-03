@@ -36,6 +36,7 @@
     "lr_dim": 1,
     "lr_parameterization": "mamba",
     "learnable_ttt_scale": true,
+    "ttt_inner_steps": 4,
     "use_momentum": true,
     "w0_w2_low_rank": 32,
     "fw_init_gain": 0.5,
@@ -46,4 +47,4 @@
     "use_fused_kernel": false,
     "use_cache": true
   }
-  
+

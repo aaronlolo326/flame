@@ -95,6 +95,7 @@ class LaCTBlock(nn.Module):
             ttt_nope=config.ttt_nope,
             lr_parameterization=config.lr_parameterization,
             learnable_ttt_scale=config.learnable_ttt_scale,
+            ttt_inner_steps=config.ttt_inner_steps,
             rope_theta=config.rope_theta,
             max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
