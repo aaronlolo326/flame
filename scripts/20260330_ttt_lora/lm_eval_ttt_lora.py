@@ -27,6 +27,10 @@ from run_ttt_lora import (
     GRAD_CLIP,
     LR,
     LOCAL_TRAIN_WINDOW,
+    LOSS_MODE,
+    LOSS_TOPK_FRACTION,
+    LORA_ALPHA,
+    LORA_R,
     STEPS_PER_CHUNK,
     UPDATE_MODE,
     WEIGHT_DECAY,
@@ -142,6 +146,10 @@ class HFTTTLoRALM(HFLM):
         ttt_steps_per_chunk: int = STEPS_PER_CHUNK,
         ttt_update_mode: str = UPDATE_MODE,
         ttt_local_train_window: int = LOCAL_TRAIN_WINDOW,
+        ttt_lora_r: int = LORA_R,
+        ttt_lora_alpha: int = LORA_ALPHA,
+        ttt_loss_mode: str = LOSS_MODE,
+        ttt_loss_topk_fraction: float = LOSS_TOPK_FRACTION,
         ttt_lr: float = LR,
         ttt_beta1: float = BETAS[0],
         ttt_beta2: float = BETAS[1],
@@ -155,13 +163,22 @@ class HFTTTLoRALM(HFLM):
         super().__init__(*args, **kwargs)
         self.ttt_enable = bool(ttt_enable)
         if self.ttt_enable:
-            self._model = attach_ttt_lora(self.model, top_layer_fraction=TOP_LAYER_FRACTION)
+            self._model = attach_ttt_lora(
+                self.model,
+                top_layer_fraction=TOP_LAYER_FRACTION,
+                lora_r=int(ttt_lora_r),
+                lora_alpha=int(ttt_lora_alpha),
+            )
         self._model.eval()
 
         self.ttt_chunk_size = int(ttt_chunk_size)
         self.ttt_steps_per_chunk = int(ttt_steps_per_chunk)
         self.ttt_update_mode = normalize_update_mode(str(ttt_update_mode))
         self.ttt_local_train_window = int(ttt_local_train_window)
+        self.ttt_lora_r = int(ttt_lora_r)
+        self.ttt_lora_alpha = int(ttt_lora_alpha)
+        self.ttt_loss_mode = str(ttt_loss_mode)
+        self.ttt_loss_topk_fraction = float(ttt_loss_topk_fraction)
         self.ttt_lr = float(ttt_lr)
         self.ttt_betas = (float(ttt_beta1), float(ttt_beta2))
         self.ttt_weight_decay = float(ttt_weight_decay)
@@ -229,6 +246,8 @@ class HFTTTLoRALM(HFLM):
                     chunk_size=self.ttt_chunk_size,
                     update_mode=self.ttt_update_mode,
                     local_train_window=self.ttt_local_train_window,
+                    loss_mode=self.ttt_loss_mode,
+                    loss_topk_fraction=self.ttt_loss_topk_fraction,
                     base_prefix_cache=prefix_cache_for_chunk,
                 )
 
@@ -239,6 +258,10 @@ class HFTTTLoRALM(HFLM):
                         "steps_per_chunk": self.ttt_steps_per_chunk,
                         "update_mode": self.ttt_update_mode,
                         "local_train_window": self.ttt_local_train_window if self.ttt_update_mode == "local_window" else None,
+                        "lora_r": self.ttt_lora_r,
+                        "lora_alpha": self.ttt_lora_alpha,
+                        "loss_mode": self.ttt_loss_mode,
+                        "loss_topk_fraction": self.ttt_loss_topk_fraction if self.ttt_loss_mode == "topk_fraction" else None,
                         "chunk_start": start,
                         "chunk_end": end,
                         "chunk_tokens": end - start,

@@ -21,6 +21,8 @@ from run_ttt_lora import (
     generate_from_adapted_state,
     get_trainable_lora_parameters,
     LOCAL_TRAIN_WINDOW,
+    LOSS_MODE,
+    LOSS_TOPK_FRACTION,
     normalize_update_mode,
     rebuild_cache_for_prefix,
     reset_trainable_state,
@@ -58,6 +60,8 @@ def parse_args() -> argparse.Namespace:
         choices=("full_prefix", "full_prefix_approx", "full_prefix_exact", "local_window"),
     )
     parser.add_argument("--local-train-window", type=int, default=LOCAL_TRAIN_WINDOW)
+    parser.add_argument("--loss-mode", type=str, default=LOSS_MODE, choices=("full", "topk_fraction"))
+    parser.add_argument("--loss-topk-fraction", type=float, default=LOSS_TOPK_FRACTION)
     parser.add_argument("--max-length", type=int, default=16384)
     parser.add_argument("--max-gen-toks", type=int, default=None)
     parser.add_argument("--raw-chars-per-token", type=float, default=3.0)
@@ -192,7 +196,8 @@ def main() -> None:
         print(
             "[ttt] "
             f"seq_len={seq_len} chunk_size={args.chunk_size} steps_per_chunk={args.steps_per_chunk} "
-            f"update_mode={args.update_mode} local_train_window={args.local_train_window} num_chunks={num_chunks} "
+            f"update_mode={args.update_mode} local_train_window={args.local_train_window} "
+            f"loss_mode={args.loss_mode} loss_topk_fraction={args.loss_topk_fraction} num_chunks={num_chunks} "
             f"device={device} dtype={args.dtype}"
         )
         for chunk_idx, start in enumerate(range(0, seq_len, args.chunk_size)):
@@ -222,6 +227,8 @@ def main() -> None:
                     chunk_size=args.chunk_size,
                     update_mode=args.update_mode,
                     local_train_window=args.local_train_window,
+                    loss_mode=args.loss_mode,
+                    loss_topk_fraction=args.loss_topk_fraction,
                     base_prefix_cache=prefix_cache_for_chunk,
                 )
                 lora_norm = compute_delta_norm(trainable_lora_params, initial_lora_state)
@@ -247,6 +254,8 @@ def main() -> None:
                         "steps_per_chunk": args.steps_per_chunk,
                         "update_mode": args.update_mode,
                         "local_train_window": args.local_train_window if args.update_mode == "local_window" else None,
+                        "loss_mode": args.loss_mode,
+                        "loss_topk_fraction": args.loss_topk_fraction if args.loss_mode == "topk_fraction" else None,
                         "chunk_start": start,
                         "chunk_end": end,
                         "chunk_tokens": end - start,
@@ -320,6 +329,8 @@ def main() -> None:
         "steps_per_chunk": args.steps_per_chunk,
         "update_mode": args.update_mode,
         "local_train_window": args.local_train_window if args.update_mode == "local_window" else None,
+        "loss_mode": args.loss_mode,
+        "loss_topk_fraction": args.loss_topk_fraction if args.loss_mode == "topk_fraction" else None,
         "max_length": args.max_length,
         "max_gen_toks": args.max_gen_toks,
         "peak_allocated_gb": peak_allocated_gb,

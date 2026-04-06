@@ -56,6 +56,37 @@ The base model stays frozen. Only LoRA parameters are updated.
 The final inference path always uses full-prefix KV after rebuild, regardless
 of update mode.
 
+## Loss Modes
+
+`TTT_LOSS_MODE` / `--loss-mode` is independent of update mode and composes with
+all update-pass variants.
+
+Supported options:
+
+- `full`
+  Standard next-token CE averaged over all scored tokens in the current update
+  span.
+- `topk_fraction`
+  Computes per-token CE, keeps only the highest-loss fraction of tokens, and
+  averages over that subset.
+
+`TTT_LOSS_TOPK_FRACTION` / `--loss-topk-fraction` controls the kept fraction
+when `loss_mode=topk_fraction`.
+
+So the current implementation has two orthogonal knobs:
+
+1. update-pass context mode
+   `full_prefix_exact`, `full_prefix_approx`, or `local_window`
+2. loss selection mode
+   `full` or `topk_fraction`
+
+Examples of valid combinations:
+
+- `full_prefix_exact + full`
+- `full_prefix_exact + topk_fraction`
+- `full_prefix_approx + topk_fraction`
+- `local_window + topk_fraction`
+
 ## Important Notes
 
 ### Zero initialization

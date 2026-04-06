@@ -18,8 +18,13 @@ TASKS="${TASKS:-longbench}"
 MAX_LENGTH="${MAX_LENGTH:-16384}"
 TTT_CHUNK_SIZE="${TTT_CHUNK_SIZE:-512}"
 TTT_STEPS_PER_CHUNK="${TTT_STEPS_PER_CHUNK:-1}"
-TTT_UPDATE_MODE="${TTT_UPDATE_MODE:-full_prefix}"
+TTT_UPDATE_MODE="${TTT_UPDATE_MODE:-local_window}"
 TTT_LOCAL_TRAIN_WINDOW="${TTT_LOCAL_TRAIN_WINDOW:-2048}"
+TTT_LORA_R="${TTT_LORA_R:-64}"
+TTT_LORA_ALPHA="${TTT_LORA_ALPHA:-${TTT_LORA_R}}"
+TTT_LR="${TTT_LR:-1e-5}"
+TTT_LOSS_MODE="${TTT_LOSS_MODE:-topk_fraction}"
+TTT_LOSS_TOPK_FRACTION="${TTT_LOSS_TOPK_FRACTION:-0.2}"
 TTT_RAW_CHARS_PER_TOKEN="${TTT_RAW_CHARS_PER_TOKEN:-4.0}"
 TTT_RAW_TRUNC_SAFETY_MARGIN="${TTT_RAW_TRUNC_SAFETY_MARGIN:-1.1}"
 NUM_FEWSHOT="${NUM_FEWSHOT:-0}"
@@ -66,7 +71,7 @@ echo "${OUTPUT_TAG}" > "${lm_eval_output_path}/${OUTPUT_SUBDIR}/run_tag.txt"
 
 MODEL_SCRIPT="$(dirname "$0")/lm_eval_ttt_lora.py"
 MODEL_NAME="hf-ttt-lora"
-MODEL_ARGS="pretrained=${eval_hf_path},trust_remote_code=True,dtype=bfloat16,torch_dtype=bfloat16,max_length=${MAX_LENGTH},ttt_chunk_size=${TTT_CHUNK_SIZE},ttt_steps_per_chunk=${TTT_STEPS_PER_CHUNK},ttt_update_mode=${TTT_UPDATE_MODE},ttt_local_train_window=${TTT_LOCAL_TRAIN_WINDOW},ttt_lr=1e-5,ttt_beta1=0.9,ttt_beta2=0.95,ttt_weight_decay=0.0,ttt_grad_clip=1.0,ttt_raw_chars_per_token=${TTT_RAW_CHARS_PER_TOKEN},ttt_raw_trunc_safety_margin=${TTT_RAW_TRUNC_SAFETY_MARGIN},ttt_log_path=${lm_eval_output_path}/longbench_ttt_lora_chunks.jsonl"
+MODEL_ARGS="pretrained=${eval_hf_path},trust_remote_code=True,dtype=bfloat16,torch_dtype=bfloat16,max_length=${MAX_LENGTH},ttt_chunk_size=${TTT_CHUNK_SIZE},ttt_steps_per_chunk=${TTT_STEPS_PER_CHUNK},ttt_update_mode=${TTT_UPDATE_MODE},ttt_local_train_window=${TTT_LOCAL_TRAIN_WINDOW},ttt_lora_r=${TTT_LORA_R},ttt_lora_alpha=${TTT_LORA_ALPHA},ttt_loss_mode=${TTT_LOSS_MODE},ttt_loss_topk_fraction=${TTT_LOSS_TOPK_FRACTION},ttt_lr=${TTT_LR},ttt_beta1=0.9,ttt_beta2=0.95,ttt_weight_decay=0.0,ttt_grad_clip=1.0,ttt_raw_chars_per_token=${TTT_RAW_CHARS_PER_TOKEN},ttt_raw_trunc_safety_margin=${TTT_RAW_TRUNC_SAFETY_MARGIN},ttt_log_path=${lm_eval_output_path}/longbench_ttt_lora_chunks.jsonl"
 
 if [[ "${USE_TTT_LORA}" == "0" ]]; then
   MODEL_ARGS="pretrained=${eval_hf_path},trust_remote_code=True,dtype=bfloat16,torch_dtype=bfloat16,max_length=${MAX_LENGTH},ttt_enable=0"
@@ -75,6 +80,7 @@ fi
 echo "Resolved model: ${eval_hf_path}"
 echo "Use TTT LoRA: ${USE_TTT_LORA}"
 echo "Resolved tasks: ${TASKS}"
+echo "Resolved TTT LoRA rank/alpha/lr: ${TTT_LORA_R}/${TTT_LORA_ALPHA}/${TTT_LR}"
 
 accelerate launch --main_process_port "${MAIN_PROCESS_PORT}" "${MODEL_SCRIPT}" \
    --model "${MODEL_NAME}" \

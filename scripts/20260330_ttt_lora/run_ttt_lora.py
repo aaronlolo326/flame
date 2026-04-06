@@ -44,8 +44,10 @@ TARGET_MODULES = ("q_proj", "v_proj")
 TOP_LAYER_FRACTION = 0.125
 CHUNK_SIZE = 1024
 STEPS_PER_CHUNK = 1
-UPDATE_MODE = "full_prefix"
+UPDATE_MODE = "full_prefix_approx"
 LOCAL_TRAIN_WINDOW = 2048
+LOSS_MODE = "topk_fraction"
+LOSS_TOPK_FRACTION = 0.2
 LORA_R = 64
 LORA_ALPHA = 64
 LORA_DROPOUT = 0.0
@@ -113,6 +115,22 @@ def parse_args() -> argparse.Namespace:
         choices=("full_prefix", "full_prefix_approx", "full_prefix_exact", "local_window"),
     )
     parser.add_argument("--local-train-window", type=int, default=LOCAL_TRAIN_WINDOW)
+    parser.add_argument("--lora-r", type=int, default=LORA_R, help="LoRA rank.")
+    parser.add_argument("--lora-alpha", type=int, default=LORA_ALPHA, help="LoRA alpha.")
+    parser.add_argument("--lr", type=float, default=LR, help="AdamW learning rate.")
+    parser.add_argument(
+        "--loss-mode",
+        type=str,
+        default=LOSS_MODE,
+        choices=("full", "topk_fraction"),
+        help="Chunk loss reduction mode.",
+    )
+    parser.add_argument(
+        "--loss-topk-fraction",
+        type=float,
+        default=LOSS_TOPK_FRACTION,
+        help="Fraction of highest-loss tokens to keep when loss-mode=topk_fraction.",
+    )
     parser.add_argument("--device", type=str, default=None, help="Torch device, e.g. cuda:0 or cpu.")
     parser.add_argument(
         "--dtype",
@@ -206,6 +224,8 @@ def attach_ttt_lora(
     model,
     module_suffixes: Sequence[str] = TARGET_MODULES,
     top_layer_fraction: float = TOP_LAYER_FRACTION,
+    lora_r: int = LORA_R,
+    lora_alpha: int = LORA_ALPHA,
 ):
     target_modules = resolve_top_layer_target_modules(
         model,
@@ -214,8 +234,8 @@ def attach_ttt_lora(
     )
 
     lora_config = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
+        r=lora_r,
+        lora_alpha=lora_alpha,
         target_modules=target_modules,
         lora_dropout=LORA_DROPOUT,
         bias="none",
@@ -234,6 +254,8 @@ def build_model_and_tokenizer(
     device: torch.device,
     torch_dtype: Optional[torch.dtype],
     trust_remote_code: bool,
+    lora_r: int = LORA_R,
+    lora_alpha: int = LORA_ALPHA,
 ):
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,
@@ -249,7 +271,7 @@ def build_model_and_tokenizer(
         device=device,
     )
     model.eval()
-    model = attach_ttt_lora(model)
+    model = attach_ttt_lora(model, lora_r=lora_r, lora_alpha=lora_alpha)
     model.to(device)
 
     return model, tokenizer
@@ -284,10 +306,10 @@ def compute_delta_norm(
     return math.sqrt(total)
 
 
-def create_optimizer(params: Iterable[torch.nn.Parameter]) -> torch.optim.Optimizer:
+def create_optimizer(params: Iterable[torch.nn.Parameter], lr: float = LR) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
         params,
-        lr=LR,
+        lr=lr,
         betas=BETAS,
         weight_decay=WEIGHT_DECAY,
     )
@@ -384,6 +406,8 @@ def compute_chunk_loss(
     full_input_ids: torch.LongTensor,
     chunk_start: int,
     chunk_end: int,
+    loss_mode: str,
+    loss_topk_fraction: float,
 ) -> Optional[torch.Tensor]:
     valid_len = min(chunk_end, full_input_ids.shape[1] - 1) - chunk_start
     if valid_len <= 0:
@@ -391,9 +415,11 @@ def compute_chunk_loss(
 
     logits_for_loss = logits[:, :valid_len, :].contiguous()
     labels = full_input_ids[:, chunk_start + 1: chunk_start + 1 + valid_len].contiguous()
-    return F.cross_entropy(
-        logits_for_loss.view(-1, logits_for_loss.size(-1)),
-        labels.view(-1),
+    return reduce_token_losses(
+        logits_for_loss=logits_for_loss,
+        labels=labels,
+        loss_mode=loss_mode,
+        loss_topk_fraction=loss_topk_fraction,
     )
 
 
@@ -402,6 +428,8 @@ def compute_loss_on_segment(
     segment_input_ids: torch.LongTensor,
     loss_start: int,
     loss_end: int,
+    loss_mode: str,
+    loss_topk_fraction: float,
 ) -> Optional[torch.Tensor]:
     valid_len = min(loss_end, segment_input_ids.shape[1] - 1) - loss_start
     if valid_len <= 0:
@@ -409,10 +437,34 @@ def compute_loss_on_segment(
 
     logits_for_loss = logits[:, loss_start: loss_start + valid_len, :].contiguous()
     labels = segment_input_ids[:, loss_start + 1: loss_start + 1 + valid_len].contiguous()
-    return F.cross_entropy(
-        logits_for_loss.view(-1, logits_for_loss.size(-1)),
-        labels.view(-1),
+    return reduce_token_losses(
+        logits_for_loss=logits_for_loss,
+        labels=labels,
+        loss_mode=loss_mode,
+        loss_topk_fraction=loss_topk_fraction,
     )
+
+
+def reduce_token_losses(
+    logits_for_loss: torch.Tensor,
+    labels: torch.LongTensor,
+    loss_mode: str,
+    loss_topk_fraction: float,
+) -> torch.Tensor:
+    flat_logits = logits_for_loss.view(-1, logits_for_loss.size(-1))
+    flat_labels = labels.view(-1)
+    token_losses = F.cross_entropy(flat_logits, flat_labels, reduction="none")
+
+    if loss_mode == "full":
+        return token_losses.mean()
+    if loss_mode != "topk_fraction":
+        raise ValueError(f"Unsupported loss_mode: {loss_mode}")
+    if not (0.0 < loss_topk_fraction <= 1.0):
+        raise ValueError(f"loss_topk_fraction must be in (0, 1], got {loss_topk_fraction}")
+
+    keep_k = max(1, math.ceil(token_losses.numel() * loss_topk_fraction))
+    topk_losses, _ = torch.topk(token_losses, k=keep_k, largest=True, sorted=False)
+    return topk_losses.mean()
 
 
 def normalize_update_mode(update_mode: str) -> str:
@@ -433,6 +485,8 @@ def forward_local_window_update(
     chunk_start: int,
     chunk_end: int,
     local_train_window: int,
+    loss_mode: str,
+    loss_topk_fraction: float,
 ) -> Optional[torch.Tensor]:
     window_start = max(0, chunk_start - local_train_window)
     window_ids = full_input_ids[:, window_start:chunk_end]
@@ -444,7 +498,14 @@ def forward_local_window_update(
     )
     loss_start = chunk_start - window_start
     loss_end = chunk_end - window_start
-    return compute_loss_on_segment(outputs.logits, window_ids, loss_start=loss_start, loss_end=loss_end)
+    return compute_loss_on_segment(
+        outputs.logits,
+        window_ids,
+        loss_start=loss_start,
+        loss_end=loss_end,
+        loss_mode=loss_mode,
+        loss_topk_fraction=loss_topk_fraction,
+    )
 
 
 def forward_full_prefix_update(
@@ -453,6 +514,8 @@ def forward_full_prefix_update(
     chunk_start: int,
     chunk_end: int,
     chunk_size: int,
+    loss_mode: str,
+    loss_topk_fraction: float,
 ) -> Optional[torch.Tensor]:
     prefix_cache = None
     if chunk_start > 0:
@@ -473,6 +536,8 @@ def forward_full_prefix_update(
         full_input_ids=full_input_ids,
         chunk_start=chunk_start,
         chunk_end=chunk_end,
+        loss_mode=loss_mode,
+        loss_topk_fraction=loss_topk_fraction,
     )
 
 
@@ -482,6 +547,8 @@ def forward_full_prefix_approx_update(
     chunk_start: int,
     chunk_end: int,
     base_prefix_cache,
+    loss_mode: str,
+    loss_topk_fraction: float,
 ) -> Optional[torch.Tensor]:
     logits, _ = forward_chunk_with_cache(
         model=model,
@@ -494,6 +561,8 @@ def forward_full_prefix_approx_update(
         full_input_ids=full_input_ids,
         chunk_start=chunk_start,
         chunk_end=chunk_end,
+        loss_mode=loss_mode,
+        loss_topk_fraction=loss_topk_fraction,
     )
 
 
@@ -507,6 +576,8 @@ def run_chunk_update_step(
     chunk_size: int,
     update_mode: str,
     local_train_window: int,
+    loss_mode: str,
+    loss_topk_fraction: float,
     base_prefix_cache=None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     optimizer.zero_grad(set_to_none=True)
@@ -519,6 +590,8 @@ def run_chunk_update_step(
             chunk_start=chunk_start,
             chunk_end=chunk_end,
             local_train_window=local_train_window,
+            loss_mode=loss_mode,
+            loss_topk_fraction=loss_topk_fraction,
         )
     elif resolved_update_mode == "full_prefix_exact":
         loss = forward_full_prefix_update(
@@ -527,6 +600,8 @@ def run_chunk_update_step(
             chunk_start=chunk_start,
             chunk_end=chunk_end,
             chunk_size=chunk_size,
+            loss_mode=loss_mode,
+            loss_topk_fraction=loss_topk_fraction,
         )
     elif resolved_update_mode == "full_prefix_approx":
         loss = forward_full_prefix_approx_update(
@@ -535,6 +610,8 @@ def run_chunk_update_step(
             chunk_start=chunk_start,
             chunk_end=chunk_end,
             base_prefix_cache=base_prefix_cache,
+            loss_mode=loss_mode,
+            loss_topk_fraction=loss_topk_fraction,
         )
     else:
         raise ValueError(f"Unsupported update_mode: {update_mode}")
@@ -611,6 +688,8 @@ def adapt_and_generate_for_sample(
     steps_per_chunk: int,
     update_mode: str,
     local_train_window: int,
+    loss_mode: str,
+    loss_topk_fraction: float,
     max_new_tokens: int,
     do_sample: bool,
     temperature: float,
@@ -629,7 +708,7 @@ def adapt_and_generate_for_sample(
         raise ValueError("Empty prompt after tokenization.")
 
     reset_trainable_state(trainable_lora_params, initial_lora_state)
-    optimizer = create_optimizer([param for _, param in trainable_lora_params])
+    optimizer = create_optimizer([param for _, param in trainable_lora_params], lr=lr)
 
     last_rebuild = None
 
@@ -648,6 +727,8 @@ def adapt_and_generate_for_sample(
                 chunk_size=chunk_size,
                 update_mode=update_mode,
                 local_train_window=local_train_window,
+                loss_mode=loss_mode,
+                loss_topk_fraction=loss_topk_fraction,
                 base_prefix_cache=prefix_cache_for_chunk,
             )
             step_logs.append(
@@ -659,6 +740,8 @@ def adapt_and_generate_for_sample(
                 "steps_per_chunk": steps_per_chunk,
                 "update_mode": normalize_update_mode(update_mode),
                 "local_train_window": local_train_window if normalize_update_mode(update_mode) == "local_window" else None,
+                "loss_mode": loss_mode,
+                "loss_topk_fraction": loss_topk_fraction if loss_mode == "topk_fraction" else None,
                 "chunk_start": start,
                 "chunk_end": end,
                 "chunk_tokens": end - start,
@@ -713,6 +796,8 @@ def main() -> None:
         device=device,
         torch_dtype=torch_dtype,
         trust_remote_code=args.trust_remote_code,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
     )
 
     trainable_lora_params = get_trainable_lora_parameters(model)
@@ -739,6 +824,9 @@ def main() -> None:
                 steps_per_chunk=args.steps_per_chunk,
                 update_mode=args.update_mode,
                 local_train_window=args.local_train_window,
+                lr=args.lr,
+                loss_mode=args.loss_mode,
+                loss_topk_fraction=args.loss_topk_fraction,
                 max_new_tokens=args.max_new_tokens,
                 do_sample=args.do_sample,
                 temperature=args.temperature,
