@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import importlib.util
 import json
 import logging
 from pathlib import Path
@@ -37,6 +38,7 @@ from run_ttt_lora import (
     adapt_and_generate_for_sample,
     attach_ttt_lora,
     clone_trainable_state,
+    get_task_family,
     get_trainable_lora_parameters,
     should_prefer_flash_attention_2,
 )
@@ -51,6 +53,19 @@ DEFAULT_SAMPLES_BASE = Path(
 
 
 eval_logger = logging.getLogger(__name__)
+
+
+def _load_legacy_ttt_module():
+    legacy_path = Path("/work/yufei/projects/flame/scripts/20260330_ttt_lora/run_ttt_lora.py")
+    spec = importlib.util.spec_from_file_location("legacy_ttt_lora_run", legacy_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load legacy TTT-LoRA module from {legacy_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+LEGACY_TTT = _load_legacy_ttt_module()
 
 
 def _normalize_task_question(doc: dict[str, Any], task_name: Optional[str]) -> str:
@@ -256,6 +271,74 @@ class HFTestTimeDistillLM(HFLM):
                     return obj
         return None
 
+    def _legacy_ntp_adapt(
+        self,
+        input_ids: torch.LongTensor,
+    ):
+        reset_trainable_state = LEGACY_TTT.reset_trainable_state
+        rebuild_cache_for_prefix = LEGACY_TTT.rebuild_cache_for_prefix
+        run_chunk_update_step = LEGACY_TTT.run_chunk_update_step
+        compute_delta_norm = LEGACY_TTT.compute_delta_norm
+
+        reset_trainable_state(self.trainable_lora_params, self.initial_lora_state)
+        optimizer = torch.optim.AdamW(
+            [param for _, param in self.trainable_lora_params],
+            lr=self.ttt_lr,
+            betas=self.ttt_betas,
+            weight_decay=self.ttt_weight_decay,
+        )
+        last_rebuild = None
+        logs = []
+        seq_len = input_ids.shape[1]
+
+        for chunk_idx, start in enumerate(range(0, seq_len, self.ttt_chunk_size)):
+            end = min(start + self.ttt_chunk_size, seq_len)
+            prefix_cache_for_chunk = None if start == 0 or last_rebuild is None else last_rebuild.past_key_values
+            loss, grad_norm = run_chunk_update_step(
+                model=self.model,
+                optimizer=optimizer,
+                trainable_lora_params=self.trainable_lora_params,
+                full_input_ids=input_ids,
+                chunk_start=start,
+                chunk_end=end,
+                chunk_size=self.ttt_chunk_size,
+                update_mode="full_prefix_approx",
+                local_train_window=2048,
+                loss_mode="topk_fraction",
+                loss_topk_fraction=0.2,
+                base_prefix_cache=prefix_cache_for_chunk,
+            )
+            last_rebuild = rebuild_cache_for_prefix(
+                self.model,
+                input_ids[:, :end],
+                chunk_size=self.ttt_chunk_size,
+            )
+            logs.append(
+                {
+                    "event": "chunk_update",
+                    "adaptation_method": "legacy_ntp_ttt_lora",
+                    "chunk_idx": chunk_idx,
+                    "chunk_start": start,
+                    "chunk_end": end,
+                    "chunk_tokens": end - start,
+                    "loss": None if loss is None else float(loss.detach().cpu().item()),
+                    "grad_norm": None
+                    if grad_norm is None
+                    else float(grad_norm.detach().cpu().item())
+                    if torch.is_tensor(grad_norm)
+                    else float(grad_norm),
+                    "lora_norm": float(compute_delta_norm(self.trainable_lora_params, self.initial_lora_state)),
+                }
+            )
+
+        if last_rebuild is None:
+            last_rebuild = rebuild_cache_for_prefix(
+                self.model,
+                input_ids,
+                chunk_size=self.ttt_chunk_size,
+            )
+        return last_rebuild, logs
+
     def _build_sample_spec(
         self,
         rendered_prompt: str,
@@ -323,6 +406,7 @@ class HFTestTimeDistillLM(HFLM):
 
             max_ctx_len = self.max_length - max_gen_toks
             sample = self._build_sample_spec(context, req=req, max_ctx_len=max_ctx_len)
+            task_family = get_task_family(str(sample.metadata.get("task_name") or ""))
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(self.device)
 
@@ -340,6 +424,7 @@ class HFTestTimeDistillLM(HFLM):
                     "doc_id": getattr(req, "doc_id", None),
                     "instance_idx": getattr(req, "idx", None),
                     "sample_source": sample.metadata.get("sample_source"),
+                    "task_family": task_family,
                     "final_prompt_char_len": len(sample.final_prompt),
                     "adaptation_char_len": len(sample.adaptation_text),
                     "task_question": sample.task_question,
@@ -352,28 +437,60 @@ class HFTestTimeDistillLM(HFLM):
 
             try:
                 if self.ttt_enable:
-                    result = adapt_and_generate_for_sample(
-                        model=self.model,
-                        tokenizer=self.tokenizer,
-                        sample=sample,
-                        sample_index=req_idx,
-                        chunk_size=self.ttt_chunk_size,
-                        update_mode=self.ttt_update_mode,
-                        lr=self.ttt_lr,
-                        num_qa_candidates=self.ttt_num_qa_candidates,
-                        num_judge_candidates=self.ttt_num_judge_candidates,
-                        num_selected_qa=self.ttt_num_selected_qa,
-                        qa_generation_max_new_tokens=self.ttt_qa_generation_max_new_tokens,
-                        qa_judge_max_new_tokens=self.ttt_qa_judge_max_new_tokens,
-                        max_new_tokens=max_gen_toks,
-                        do_sample=do_sample,
-                        temperature=temperature,
-                        top_p=top_p,
-                        initial_lora_state=self.initial_lora_state,
-                        trainable_lora_params=self.trainable_lora_params,
-                        log_file=self._ttt_log_handle,
-                    )
-                    continuation = result["generated_text"]
+                    if task_family == "qa":
+                        result = adapt_and_generate_for_sample(
+                            model=self.model,
+                            tokenizer=self.tokenizer,
+                            sample=sample,
+                            sample_index=req_idx,
+                            chunk_size=self.ttt_chunk_size,
+                            update_mode=self.ttt_update_mode,
+                            lr=self.ttt_lr,
+                            num_qa_candidates=self.ttt_num_qa_candidates,
+                            num_judge_candidates=self.ttt_num_judge_candidates,
+                            num_selected_qa=self.ttt_num_selected_qa,
+                            qa_generation_max_new_tokens=self.ttt_qa_generation_max_new_tokens,
+                            qa_judge_max_new_tokens=self.ttt_qa_judge_max_new_tokens,
+                            max_new_tokens=max_gen_toks,
+                            do_sample=do_sample,
+                            temperature=temperature,
+                            top_p=top_p,
+                            initial_lora_state=self.initial_lora_state,
+                            trainable_lora_params=self.trainable_lora_params,
+                            log_file=self._ttt_log_handle,
+                        )
+                        continuation = result["generated_text"]
+                    else:
+                        prompt_ids, _ = self.tok_batch_encode(
+                            [sample.final_prompt],
+                            left_truncate_len=max_ctx_len,
+                            truncation=self.truncation,
+                        )
+                        prompt_ids = prompt_ids.to(self.device)
+                        rebuild, logs = self._legacy_ntp_adapt(prompt_ids)
+                        for chunk_log in logs:
+                            self._write_ttt_log(
+                                {
+                                    "request_idx": req_idx,
+                                    "rank": self.rank,
+                                    "task_name": getattr(req, "task_name", None),
+                                    "doc_id": getattr(req, "doc_id", None),
+                                    **chunk_log,
+                                    **self._memory_stats(),
+                                }
+                            )
+                        cont_toks = LEGACY_TTT.generate_from_adapted_state(
+                            model=self.model,
+                            prefix_ids=prompt_ids,
+                            past_key_values=rebuild.past_key_values,
+                            last_logits=rebuild.last_logits,
+                            max_new_tokens=max_gen_toks,
+                            do_sample=do_sample,
+                            temperature=temperature,
+                            top_p=top_p,
+                            eos_token_id=self.eot_token_id,
+                        )
+                        continuation = self.tok_decode(cont_toks[0].tolist())
                 else:
                     context_enc, _ = self.tok_batch_encode(
                         [sample.final_prompt],

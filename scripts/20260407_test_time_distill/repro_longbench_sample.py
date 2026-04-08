@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib.util
 import json
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from run_ttt_lora import (
     adapt_and_generate_for_sample,
     build_model_and_tokenizer,
     clone_trainable_state,
+    get_task_family,
     get_trainable_lora_parameters,
     resolve_device,
     resolve_dtype,
@@ -35,6 +37,19 @@ DEFAULT_SAMPLES_BASE = Path(
     "lb/__storage__backup__yufei__ttt__flame__exp__"
     "20260322_hybrid_qwen3_lact_0p6B_swa_2k_chunk_1k_rerun12_prolong_prolong_from_run12_step9535_v4"
 )
+
+
+def load_legacy_ttt_module():
+    legacy_path = Path("/work/yufei/projects/flame/scripts/20260330_ttt_lora/run_ttt_lora.py")
+    spec = importlib.util.spec_from_file_location("legacy_ttt_lora_run", legacy_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load legacy TTT-LoRA module from {legacy_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+LEGACY_TTT = load_legacy_ttt_module()
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,6 +172,8 @@ def main() -> None:
         f"num_judge_candidates={args.num_judge_candidates} "
         f"num_selected_qa={args.num_selected_qa}"
     )
+    task_family = get_task_family(str(doc.get("task") or ""))
+    print(f"[route] task_family={task_family} adaptation_method={'distill' if task_family == 'qa' else 'legacy_ntp_ttt_lora'}")
 
     trainable_lora_params = get_trainable_lora_parameters(model)
     initial_lora_state = clone_trainable_state(trainable_lora_params)
@@ -168,27 +185,77 @@ def main() -> None:
     result = None
 
     try:
-        result = adapt_and_generate_for_sample(
-            model=model,
-            tokenizer=tokenizer,
-            sample=sample,
-            sample_index=0,
-            chunk_size=args.chunk_size,
-            update_mode="full_prefix_approx",
-            lr=args.lr,
-            num_qa_candidates=args.num_qa_candidates,
-            num_judge_candidates=args.num_judge_candidates,
-            num_selected_qa=args.num_selected_qa,
-            qa_generation_max_new_tokens=args.qa_generation_max_new_tokens,
-            qa_judge_max_new_tokens=args.qa_judge_max_new_tokens,
-            max_new_tokens=max_gen_toks,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=1.0,
-            initial_lora_state=initial_lora_state,
-            trainable_lora_params=trainable_lora_params,
-            log_file=None,
-        )
+        if task_family == "qa":
+            result = adapt_and_generate_for_sample(
+                model=model,
+                tokenizer=tokenizer,
+                sample=sample,
+                sample_index=0,
+                chunk_size=args.chunk_size,
+                update_mode="full_prefix_approx",
+                lr=args.lr,
+                num_qa_candidates=args.num_qa_candidates,
+                num_judge_candidates=args.num_judge_candidates,
+                num_selected_qa=args.num_selected_qa,
+                qa_generation_max_new_tokens=args.qa_generation_max_new_tokens,
+                qa_judge_max_new_tokens=args.qa_judge_max_new_tokens,
+                max_new_tokens=max_gen_toks,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=1.0,
+                initial_lora_state=initial_lora_state,
+                trainable_lora_params=trainable_lora_params,
+                log_file=None,
+            )
+        else:
+            input_ids = tokenizer(sample.final_prompt, return_tensors="pt")["input_ids"].to(device)
+            LEGACY_TTT.reset_trainable_state(trainable_lora_params, initial_lora_state)
+            optimizer = torch.optim.AdamW(
+                [param for _, param in trainable_lora_params],
+                lr=args.lr,
+                betas=LEGACY_TTT.BETAS,
+                weight_decay=LEGACY_TTT.WEIGHT_DECAY,
+            )
+            rebuild = None
+            for start in range(0, input_ids.shape[1], args.chunk_size):
+                end = min(start + args.chunk_size, input_ids.shape[1])
+                prefix_cache = None if start == 0 or rebuild is None else rebuild.past_key_values
+                LEGACY_TTT.run_chunk_update_step(
+                    model=model,
+                    optimizer=optimizer,
+                    trainable_lora_params=trainable_lora_params,
+                    full_input_ids=input_ids,
+                    chunk_start=start,
+                    chunk_end=end,
+                    chunk_size=args.chunk_size,
+                    update_mode="full_prefix_approx",
+                    local_train_window=2048,
+                    loss_mode="topk_fraction",
+                    loss_topk_fraction=0.2,
+                    base_prefix_cache=prefix_cache,
+                )
+                rebuild = LEGACY_TTT.rebuild_cache_for_prefix(model, input_ids[:, :end], chunk_size=args.chunk_size)
+            if rebuild is None:
+                rebuild = LEGACY_TTT.rebuild_cache_for_prefix(model, input_ids, chunk_size=args.chunk_size)
+            generated_ids = LEGACY_TTT.generate_from_adapted_state(
+                model=model,
+                prefix_ids=input_ids,
+                past_key_values=rebuild.past_key_values,
+                last_logits=rebuild.last_logits,
+                max_new_tokens=max_gen_toks,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=1.0,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            result = {
+                "sample_idx": 0,
+                "prompt": sample.final_prompt,
+                "adaptation_text": sample.adaptation_text,
+                "task_question": sample.task_question,
+                "generated_token_count": int(generated_ids.shape[1]),
+                "generated_text": tokenizer.decode(generated_ids[0], skip_special_tokens=True),
+            }
     except torch.OutOfMemoryError as exc:
         status = "oom"
         error_message = str(exc)
