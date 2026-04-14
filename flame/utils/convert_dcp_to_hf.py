@@ -15,7 +15,7 @@ from torchtitan.tools.logging import init_logger, logger
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import custom_models
-
+breakpoint()
 
 @torch.inference_mode()
 def save_pretrained(
@@ -25,7 +25,8 @@ def save_pretrained(
     tokenizer: str
 ):
     logger.info(f"Loading the config from {config}")
-    config = AutoConfig.from_pretrained(config, trust_remote_code=True)
+    # config = AutoConfig.from_pretrained(config, trust_remote_code=True)
+    config = custom_models.hymba.AutoConfig.from_pretrained(config)
 
     logger.info(f"Saving the config to {path}")
     config.save_pretrained(path)

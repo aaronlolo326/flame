@@ -120,7 +120,7 @@
   "sliding_window": 2048,
   "tie_word_embeddings": true,
   "torch_dtype": "bfloat16",
-  "transformers_version": "4.44.0",
+  "transformers_version": "5.00.0",
   "use_cache": false,
   "use_mamba_kernels": true,
   "v_head_dim": -1,
