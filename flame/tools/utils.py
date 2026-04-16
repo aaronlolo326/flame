@@ -60,6 +60,7 @@ def get_nparams_and_flops(model: nn.Module, model_config, seq_len: int) -> tuple
 
     # traverse model parameters and get total numel() for those that is isinstance of nn.Embedding
     nparams_embedding = get_total_embedding_params(model)
+    nparams_embedding = 0 # for transformers < 5.0.0
     
     if hasattr(model_config, "num_heads"):
         num_heads = model_config.num_heads

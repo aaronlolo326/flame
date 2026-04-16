@@ -9,6 +9,7 @@ import logging
 import os
 import time
 from datetime import timedelta
+from typing import Iterable
 
 import fla  # noqa
 import torch
@@ -58,6 +59,310 @@ register_train_spec(
         build_loss_fn=build_cross_entropy_loss,
     )
 )
+
+
+def _log_initial_weight_value_stats(
+    model_parts: Iterable[torch.nn.Module], max_tensors: int | None = None
+) -> None:
+    """Log value statistics for initialized parameters before training starts."""
+
+    def _tensor_stats(tensor: torch.Tensor, chunk_size: int = 16_777_216) -> dict[str, float | int]:
+        with torch.no_grad():
+            values = tensor.detach()
+            if hasattr(values, "to_local"):
+                values = values.to_local()
+            numel = values.numel()
+            if values.device.type == "meta":
+                return {
+                    "numel": numel,
+                    "finite": 0,
+                    "sum": 0.0,
+                    "sumsq": 0.0,
+                    "min": float("nan"),
+                    "max": float("nan"),
+                    "absmax": float("nan"),
+                }
+            flat_values = values.reshape(-1)
+            finite = 0
+            total_sum = 0.0
+            total_sumsq = 0.0
+            total_min = float("inf")
+            total_max = float("-inf")
+            total_absmax = 0.0
+            for start in range(0, numel, chunk_size):
+                chunk = flat_values[start : start + chunk_size].float()
+                finite_mask = torch.isfinite(chunk)
+                finite_count = finite_mask.sum().item()
+                if finite_count == 0:
+                    continue
+                finite_values = chunk[finite_mask]
+                finite += finite_count
+                total_sum += finite_values.sum().item()
+                total_sumsq += finite_values.square().sum().item()
+                total_min = min(total_min, finite_values.min().item())
+                total_max = max(total_max, finite_values.max().item())
+                total_absmax = max(total_absmax, finite_values.abs().max().item())
+            if finite == 0:
+                return {
+                    "numel": numel,
+                    "finite": 0,
+                    "sum": 0.0,
+                    "sumsq": 0.0,
+                    "min": float("nan"),
+                    "max": float("nan"),
+                    "absmax": float("nan"),
+                }
+            return {
+                "numel": numel,
+                "finite": finite,
+                "sum": total_sum,
+                "sumsq": total_sumsq,
+                "min": total_min,
+                "max": total_max,
+                "absmax": total_absmax,
+            }
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    model_parts = list(model_parts)
+    logger.info(
+        "[INIT-WEIGHT-STATS] Local value statistics after model.post_init(), before checkpoint load."
+    )
+
+    total_numel = 0
+    total_finite = 0
+    total_sum = 0.0
+    total_sumsq = 0.0
+    total_min = float("inf")
+    total_max = float("-inf")
+    total_absmax = 0.0
+    logged_tensors = 0
+    skipped_tensors = 0
+
+    for part_idx, model_part in enumerate(model_parts):
+        prefix = f"part{part_idx}." if len(model_parts) > 1 else ""
+        for name, param in model_part.named_parameters():
+            stats = _tensor_stats(param)
+            numel = int(stats["numel"])
+            finite = int(stats["finite"])
+            total_numel += numel
+            total_finite += finite
+            total_sum += float(stats["sum"])
+            total_sumsq += float(stats["sumsq"])
+            if finite > 0:
+                total_min = min(total_min, float(stats["min"]))
+                total_max = max(total_max, float(stats["max"]))
+                total_absmax = max(total_absmax, float(stats["absmax"]))
+
+            if max_tensors is None or logged_tensors < max_tensors:
+                mean = float(stats["sum"]) / finite if finite else float("nan")
+                variance = max(float(stats["sumsq"]) / finite - mean * mean, 0.0) if finite else float("nan")
+                rms = (float(stats["sumsq"]) / finite) ** 0.5 if finite else float("nan")
+                finite_ratio = finite / numel if numel else float("nan")
+                print(
+                    "\n"
+                    f"[INIT-WEIGHT-STATS][rank={rank}] {prefix}{name}\n"
+                    f"  shape:        {tuple(param.shape)}\n"
+                    f"  dtype:        {param.dtype}\n"
+                    f"  numel:        {numel:,}\n"
+                    f"  finite:       {finite_ratio:.6f}\n"
+                    f"  mean:         {mean:.6e}\n"
+                    f"  std:          {variance**0.5:.6e}\n"
+                    f"  rms:          {rms:.6e}\n"
+                    f"  min:          {float(stats['min']):.6e}\n"
+                    f"  max:          {float(stats['max']):.6e}\n"
+                    f"  absmax:       {float(stats['absmax']):.6e}"
+                )
+                logged_tensors += 1
+            else:
+                skipped_tensors += 1
+
+    if total_finite > 0:
+        total_mean = total_sum / total_finite
+        total_variance = max(total_sumsq / total_finite - total_mean * total_mean, 0.0)
+        total_rms = (total_sumsq / total_finite) ** 0.5
+        total_finite_ratio = total_finite / total_numel if total_numel else float("nan")
+    else:
+        total_mean = total_variance = total_rms = total_finite_ratio = float("nan")
+        total_min = total_max = total_absmax = float("nan")
+
+    if skipped_tensors:
+        print(
+            "\n"
+            f"[INIT-WEIGHT-STATS][rank={rank}] skipped logging "
+            f"{skipped_tensors:,} tensors after max_tensors={max_tensors}"
+        )
+    print(
+        "\n"
+        f"[INIT-WEIGHT-STATS][rank={rank}][summary]\n"
+        f"  tensors_logged: {logged_tensors:,}\n"
+        f"  total_numel:    {total_numel:,}\n"
+        f"  finite:         {total_finite_ratio:.6f}\n"
+        f"  mean:           {total_mean:.6e}\n"
+        f"  std:            {total_variance**0.5:.6e}\n"
+        f"  rms:            {total_rms:.6e}\n"
+        f"  min:            {total_min:.6e}\n"
+        f"  max:            {total_max:.6e}\n"
+        f"  absmax:         {total_absmax:.6e}"
+    )
+
+
+def _log_gradient_value_stats(
+    model_parts: Iterable[torch.nn.Module],
+    step: int,
+    top_k: int | None = None,
+    first_n_steps: int | None = None,
+    local_norm_threshold: float | None = None,
+) -> None:
+    """Log the largest local gradient contributors before gradient clipping."""
+
+    top_k = int(os.environ.get("FLAME_GRAD_DEBUG_TOPK", top_k or 6))
+    first_n_steps = int(os.environ.get("FLAME_GRAD_DEBUG_FIRST_N_STEPS", first_n_steps or 16))
+    local_norm_threshold = float(
+        os.environ.get("FLAME_GRAD_DEBUG_LOCAL_NORM_THRESHOLD", local_norm_threshold or 100.0)
+    )
+
+    def _to_local(tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.detach()
+        if hasattr(tensor, "to_local"):
+            tensor = tensor.to_local()
+        return tensor
+
+    def _scan_tensor(tensor: torch.Tensor, chunk_size: int = 16_777_216) -> dict[str, float | int]:
+        with torch.no_grad():
+            values = _to_local(tensor)
+            numel = values.numel()
+            if values.device.type == "meta":
+                return {
+                    "numel": numel,
+                    "finite": 0,
+                    "sum": 0.0,
+                    "sumsq": 0.0,
+                    "min": float("nan"),
+                    "max": float("nan"),
+                    "absmax": float("nan"),
+                }
+            flat_values = values.reshape(-1)
+            finite = 0
+            total_sum = 0.0
+            total_sumsq = 0.0
+            total_min = float("inf")
+            total_max = float("-inf")
+            total_absmax = 0.0
+            for start in range(0, numel, chunk_size):
+                chunk = flat_values[start : start + chunk_size].float()
+                finite_mask = torch.isfinite(chunk)
+                finite_count = finite_mask.sum().item()
+                if finite_count == 0:
+                    continue
+                finite_values = chunk[finite_mask]
+                finite += finite_count
+                total_sum += finite_values.sum().item()
+                total_sumsq += finite_values.square().sum().item()
+                total_min = min(total_min, finite_values.min().item())
+                total_max = max(total_max, finite_values.max().item())
+                total_absmax = max(total_absmax, finite_values.abs().max().item())
+            if finite == 0:
+                return {
+                    "numel": numel,
+                    "finite": 0,
+                    "sum": 0.0,
+                    "sumsq": 0.0,
+                    "min": float("nan"),
+                    "max": float("nan"),
+                    "absmax": float("nan"),
+                }
+            return {
+                "numel": numel,
+                "finite": finite,
+                "sum": total_sum,
+                "sumsq": total_sumsq,
+                "min": total_min,
+                "max": total_max,
+                "absmax": total_absmax,
+            }
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    model_parts = list(model_parts)
+    rows = []
+    total_sumsq = 0.0
+    total_numel = 0
+    total_finite = 0
+
+    for part_idx, model_part in enumerate(model_parts):
+        prefix = f"part{part_idx}." if len(model_parts) > 1 else ""
+        for name, param in model_part.named_parameters():
+            if param.grad is None:
+                continue
+            grad_stats = _scan_tensor(param.grad)
+            grad_sumsq = float(grad_stats["sumsq"])
+            grad_finite = int(grad_stats["finite"])
+            grad_numel = int(grad_stats["numel"])
+            total_sumsq += grad_sumsq
+            total_numel += grad_numel
+            total_finite += grad_finite
+            if grad_finite == 0:
+                grad_mean = grad_std = grad_rms = float("nan")
+            else:
+                grad_mean = float(grad_stats["sum"]) / grad_finite
+                grad_variance = max(grad_sumsq / grad_finite - grad_mean * grad_mean, 0.0)
+                grad_std = grad_variance**0.5
+                grad_rms = (grad_sumsq / grad_finite) ** 0.5
+            param_stats = _scan_tensor(param)
+            param_norm = float(param_stats["sumsq"]) ** 0.5
+            grad_norm = grad_sumsq**0.5
+            rows.append(
+                {
+                    "name": f"{prefix}{name}",
+                    "shape": tuple(param.shape),
+                    "dtype": str(param.dtype),
+                    "grad_numel": grad_numel,
+                    "grad_finite_ratio": grad_finite / grad_numel if grad_numel else float("nan"),
+                    "grad_norm": grad_norm,
+                    "grad_mean": grad_mean,
+                    "grad_std": grad_std,
+                    "grad_rms": grad_rms,
+                    "grad_min": float(grad_stats["min"]),
+                    "grad_max": float(grad_stats["max"]),
+                    "grad_absmax": float(grad_stats["absmax"]),
+                    "param_norm": param_norm,
+                    "grad_param_ratio": grad_norm / param_norm if param_norm > 0 else float("inf"),
+                }
+            )
+
+    local_grad_norm = total_sumsq**0.5
+    should_log = step <= first_n_steps or local_grad_norm >= local_norm_threshold
+    if not should_log:
+        return
+
+    rows.sort(key=lambda row: row["grad_norm"], reverse=True)
+    total_finite_ratio = total_finite / total_numel if total_numel else float("nan")
+    print(
+        "\n"
+        f"[GRAD-STATS][rank={rank}][step={step}][pre-clip]\n"
+        f"  local_grad_norm: {local_grad_norm:.6e}\n"
+        f"  tensors_with_grad: {len(rows):,}\n"
+        f"  finite:          {total_finite_ratio:.6f}\n"
+        f"  top_k:           {min(top_k, len(rows)):,}"
+    )
+
+    for idx, row in enumerate(rows[:top_k], start=1):
+        print(
+            "\n"
+            f"[GRAD-STATS][rank={rank}][step={step}][#{idx}] {row['name']}\n"
+            f"  shape:            {row['shape']}\n"
+            # f"  dtype:            {row['dtype']}\n"
+            # f"  grad_numel:       {row['grad_numel']:,}\n"
+            # f"  grad_finite:      {row['grad_finite_ratio']:.6f}\n"
+            f"  grad_norm:        {row['grad_norm']:.6e}\n"
+            f"  grad_mean:        {row['grad_mean']:.6e}\n"
+            f"  grad_std:         {row['grad_std']:.6e}\n"
+            # f"  grad_rms:         {row['grad_rms']:.6e}\n"
+            # f"  grad_min:         {row['grad_min']:.6e}\n"
+            # f"  grad_max:         {row['grad_max']:.6e}\n"
+            f"  grad_absmax:      {row['grad_absmax']:.6e}\n"
+            f"  param_norm:       {row['param_norm']:.6e}\n"
+            # f"  grad/param_norm:  {row['grad_param_ratio']:.6e}"
+        )
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
 @record
@@ -363,6 +668,8 @@ def main(job_config: JobConfig):
         model.train()
 
         model_parts = [model]
+
+    # _log_initial_weight_value_stats(model_parts)
 
     ###
     from collections import defaultdict
@@ -685,6 +992,8 @@ def main(job_config: JobConfig):
                 # logger.info(1)
             loss = sum(losses)
 
+            # _log_gradient_value_stats(model_parts, train_state.step)
+
             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in model_parts for p in m.parameters()],
@@ -692,6 +1001,7 @@ def main(job_config: JobConfig):
                 foreach=True,
                 pp_mesh=pp_mesh if parallel_dims.pp_enabled else None,
             )
+            # print (f"clipped {grad_norm=}")
 
             # optimizer step
             # logger.info(1)
