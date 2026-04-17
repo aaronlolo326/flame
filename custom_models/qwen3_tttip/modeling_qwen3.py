@@ -568,7 +568,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if not self.ttt_mode or not decoder_layer.is_ttt_layer:
             return None
         if self.ttt_target == "input_embed":
-            return inputs_embeds.detach()
+            # Keep gradients to the embedding table, but give the TTT branch its
+            # own storage so compile/autograd do not have to reason about the
+            # same tensor object flowing through both the main hidden-state path
+            # and the auxiliary target path.
+            return inputs_embeds.clone()
         return None
 
     @check_model_inputs()

@@ -981,6 +981,7 @@ def main(job_config: JobConfig):
                                 labels=labels,
                                 position_ids=position_ids,
                                 cu_seqlens=cu_seqlens,
+                                use_cache=False
                         )
                         loss = (
                             output.loss
