@@ -17,6 +17,7 @@
 # ("Bytedance's Modifications"). All Bytedance's Modifications are Copyright
 # 2026 Bytedance Ltd. and/or its affiliates.
 
+from collections import OrderedDict
 from typing import Callable, Optional, Union
 
 import torch
@@ -48,6 +49,20 @@ from .configuration_qwen3 import Qwen3Config
 from einops import rearrange
 
 logger = logging.get_logger(__name__)
+
+
+# def _canonical_state_dict_key(key: str) -> str:
+#     wrapper_segments = {"_orig_mod", "_fsdp_wrapped_module"}
+#     return ".".join(part for part in key.split(".") if part not in wrapper_segments)
+
+
+# def _canonicalize_state_dict_keys(state_dict):
+#     canonical_state_dict = state_dict.__class__()
+#     for key, value in state_dict.items():
+#         canonical_key = _canonical_state_dict_key(key)
+#         if canonical_key not in canonical_state_dict:
+#             canonical_state_dict[canonical_key] = value
+#     return canonical_state_dict
 
 def _should_log_debug(module) -> bool:
     cfg = getattr(module, "config", None)
@@ -184,15 +199,16 @@ class Qwen3MLP(nn.Module):
         )
         if _should_log_debug(self):
             print(
-                "[QWEN3-TTT-DEBUG][MLP layer=%s] \n %s \n  %s \n  %s \n  %s \n  ttt_lr=%.4g chunk=%s proj=%s",
-                self.layer_idx,
-                _tensor_stats("x", x),
-                _tensor_stats("t", t),
-                _tensor_stats("h", h),
-                _tensor_stats("d_down_proj_sum", d_down_proj_sum),
-                float(self.ttt_lr),
-                getattr(self, "ttt_chunk", None),
-                self.ttt_proj is not None,
+                "[QWEN3-TTT-DEBUG][MLP layer=%s] \n %s \n  %s \n  %s \n  %s \n  ttt_lr=%.4g chunk=%s proj=%s".format(
+                    self.layer_idx,
+                    _tensor_stats("x", x),
+                    _tensor_stats("t", t),
+                    _tensor_stats("h", h),
+                    _tensor_stats("d_down_proj_sum", d_down_proj_sum),
+                    float(self.ttt_lr),
+                    getattr(self, "ttt_chunk", None),
+                    self.ttt_proj is not None
+                )
             )
         down_proj = self.down_proj(h_padded) + torch.einsum(
             "btdh,btch->btcd", d_down_proj_sum, h_padded
@@ -482,6 +498,27 @@ class Qwen3PreTrainedModel(PreTrainedModel):
         elif hasattr(module, "reset_parameters"):
             module.reset_parameters()
 
+    # def state_dict(self, *args, **kwargs):
+    #     state_dict = super().state_dict(*args, **kwargs)
+    #     return _canonicalize_state_dict_keys(state_dict)
+
+    # def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+    #     current_state_dict = super().state_dict()
+    #     canonical_to_current = OrderedDict()
+    #     for key in current_state_dict.keys():
+    #         canonical_key = _canonical_state_dict_key(key)
+    #         if canonical_key not in canonical_to_current:
+    #             canonical_to_current[canonical_key] = key
+
+    #     remapped_state_dict = state_dict.__class__()
+    #     for key, value in state_dict.items():
+    #         canonical_key = _canonical_state_dict_key(key)
+    #         target_key = canonical_to_current.get(canonical_key, key)
+    #         if target_key not in remapped_state_dict:
+    #             remapped_state_dict[target_key] = value
+
+    #     return super().load_state_dict(remapped_state_dict, strict=strict, assign=assign)
+
 
 class Qwen3RotaryEmbedding(nn.Module):
     # inv_freq: torch.Tensor  # fix linting for `register_buffer`
@@ -559,6 +596,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    # def get_input_embeddings(self):
+    #     return self.embed_tokens
+
+    # def set_input_embeddings(self, value):
+    #     self.embed_tokens = value
 
     def _resolve_ttt_target_states(
         self,
@@ -654,22 +697,23 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 target_states=target_states,
                 **kwargs,
             )
-            if should_log_debug and (
-                decoder_layer.is_ttt_layer
-                or decoder_layer.layer_idx == 0
-                or decoder_layer.layer_idx == (self.config.num_hidden_layers - 1)
-            ):
-                print(
-                    "[QWEN3-TTT-DEBUG][MODEL layer=%s type=%s ttt=%s] \n %s",
-                    decoder_layer.layer_idx,
-                    decoder_layer.attention_type,
-                    decoder_layer.is_ttt_layer,
-                    _tensor_stats("hidden_states", hidden_states),
-                )
+            # if should_log_debug and (
+            #     decoder_layer.is_ttt_layer
+            #     or decoder_layer.layer_idx == 0
+            #     or decoder_layer.layer_idx == (self.config.num_hidden_layers - 1)
+            # ):
+            #     print(
+            #         "[QWEN3-TTT-DEBUG][MODEL layer=%s type=%s ttt=%s] \n %s".format(
+            #             decoder_layer.layer_idx,
+            #             decoder_layer.attention_type,
+            #             decoder_layer.is_ttt_layer,
+            #             _tensor_stats("hidden_states", hidden_states)
+            #         )
+            #     )
 
         hidden_states = self.norm(hidden_states)
         if should_log_debug:
-            print("[QWEN3-TTT-DEBUG][MODEL post] \n %s", _tensor_stats("norm_hidden_states", hidden_states))
+            print("[QWEN3-TTT-DEBUG][MODEL post] \n %s".format(_tensor_stats("norm_hidden_states", hidden_states)))
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
@@ -690,6 +734,18 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    # def get_input_embeddings(self):
+    #     return self.model.get_input_embeddings()
+
+    # def set_input_embeddings(self, value):
+    #     self.model.set_input_embeddings(value)
+
+    # def get_output_embeddings(self):
+    #     return self.lm_head
+
+    # def set_output_embeddings(self, new_embeddings):
+    #     self.lm_head = new_embeddings
 
     @can_return_tuple
     @auto_docstring

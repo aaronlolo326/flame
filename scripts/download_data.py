@@ -29,5 +29,26 @@ import huggingface_hub as hf # pip install huggingface_hub, if not installed
 
 # dataset = load_dataset("mlfoundations/dclm-baseline-1.0")
 
-from datasets import load_dataset
-load_dataset("/storage/backup/hei/data/fineweb100bt-qwen3-tokenized-packed-16384")
+# from datasets import load_dataset
+# load_dataset("/storage/backup/hei/data/fineweb100bt-qwen3-tokenized-packed-16384")
+
+# hf.snapshot_download(
+#   repo_id="princeton-nlp/prolong-data-64K", 
+# #   allow_patterns=["*.txt", "*.zarr.zip"], 
+#   repo_type="dataset", 
+#   local_dir="/storage/backup/hei/data/", 
+#   local_dir_use_symlinks="auto"
+# )
+
+# hf.snapshot_download(
+#   repo_id="princeton-nlp/prolong-data-512K", 
+# #   allow_patterns=["*.txt", "*.zarr.zip"], 
+#   repo_type="dataset", 
+#   local_dir="/storage/backup/hei/data/", 
+#   local_dir_use_symlinks="auto"
+# )
+
+dataset = load_dataset("xfxcwynlc/prolong1-qwen3-8b-tokenized-32768", num_proc=200)
+dataset.save_to_disk("/storage/backup/hei/data/xfxcwynlc__prolong1-qwen3-8b-tokenized-32768_arrow", num_proc=200)
+dataset = load_dataset("xfxcwynlc/prolong2-qwen3-8b-tokenized-32768", num_proc=200)
+dataset.save_to_disk("/storage/backup/hei/data/xfxcwynlc__prolong2-qwen3-8b-tokenized-32768_arrow", num_proc=200)

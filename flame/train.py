@@ -8,13 +8,16 @@ import json
 import logging
 import os
 import time
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import Iterable
 
 import fla  # noqa
 import torch
+import torch.distributed.checkpoint as dcp
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss # commented out for now as it is not used so far; also not available in flash-linear-attention 0.4.0
 from fla.ops.utils import prepare_position_ids
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.ft import FTParallelDims, init_ft_manager
@@ -59,6 +62,64 @@ register_train_spec(
         build_loss_fn=build_cross_entropy_loss,
     )
 )
+
+
+@contextmanager
+def _allow_partial_checkpoint_load():
+    """Allow loading checkpoints that do not cover newly added model weights."""
+
+    original_load = dcp.load
+
+    def _log_partial_checkpoint_load(state_dict, checkpoint_id) -> None:
+        if state_dict is None or checkpoint_id is None:
+            return
+
+        try:
+            metadata = dcp.FileSystemReader(checkpoint_id).read_metadata()
+            # print (f"{metadata=}")
+            planner = DefaultLoadPlanner(allow_partial_load=True)
+            planner.set_up_planner(state_dict, metadata, is_coordinator=False)
+            current_keys = set(planner.state_dict.keys())
+            # print (f"{list(current_keys)[:20]=}")
+            checkpoint_keys = set(metadata.state_dict_metadata.keys())
+            # print (f"{list(checkpoint_keys)[:20]=}")
+            missing_keys = sorted(current_keys - checkpoint_keys)
+            if missing_keys:
+                max_logged_keys = 16
+                preview = "\n".join(missing_keys[:max_logged_keys])
+                if len(missing_keys) > max_logged_keys:
+                    preview = f"{preview}, ..."
+                logger.warning(
+                    f"{utils.Color.red}Partial checkpoint load enabled: %d model keys are missing in %s "
+                    f"and will keep their initialized values. Missing keys: %s{utils.Color.reset}",
+                    len(missing_keys),
+                    checkpoint_id,
+                    preview,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Unable to inspect checkpoint metadata for partial-load logging at %s: %s",
+                checkpoint_id,
+                exc,
+            )
+
+    def _load_with_partial_planner(*args, **kwargs):
+        state_dict = kwargs.get("state_dict")
+        if state_dict is None and args:
+            state_dict = args[0]
+        checkpoint_id = kwargs.get("checkpoint_id")
+        # print(f"{state_dict.keys()}")
+        # if 'model' in state_dict and len(state_dict.keys()) == 1:
+        #     state_dict = state_dict['model']
+        _log_partial_checkpoint_load(state_dict, checkpoint_id)
+        kwargs.setdefault("planner", DefaultLoadPlanner(allow_partial_load=True))
+        return original_load(*args, **kwargs)
+
+    dcp.load = _load_with_partial_planner
+    try:
+        yield
+    finally:
+        dcp.load = original_load
 
 
 def _log_initial_weight_value_stats(
@@ -363,6 +424,7 @@ def _log_gradient_value_stats(
             f"  param_norm:       {row['param_norm']:.6e}\n"
             # f"  grad/param_norm:  {row['grad_param_ratio']:.6e}"
         )
+
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
 @record
@@ -745,9 +807,8 @@ def main(job_config: JobConfig):
         logger.info("Created seed checkpoint")
         return
 
-
-
-    checkpoint.load(step=job_config.checkpoint.load_step)
+    with _allow_partial_checkpoint_load():
+        checkpoint.load(step=job_config.checkpoint.load_step)
     # # NOTE[flame]:
     # # When loading checkpoints created with an older model/optimizer configuration,
     # # TorchTitan's CheckpointManager may raise:
