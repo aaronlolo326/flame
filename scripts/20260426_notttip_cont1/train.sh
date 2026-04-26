@@ -23,7 +23,7 @@ echo $RUN_NAME
 
 
 batch_size=4
-grad_accum=2
+grad_accum=1
 no_tokens=$(( 20 * 10**9 ))
 seed=42
 
