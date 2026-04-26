@@ -11,6 +11,7 @@ from transformers import AutoModelForCausalLM
 import fla  # noqa
 from torchtitan.tools.logging import init_logger, logger
 
+import custom_models
 
 # def _restore_tied_weight_aliases(model, state_dict):
 #     # HF may drop duplicate tied-weight aliases from state_dict(); DCP seed

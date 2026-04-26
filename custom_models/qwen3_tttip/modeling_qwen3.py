@@ -558,11 +558,12 @@ class Qwen3RotaryEmbedding(nn.Module):
     def reset_parameters(self):
         # pass
         with torch.no_grad():
-            self.inv_freq.copy_(self._compute_inv_freq(device=self.inv_freq.device))
-            if self.config.rope_scaling is not None:
-                self.attention_scaling.copy_(self._compute_scale(device=self.attention_scaling.device))
-            else:
-                self.attention_scaling = 1.0
+            # self.inv_freq.copy_(self._compute_inv_freq(device=self.inv_freq.device))
+            # if self.config.rope_scaling is not None:
+            #     self.attention_scaling.copy_(self._compute_scale(device=self.attention_scaling.device))
+            # else:
+            #     self.attention_scaling = 1.0
+            self.inv_freq, self.attention_scaling = self.rope_init_fn(self.config, self.inv_freq.device)
 
     def _compute_inv_freq(self, device=None):
         base = self.config.rope_theta
