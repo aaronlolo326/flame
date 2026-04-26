@@ -42,7 +42,7 @@ def load_data(run_name, data_set):
 
     if data_set == 'niah':
         # Define the context lengths you want to extract
-        context_lengths = ["4096", "8192", "16384", "32768"]
+        context_lengths = ["4096", "8192", "16384", "32768", "65536", "131072", "262144"]
         for key, metrics in results.items():
             # Remove 'niah_' prefix to get 'single_1', 'single_2', etc.
             clean_name = key.replace("niah_", "")

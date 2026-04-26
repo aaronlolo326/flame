@@ -12,7 +12,7 @@
     "hidden_size": 2560,
     "initializer_range": 0.02,
     "intermediate_size": 9728,
-    "max_position_embeddings": 40960,
+    "max_position_embeddings": 32768,
     "max_window_layers": 36,
     "model_type": "qwen3_tttip",
     "num_attention_heads": 32,
@@ -30,11 +30,11 @@
     "vocab_size": 151936,
 
     "ttt_layers": [0, 6, 12, 18, 24, 30, 36],
-    "ttt_mode": true,
+    "ttt_mode": false,
     "ttt_proj": true,
     "ttt_lr": 3,
     "ttt_chunk": 4096,
     "ttt_target": "hidden_states",
-    "debug_ttt_logs": true,
+    "debug_ttt_logs": false,
     "debug_ttt_log_every": 10
 }

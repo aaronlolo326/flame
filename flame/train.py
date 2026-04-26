@@ -277,7 +277,7 @@ def _log_gradient_value_stats(
     """Log the largest local gradient contributors before gradient clipping."""
 
     top_k = int(os.environ.get("FLAME_GRAD_DEBUG_TOPK", top_k or 6))
-    first_n_steps = int(os.environ.get("FLAME_GRAD_DEBUG_FIRST_N_STEPS", first_n_steps or 16))
+    first_n_steps = int(os.environ.get("FLAME_GRAD_DEBUG_FIRST_N_STEPS", first_n_steps or 4))
     local_norm_threshold = float(
         os.environ.get("FLAME_GRAD_DEBUG_LOCAL_NORM_THRESHOLD", local_norm_threshold or 100.0)
     )
@@ -1054,7 +1054,7 @@ def main(job_config: JobConfig):
                 # logger.info(1)
             loss = sum(losses)
 
-            # _log_gradient_value_stats(model_parts, train_state.step)
+            _log_gradient_value_stats(model_parts, train_state.step)
 
             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
