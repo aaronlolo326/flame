@@ -37,6 +37,7 @@ __pycache__
 # saved model
 *.pkl
 *.pt
+checkpoints/
 
 # hidden files
 .*
