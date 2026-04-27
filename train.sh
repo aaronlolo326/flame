@@ -79,14 +79,15 @@ if $train; then
     python -c "import json; import sys; j = json.load(open(sys.argv[1])); print (j.get(\"model_type\"))" "$config"
   )
 
-
-  mkdir -p $path
-  cp * $path
-  cp -r configs $path
-  cp -r flame   $path
-  cp -r custom_models   $path
-  cp -r 3rdparty/flash-linear-attention/fla $path
-  cp -r 3rdparty/torchtitan/torchtitan $path
+  if [[ $LOG_RANK == 0 ]]; then
+    mkdir -p $path
+    cp * $path
+    cp -r configs $path
+    cp -r flame   $path
+    cp -r custom_models   $path
+    cp -r 3rdparty/flash-linear-attention/fla $path
+    cp -r 3rdparty/torchtitan/torchtitan $path
+  fi
 
   # for offline systems
   # export TRANSFORMERS_OFFLINE=1

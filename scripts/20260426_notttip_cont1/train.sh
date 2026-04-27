@@ -3,14 +3,14 @@ source "$(dirname "$0")/vars.sh"
 debug=false
 profile=false
 
-available_nodes=(9 10 12) # first is master node
+available_nodes=(9 6) # first is master node
 # based on env var $THIS_NODE, set local rank according to the order, e.g., THIS_NODE is 0 means local_rank = 0
 local_rank=$(echo ${available_nodes[@]} | tr ' ' '\n' | grep -n "^${THIS_NODE}$" | cut -d: -f1)
 local_rank=$((local_rank - 1))
 echo "THIS_NODE=${THIS_NODE}; local_rank=$local_rank"
 
-MASTER_ADDR=192.168.241.41 # 192.168.240.149 for node 12; 192.168.240.169  for node 1
-MASTER_PORT=29500
+MASTER_ADDR=192.168.240.118 # 192.168.240.118 for node 9; 192.168.240.169  for node 1
+MASTER_PORT=29501
 
 NNODE=${#available_nodes[@]}
 if [ ${NNODE} -eq 1 ]; then
@@ -27,21 +27,22 @@ grad_accum=1
 no_tokens=$(( 20 * 10**9 ))
 seed=42
 
-# if $local_rank -eq 0; then
-if [ ! -d "${seed_checkpoint_dir}" ]; then
-  echo "Seed checkpoint missing at ${seed_checkpoint_dir}"
-  echo "Run: bash $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/init_ckpt.sh"
-  exit 1
-fi
+if [[ $local_rank == 0 ]]; then
+  if [ ! -d "${seed_checkpoint_dir}" ]; then
+    echo "Seed checkpoint missing at ${seed_checkpoint_dir}"
+    echo "Run: bash $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/init_ckpt.sh"
+    exit 1
+  fi
 
-mkdir -p "${checkpoint_folder}"
-chmod 777 "${checkpoint_folder}" || true
-step0_checkpoint_dir="${checkpoint_folder}/step-0"
-# if [ ! -d "${step0_checkpoint_dir}" ]; then
-mkdir -p "${step0_checkpoint_dir}"
-cp -a "${seed_checkpoint_dir}/." "${step0_checkpoint_dir}/"
-chmod -R 777 "${step0_checkpoint_dir}"
-# fi
+  mkdir -p "${checkpoint_folder}"
+  chmod 777 "${checkpoint_folder}" || true
+  step0_checkpoint_dir="${checkpoint_folder}/step-0"
+  # if [ ! -d "${step0_checkpoint_dir}" ]; then
+  mkdir -p "${step0_checkpoint_dir}"
+  cp -a "${seed_checkpoint_dir}/." "${step0_checkpoint_dir}/"
+  chmod -R 777 "${step0_checkpoint_dir}"
+  chmod -R 777 "${dump_folder}"
+fi
 # fi
 
 if [ "$debug" = true ]; then
@@ -55,17 +56,17 @@ else
   NGPU=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
 fi
 
-NNODE_TOTAL=$(( NNODE * NGPU ))
+NGPU_TOTAL=$(( NNODE * NGPU ))
 
 data_parallel_replicate_degree=1
 if [ "${MODEL_TYPE}" = "lact" ]; then
   data_parallel_replicate_degree=1
 elif [ "${MODEL_TYPE}" = "e2e" ]; then
-  data_parallel_replicate_degree=${NNODE_TOTAL}
+  data_parallel_replicate_degree=${NGPU_TOTAL}
 fi
 
 
-steps=$(( no_tokens / NNODE / NGPU / seq_len / batch_size / grad_accum ))
+steps=$(( no_tokens / NGPU_TOTAL / seq_len / batch_size / grad_accum ))
 warmup_steps=$(( steps / 50 )) # 1024
 interval=$(( steps / 4 ))
 echo steps=$steps
