@@ -33,6 +33,7 @@ DEFAULT_SAMPLES_BASE = Path(
     "lb/__storage__backup__yufei__ttt__flame__exp__"
     "20260322_hybrid_qwen3_lact_0p6B_swa_2k_chunk_1k_rerun12_prolong_prolong_from_run12_step9535_v4"
 )
+DEFAULT_LOG_PATH = Path("/work/yufei/projects/flame/results/20260407_test_time_distill/test_failed_qa_recovery_logs.jsonl")
 
 DEFAULT_QA_TASKS = (
     "longbench_2wikimqa",
@@ -47,7 +48,7 @@ DEFAULT_QA_TASKS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Search baseline QA failures and test whether distillation recovers one.")
-    parser.add_argument("--model-name-or-path", default="/work/yufei/downloads/Qwen3-0.6B-Base")
+    parser.add_argument("--model-name-or-path", default="/work/yufei/downloads/Qwen3-4B")
     parser.add_argument("--samples-base-dir", type=str, default=str(DEFAULT_SAMPLES_BASE))
     parser.add_argument("--task-name", type=str, default=None, help="Run directly on one sample task name.")
     parser.add_argument("--doc-id", type=int, default=None, help="Run directly on one sample doc id.")
@@ -67,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument("--log-file", type=str, default=str(DEFAULT_LOG_PATH))
     return parser.parse_args()
 
 
@@ -191,6 +193,11 @@ def main() -> None:
     initial_lora_state = clone_trainable_state(trainable_lora_params)
 
     trials = []
+    log_handle = None
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_path.open("a", encoding="utf-8")
     if (args.task_name is None) != (args.doc_id is None):
         raise ValueError("Provide both --task-name and --doc-id together.")
 
@@ -224,7 +231,7 @@ def main() -> None:
             top_p=float(sample_gen_kwargs.get("top_p", 1.0)),
             initial_lora_state=initial_lora_state,
             trainable_lora_params=trainable_lora_params,
-            log_file=None,
+            log_file=log_handle,
         )
 
         answers = list(sample_obj["doc"].get("answers") or [])
@@ -255,6 +262,7 @@ def main() -> None:
             "ground_truth_answer": trial["ground_truth_answer"],
             "baseline_answer": trial["baseline_answer"],
             "method_answer": trial["method_answer"],
+            "log_file": args.log_file,
         }
         print(json.dumps(pretty_trial, ensure_ascii=True, indent=2))
 
@@ -263,9 +271,12 @@ def main() -> None:
                 "status": "improved",
                 "trial_count": len(trials),
                 "best_trial": trial,
+                "log_file": args.log_file,
             }
             if args.output_json:
                 Path(args.output_json).write_text(json.dumps(summary, ensure_ascii=True, indent=2) + "\n")
+            if log_handle is not None:
+                log_handle.close()
             return
 
         if len(trials) >= args.max_trials:
@@ -275,10 +286,13 @@ def main() -> None:
         "status": "no_improvement_found",
         "trial_count": len(trials),
         "trials": trials,
+        "log_file": args.log_file,
     }
     if args.output_json:
         Path(args.output_json).write_text(json.dumps(summary, ensure_ascii=True, indent=2) + "\n")
     print(json.dumps(summary, ensure_ascii=True))
+    if log_handle is not None:
+        log_handle.close()
 
 
 if __name__ == "__main__":

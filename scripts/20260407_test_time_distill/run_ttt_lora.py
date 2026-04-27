@@ -22,6 +22,7 @@ The base model stays frozen. Only LoRA parameters are updated.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import math
@@ -501,25 +502,38 @@ def decode_chunk_text(tokenizer, chunk_ids: torch.LongTensor) -> str:
 
 def build_qa_generation_prompt(chunk_text: str, task_question: str, num_pairs: int) -> str:
     return (
-        "You are extracting task-relevant facts from one context chunk.\n\n"
-        f"Task question:\n{task_question}\n\n"
+        "You are extracting evidence from one context chunk for answering one final question.\n"
+        "Return only the requested question-answer pairs.\n"
+        "Do not explain your reasoning.\n"
+        "Do not add any commentary before or after the pairs.\n"
+        "Do not write notes like \"I need to\" or \"Let's see\".\n\n"
+        f"Final question:\n{task_question}\n\n"
         f"Context chunk:\n{chunk_text}\n\n"
-        f"Generate {num_pairs} diverse question-answer pairs that capture information from this chunk that is useful "
-        "for solving the task question.\n\n"
-        "Diversity requirements:\n"
-        "- Cover different types of information when possible: entities, numbers, dates, conditions, causes, "
-        "definitions, constraints, decisions, conclusions, or code behaviors.\n"
-        "- Avoid asking the same thing in different words.\n\n"
-        "Faithfulness requirements:\n"
+        f"Generate up to {num_pairs} question-answer pairs that directly help answer the final question above.\n\n"
+        "Evidence requirements:\n"
         "- Every question must be answerable using only this chunk.\n"
+        "- Prefer direct answer evidence for the final question.\n"
+        "- If direct answer evidence is unavailable, include only necessary bridge facts.\n"
+        "- Avoid background facts that do not help answer the final question.\n"
         "- Answers must be concise and factual.\n"
+        "- Prefer short extractive answer spans copied from the chunk when possible.\n"
         "- Avoid vague or generic questions.\n\n"
+        "If this chunk does not help answer the final question, output exactly:\n"
+        "NO_VALID_QA\n\n"
+        "Formatting requirements:\n"
+        f"- Output at most {num_pairs} pairs.\n"
+        "- Each question must be on one line.\n"
+        "- Each answer must be on one line.\n"
+        "- Do not include blank lines between pairs.\n"
+        "- Do not output anything except the pairs or NO_VALID_QA.\n\n"
         "Output format exactly:\n"
         "Q1: ...\n"
         "A1: ...\n"
         "Q2: ...\n"
         "A2: ...\n"
         "...\n"
+        f"Q{num_pairs}: ...\n"
+        f"A{num_pairs}: ...\n"
     )
 
 
@@ -603,15 +617,21 @@ def generate_text(
 ) -> str:
     device = next(model.parameters()).device
     encoded = tokenizer(prompt_text, return_tensors="pt").to(device)
+    generation_config = copy.deepcopy(model.generation_config)
+    generation_config.do_sample = do_sample
+    if do_sample:
+        generation_config.temperature = temperature
+    else:
+        generation_config.temperature = None
+        generation_config.top_p = None
+        generation_config.top_k = None
     generate_kwargs = dict(
         **encoded,
         max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
+        generation_config=generation_config,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
-    if do_sample:
-        generate_kwargs["temperature"] = temperature
     generated = model.generate(**generate_kwargs)
     full_text = tokenizer.decode(generated[0], skip_special_tokens=True)
     return _extract_generated_suffix(prompt_text, full_text)
@@ -707,9 +727,27 @@ def dedupe_qa_pairs(pairs: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
     return kept
 
 
+def normalized_substring_present(needle: str, haystack: str) -> bool:
+    needle_norm = re.sub(r"\s+", " ", needle.lower()).strip()
+    haystack_norm = re.sub(r"\s+", " ", haystack.lower()).strip()
+    return bool(needle_norm) and needle_norm in haystack_norm
+
+
+def answer_support_score(answer: str, chunk_text: str) -> float:
+    answer_tokens = re.findall(r"\w+", answer.lower())
+    if not answer_tokens:
+        return 0.0
+    chunk_tokens = set(re.findall(r"\w+", chunk_text.lower()))
+    if not chunk_tokens:
+        return 0.0
+    overlap = sum(1 for token in answer_tokens if token in chunk_tokens)
+    return overlap / len(answer_tokens)
+
+
 def filter_candidate_qa_pairs(
     pairs: Sequence[Tuple[str, str]],
     task_question: str,
+    chunk_text: str,
 ) -> List[QAPair]:
     filtered: List[QAPair] = []
     for idx, (question, answer) in enumerate(dedupe_qa_pairs(pairs), start=1):
@@ -720,6 +758,10 @@ def filter_candidate_qa_pairs(
         answer_len = len(a.split())
         if answer_len < 2 or answer_len > 80:
             continue
+        if not normalized_substring_present(a, chunk_text):
+            support = answer_support_score(a, chunk_text)
+            if support < 0.8:
+                continue
         filtered.append(
             QAPair(
                 question=q,
@@ -1010,7 +1052,11 @@ def generate_candidate_qa_pairs(
     if family == "synthetic":
         return raw_text, filter_statement_candidates(parse_prefixed_list(raw_text, "F"), task_question, "structured_fact")
     parsed_pairs = parse_qa_pairs(raw_text)
-    return raw_text, filter_candidate_qa_pairs(parsed_pairs, task_question=task_question)
+    return raw_text, filter_candidate_qa_pairs(
+        parsed_pairs,
+        task_question=task_question,
+        chunk_text=chunk_text,
+    )
 
 
 def build_qa_training_example(

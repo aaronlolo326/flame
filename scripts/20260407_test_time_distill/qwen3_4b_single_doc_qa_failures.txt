@@ -1,0 +1,86 @@
+Qwen3-4B single-document QA baseline failures
+Source:
+/work/yufei/projects/flame/results/20260330_ttt_lora/lb/Qwen__Qwen3-4B
+
+Suggested runs:
+python test_failed_qa_recovery.py --samples-base-dir /work/yufei/projects/flame/results/20260330_ttt_lora/lb/Qwen__Qwen3-4B --task-name <task> --doc-id <doc_id> --device cuda:0 --dtype bfloat16
+
+1.
+task: longbench_multifieldqa_en
+doc_id: 128
+baseline_score: 0.0
+question: Question: Who was Ralph Rokebye's brother?
+ground_truth: Sir Richard.
+baseline_answer: William Rokeby
+
+2.
+task: longbench_multifieldqa_en
+doc_id: 8
+baseline_score: 0.0
+question: Question: What was the Buckeyes' record in their first game of the season?
+ground_truth: They won their first game with a score of 15-3.
+baseline_answer: 1-0
+
+3.
+task: longbench_multifieldqa_en
+doc_id: 19
+baseline_score: 0.0
+question: Question: What were the vaccines trialed against?
+ground_truth: Other toxic products.
+baseline_answer: genuine placebo
+
+4.
+task: longbench_qasper
+doc_id: 14
+baseline_score: 0.0
+question: Question: Did they experiment with this new dataset?
+ground_truth: No
+baseline_answer: Yes.
+
+5.
+task: longbench_qasper
+doc_id: 96
+baseline_score: 0.0
+question: Question: Is datasets for sentiment analysis balanced?
+ground_truth: No
+baseline_answer: unanswerable
+
+6.
+task: longbench_qasper
+doc_id: 0
+baseline_score: 0.0
+question: Question: How is the ground truth for fake news established?
+ground_truth: Ground truth is not established in the paper
+baseline_answer: unanswerable
+
+7.
+task: longbench_narrativeqa
+doc_id: 22
+baseline_score: 0.0
+question: Question: Why did Bill run to Texas?
+ground_truth: he murdered someone
+baseline_answer: Bill ran to Texas to escape the locusts and the destruction of his land.
+
+8.
+task: longbench_narrativeqa
+doc_id: 19
+baseline_score: 0.0
+question: Question: How many ethical arguments does Socrates propose?
+ground_truth: Two
+baseline_answer: 1
+
+9.
+task: longbench_multifieldqa_zh
+doc_id: 52
+baseline_score: 0.0
+question: 问题：孔子后代首次获得封号是在哪一代？
+ground_truth: 8世孙，孔腾被汉高祖刘邦封为奉祀君。
+baseline_answer: 第55代
+
+10.
+task: longbench_multifieldqa_zh
+doc_id: 19
+baseline_score: 0.0
+question: 问题：规档云的联系电话是多少？
+ground_truth: 19901949665。
+baseline_answer: 021-50710282
