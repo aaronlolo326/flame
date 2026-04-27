@@ -21,9 +21,11 @@ TOKENIZER_PATH="${base_model_hfac}/${base_model_name}"
 
 lm_eval_output_path="/storage/backup/${USERNAME}/ttt/flame/results/${RUN_NAME}"
 dump_folder=/storage/backup/${USERNAME}/ttt/flame/exp/${RUN_NAME}
-
-cont_pretrain_from="Qwen/Qwen3-4B-Base"
 checkpoint_folder=${dump_folder}/checkpoint
+
+# Provide the following variables for continual pretraining over existing checkpoints; Don't provide them if you want to train from scratch
+# These will be used to convert the HuggingFace checkpoint to the DCP format required for training
+cont_pretrain_from="Qwen/Qwen3-4B-Base"
 seed_root=/storage/backup/${USERNAME}/ttt/flame/seeds/qwen3_tttip_4B
 seed_checkpoint_dir=${seed_root}/step-0
 
