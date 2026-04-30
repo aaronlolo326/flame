@@ -565,15 +565,15 @@ class Qwen3RotaryEmbedding(nn.Module):
             #     self.attention_scaling = 1.0
             self.inv_freq, self.attention_scaling = self.rope_init_fn(self.config, self.inv_freq.device)
 
-    def _compute_inv_freq(self, device=None):
-        base = self.config.rope_theta
-        return 1.0 / (
-            base
-            ** (torch.arange(0, self.config.head_dim, 2, device=device, dtype=torch.float32) / self.config.head_dim)
-        )
+    # def _compute_inv_freq(self, device=None):
+    #     base = self.config.rope_theta
+    #     return 1.0 / (
+    #         base
+    #         ** (torch.arange(0, self.config.head_dim, 2, device=device, dtype=torch.float32) / self.config.head_dim)
+    #     )
 
-    def _compute_scale(self, device=None):
-        return (torch.arange(0, self.config.hidden_size, 2, device=device, dtype=torch.float32) + 0.4 * self.config.hidden_size) / (1.4 * self.config.hidden_size)
+    # def _compute_scale(self, device=None):
+    #     return (torch.arange(0, self.config.hidden_size, 2, device=device, dtype=torch.float32) + 0.4 * self.config.hidden_size) / (1.4 * self.config.hidden_size)
 
 
 @auto_docstring

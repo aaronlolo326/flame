@@ -36,6 +36,7 @@ def save_pretrained(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         checkpoint = os.path.join(path, f'checkpoint/step-{step}')
+        logger.info(f"{checkpoint=}")
         checkpoint_path = os.path.join(tmpdir, 'checkpoint.pt')
         logger.info(f"Saving the distributed checkpoint to {checkpoint_path}")
         dcp_to_torch_save(checkpoint, checkpoint_path)
@@ -48,7 +49,11 @@ def save_pretrained(
         # Add datetime.timedelta and io.BytesIO to safe globals
         torch.serialization.add_safe_globals([timedelta, io.BytesIO])
         # torch.load now with default weights_only=True will work
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu')['model'])
+        try:
+            model.load_state_dict(torch.load(checkpoint_path, map_location='cpu')['model'])
+        except:
+            loaded = torch.load(checkpoint_path, map_location='cpu')
+            model.load_state_dict(loaded)
 
         logger.info(f"Saving the model to {path}")
         model.save_pretrained(path)
