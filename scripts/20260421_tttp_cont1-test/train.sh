@@ -27,21 +27,21 @@ grad_accum=1
 no_tokens=$(( 20 * 10**9 ))
 seed=42
 
-if $local_rank -eq 0; then
-  if [ ! -d "${seed_checkpoint_dir}" ]; then
-    echo "Seed checkpoint missing at ${seed_checkpoint_dir}"
-    echo "Run: bash $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/init_ckpt.sh"
-    exit 1
+if [[ $local_rank == 0 ]]; then
+  if [ -z "${seed_checkpoint_dir}" ]; then
+    echo "seed_checkpoint_dir is not set. Training from scratch ..."
+  elif [ ! -d "${seed_checkpoint_dir}" ]; then
+    echo "Warning: seed_checkpoint_dir is not set or does not exist: ${seed_checkpoint_dir}"
+    echo "Proceeding with training from scratch ..."
+  else
+    mkdir -p "${checkpoint_folder}"
+    chmod 777 "${checkpoint_folder}" || true
+    step0_checkpoint_dir="${checkpoint_folder}/step-0"
+    mkdir -p "${step0_checkpoint_dir}"
+    cp -a "${seed_checkpoint_dir}/." "${step0_checkpoint_dir}/"
+    chmod -R 777 "${step0_checkpoint_dir}"
+    chmod -R 777 "${dump_folder}"
   fi
-
-  mkdir -p "${checkpoint_folder}"
-  chmod 777 "${checkpoint_folder}" || true
-  step0_checkpoint_dir="${checkpoint_folder}/step-0"
-  # if [ ! -d "${step0_checkpoint_dir}" ]; then
-  mkdir -p "${step0_checkpoint_dir}"
-  cp -a "${seed_checkpoint_dir}/." "${step0_checkpoint_dir}/"
-  chmod -R 777 "${step0_checkpoint_dir}"
-  # fi
 fi
 
 if [ "$debug" = true ]; then

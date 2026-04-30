@@ -3,13 +3,13 @@ source "$(dirname "$0")/vars.sh"
 debug=false
 profile=false
 
-available_nodes=(10) # first is master node
+available_nodes=(9 6) # first is master node
 # based on env var $THIS_NODE, set local rank according to the order, e.g., THIS_NODE is 0 means local_rank = 0
 local_rank=$(echo ${available_nodes[@]} | tr ' ' '\n' | grep -n "^${THIS_NODE}$" | cut -d: -f1)
 local_rank=$((local_rank - 1))
 echo "THIS_NODE=${THIS_NODE}; local_rank=$local_rank"
 
-MASTER_ADDR=192.168.240.149 # 192.168.240.169  for node 1
+MASTER_ADDR=192.168.240.118 # 192.168.240.118 for node 9; 192.168.240.169  for node 1
 MASTER_PORT=29501
 
 NNODE=${#available_nodes[@]}
@@ -56,7 +56,6 @@ else
 fi
 
 NGPU_TOTAL=$(( NNODE * NGPU ))
-NGPU_TOTAL=16
 
 data_parallel_replicate_degree=1
 if [ "${MODEL_TYPE}" = "lact" ]; then
