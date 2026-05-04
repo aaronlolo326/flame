@@ -11,7 +11,7 @@ RUN_NAME=$(basename "$(dirname "$0")")
 cd ${flame_dir}
 
 MODEL_CONFIGS_DIR=configs
-MODEL_NAME=qwen3_tttip_4B_cz512
+MODEL_NAME=qwen3_tttip_4B_cz1024
 MODEL_CONFIG_PATH=${MODEL_CONFIGS_DIR}/${MODEL_NAME}.json
 MODEL_TYPE="tttip"
 

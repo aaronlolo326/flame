@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .configuration_qwen3 import Qwen3Config
-from .modeling_qwen3 import Qwen3Model, Qwen3ForCausalLM
+from .modeling_qwen3_combined import Qwen3Model, Qwen3ForCausalLM
 from liger_kernel.transformers.model.qwen3 import lce_forward as qwen3_lce_forward
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
