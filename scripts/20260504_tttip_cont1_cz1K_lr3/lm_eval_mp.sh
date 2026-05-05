@@ -66,6 +66,29 @@ accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
    --output_path $lm_eval_output_path/niah \
    --log_samples \
    --seed 1234
+# Below requires hugginface_custom.py to be updated to support yarn_max_seq_length args.
+accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
+   --model hf-custom \
+   --model_args pretrained=${eval_hf_path},trust_remote_code=True,dtype=bfloat16,torch_dtype=bfloat16,max_length=131072,yarn_max_seq_length=65536 \
+   --tasks niah_single_1,niah_single_2,niah_single_3,niah_multikey_1,niah_multikey_2,niah_multikey_3 \
+   --metadata='{"max_seq_lengths":[65536]}' \
+   --device cuda \
+   --trust_remote_code \
+   --batch_size 1 \
+   --output_path $lm_eval_output_path/niah \
+   --log_samples \
+   --seed 1234
+accelerate launch --main_process_port ${MAIN_PROCESS_PORT} -m lm_eval \
+   --model hf-custom \
+   --model_args pretrained=${eval_hf_path},trust_remote_code=True,dtype=bfloat16,torch_dtype=bfloat16,max_length=131072,yarn_max_seq_length=131072 \
+   --tasks niah_single_1,niah_single_2,niah_single_3,niah_multikey_1,niah_multikey_2,niah_multikey_3 \
+   --metadata='{"max_seq_lengths":[131072]}' \
+   --device cuda \
+   --trust_remote_code \
+   --batch_size 1 \
+   --output_path $lm_eval_output_path/niah \
+   --log_samples \
+   --seed 1234
 
 
 

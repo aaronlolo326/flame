@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# 
+#
 # This file may have been modified by Bytedance Ltd. and/or its affiliates
 # ("Bytedance's Modifications"). All Bytedance's Modifications are Copyright
 # 2026 Bytedance Ltd. and/or its affiliates.
@@ -51,18 +51,9 @@ from einops import rearrange
 logger = logging.get_logger(__name__)
 
 
-# def _canonical_state_dict_key(key: str) -> str:
-#     wrapper_segments = {"_orig_mod", "_fsdp_wrapped_module"}
-#     return ".".join(part for part in key.split(".") if part not in wrapper_segments)
-
-
-# def _canonicalize_state_dict_keys(state_dict):
-#     canonical_state_dict = state_dict.__class__()
-#     for key, value in state_dict.items():
-#         canonical_key = _canonical_state_dict_key(key)
-#         if canonical_key not in canonical_state_dict:
-#             canonical_state_dict[canonical_key] = value
-#     return canonical_state_dict
+# ---------------------------------------------------------------------------
+# Debug helpers (training only — no-op when debug_ttt_logs is unset)
+# ---------------------------------------------------------------------------
 
 def _should_log_debug(module) -> bool:
     cfg = getattr(module, "config", None)
@@ -98,15 +89,37 @@ def _tensor_stats(name: str, tensor: Optional[torch.Tensor]) -> str:
         finite_ratio = finite.float().mean().item()
         if finite.any():
             vals = tf[finite]
-            # return (
-            #     f"{name}[shape={shape}, dtype={dtype}, mean={vals.mean().item():.4g}, std={vals.std(unbiased=False).item():.4g}, "
-            #     f"min={vals.min().item():.4g}, max={vals.max().item():.4g}, absmax={vals.abs().max().item():.4g}, finite={finite_ratio:.4f}]"
-            # )
             return (
                 f"{name}[shape={shape}, dtype={dtype}, mean={vals.mean().item()}, std={vals.std(unbiased=False).item()}, "
                 f"min={vals.min().item()}, max={vals.max().item()}, absmax={vals.abs().max().item()}, finite={finite_ratio:.4f}]"
             )
         return f"{name}[shape={shape}, dtype={dtype}, finite=0.0000]"
+
+
+# ---------------------------------------------------------------------------
+# TTT-aware KV cache (inference only)
+# ---------------------------------------------------------------------------
+
+class TTTDynamicCache(DynamicCache):
+    """DynamicCache extended with per-layer TTT state storage for inference.
+
+    Each TTT layer stores a ``(past_h, past_t, past_w)`` tuple that carries
+    the partial-chunk hidden states and the adapted ``down_proj`` weight across
+    generation steps.
+    """
+
+    def __init__(self, ddp_cache_data=None, config=None) -> None:
+        super().__init__(ddp_cache_data=ddp_cache_data, config=config)
+        self.ttt_states = [(None, None, None)] * 100  # (past_h, past_t, past_w) per layer
+
+    def TTT_update(self, ttt_state, layer_idx: int) -> None:
+        self.ttt_states[layer_idx] = ttt_state
+
+
+# ---------------------------------------------------------------------------
+# Shared building blocks
+# ---------------------------------------------------------------------------
+
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -129,7 +142,7 @@ class Qwen3RMSNorm(nn.Module):
 
 
 class Qwen3MLP(nn.Module):
-    def __init__(self, config, layer_idx: Optional[int] = None):  # TTT: added layer_idx
+    def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -154,8 +167,8 @@ class Qwen3MLP(nn.Module):
             )
             self.ttt_conv._is_ttt_conv = True
 
-    # TTT: new method
     def padding(self, x):
+        """Pad x to a multiple of ttt_chunk and reshape to (B, num_chunks, chunk_size, D)."""
         if not hasattr(self, "ttt_chunk"):
             return x
         if x.shape[1] % self.ttt_chunk != 0:
@@ -166,29 +179,34 @@ class Qwen3MLP(nn.Module):
             x = torch.cat([x, padding_embeddings], dim=1)
         return rearrange(x, "b (t c) d -> b t c d", c=self.ttt_chunk)
 
-    def forward(self, x, t: Optional[torch.Tensor] = None):  # TTT: added t param
-        h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-        # TTT: branch on whether this is a TTT layer with target states
-        if t is None or not hasattr(self, "ttt_conv"):
-            return self.down_proj(h)
-        # TTT path
-        t = self.padding(t)
-        h_padded = self.padding(h)
-        bs, chunk_num, chunk_size, _ = t.shape
-        t = (
-            self.ttt_conv(t.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size))
+    def _ttt_conv_apply(self, t_chunked: torch.Tensor) -> torch.Tensor:
+        """Apply the depthwise conv over the time dimension within each chunk."""
+        bs, chunk_num, chunk_size, d = t_chunked.shape
+        return (
+            self.ttt_conv(t_chunked.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size))
             .transpose(-1, -2)
-            .reshape(bs, chunk_num, chunk_size, -1)
+            .reshape(bs, chunk_num, chunk_size, d)
         )
+
+    # ------------------------------------------------------------------
+    # Training forward: batched einsum, no per-step state tracking
+    # ------------------------------------------------------------------
+    def _forward_train(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """TTT forward used during training (full-sequence, batched einsum)."""
+        h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        t_padded = self.padding(t)
+        h_padded = self.padding(h)
+        bs, chunk_num, chunk_size, _ = t_padded.shape
+        t_conv = self._ttt_conv_apply(t_padded)
         if self.ttt_proj is not None:
             d_down_proj = torch.einsum(
                 "btch,btcd,de->bteh",
-                h_padded[:, :-1], t[:, :-1], self.ttt_proj.weight,
+                h_padded[:, :-1], t_conv[:, :-1], self.ttt_proj.weight,
             )
         else:
             d_down_proj = torch.einsum(
                 "btch,btcd->btdh",
-                h_padded[:, :-1], t[:, :-1],
+                h_padded[:, :-1], t_conv[:, :-1],
             )
         d_down_proj_sum = torch.cat(
             [
@@ -207,13 +225,90 @@ class Qwen3MLP(nn.Module):
                     _tensor_stats("d_down_proj_sum", d_down_proj_sum),
                     float(self.ttt_lr),
                     getattr(self, "ttt_chunk", None),
-                    self.ttt_proj is not None
+                    self.ttt_proj is not None,
                 )
             )
         down_proj = self.down_proj(h_padded) + torch.einsum(
             "btdh,btch->btcd", d_down_proj_sum, h_padded
         )
         return rearrange(down_proj, "b t c d -> b (t c) d")[:, : x.shape[1], :]
+
+    # ------------------------------------------------------------------
+    # Inference forward: sequential per-chunk loop, returns adapted weight
+    # ------------------------------------------------------------------
+    def _forward_infer(
+        self, x: torch.Tensor, t: Optional[torch.Tensor], past_w: Optional[torch.Tensor]
+    ):
+        """TTT forward used during inference (chunk-sequential, returns present_down_proj_w).
+
+        Returns:
+            (output, present_down_proj_w) where present_down_proj_w is the adapted down_proj weight.
+        """
+        h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        present_down_proj_w = self.down_proj.weight.clone() if past_w is None else past_w
+        bs, seq_len, _ = x.shape
+        # Not enough tokens to fill a chunk — apply current weight, no update
+        if t is None or seq_len < self.ttt_chunk:
+            return nn.functional.linear(h, present_down_proj_w, self.down_proj.bias), present_down_proj_w
+        # Pad and chunk
+        t_padded = self.padding(t)
+        h_padded = self.padding(h)
+        bs, chunk_num, chunk_size, _ = t_padded.shape
+        t_conv = self._ttt_conv_apply(t_padded)
+        current_w = present_down_proj_w
+        y = torch.zeros_like(t_conv)
+        for i, current_y, current_t, current_h in zip(range(chunk_num), y[0], t_conv[0], h_padded[0]):
+            current_y = torch.einsum("d h, c h -> c d", current_w, current_h)
+            y[0][i] = current_y
+            if seq_len % self.ttt_chunk == 0 or i != chunk_num - 1:
+                if self.ttt_proj is not None:
+                    dw = (
+                        torch.einsum("c h, c d, d e -> e h", current_h, current_t, self.ttt_proj.weight)
+                        * self.ttt_lr
+                    )
+                else:
+                    dw = torch.einsum("c h, c d -> d h", current_h, current_t) * self.ttt_lr
+                current_w = current_w + dw
+        out = rearrange(y, "b t c d -> b (t c) d")[:, :seq_len, :]
+        return out, current_w
+
+    # ------------------------------------------------------------------
+    # Unified forward — dispatches based on whether past_w is supplied
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        past_w: Optional[torch.Tensor] = None,
+    ):
+        """Unified TTT-aware MLP forward.
+
+        Behaviour summary:
+        - Non-TTT layer (no ``ttt_conv``): standard ``down_proj(act(gate) * up)``.
+        - TTT layer, **training** (``past_w`` is ``None`` and ``t`` is not ``None``
+          and ``self.training`` is ``True``): batched einsum path, returns a plain
+          ``Tensor``.
+        - TTT layer, **inference** (``past_w`` supplied **or** ``not self.training``):
+          sequential per-chunk path, returns ``(output_tensor, present_down_proj_w)``.
+
+        Callers in ``Qwen3DecoderLayer`` check ``isinstance(result, tuple)`` to
+        distinguish the two return types.
+        """
+        h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+
+        # Non-TTT layer
+        if not hasattr(self, "ttt_conv"):
+            return self.down_proj(h)
+
+        # TTT layer — choose path
+        if self.training and past_w is None:
+            # Training path: t=None means no target (fall back to plain down_proj)
+            if t is None:
+                return self.down_proj(h)
+            return self._forward_train(x, t)
+        else:
+            # Inference path
+            return self._forward_infer(x, t, past_w)
 
 
 def rotate_half(x):
@@ -238,8 +333,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
             that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
             k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+            cos[position_ids] and sin[position_ids] broadcastable to the dimensions of q and k. Similarly, if q and k
+            have the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
@@ -367,15 +462,15 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
         self.layer_idx = layer_idx
-        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
 
-        self.mlp = Qwen3MLP(config, layer_idx=layer_idx)  # TTT: pass layer_idx
+        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
+        self.mlp = Qwen3MLP(config, layer_idx=layer_idx)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
-        # TTT: check if this is a TTT layer
+        # TTT: store chunk size and whether this is a TTT layer
+        self.ttt_chunk = getattr(config, "ttt_chunk", 8192)
         self.is_ttt_layer = getattr(config, "ttt_mode", False) and layer_idx in getattr(config, "ttt_layers", [])
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -388,11 +483,12 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        target_states: Optional[torch.Tensor] = None,
+        target_states: Optional[torch.Tensor] = None,  # TTT
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -409,9 +505,45 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if target_states is None and self.is_ttt_layer:
-            target_states = hidden_states
-        hidden_states = self.mlp(hidden_states, t=target_states)
+
+        if self.is_ttt_layer:
+            # Use post-norm hidden states as target when none provided externally
+            if target_states is None:
+                target_states = hidden_states
+
+            if self.training:
+                # --- Training path: batched einsum, no state cache ---
+                hidden_states = self.mlp(hidden_states, t=target_states)
+            else:
+                # --- Inference path: sequential per-chunk, TTTDynamicCache ---
+                past_h, past_t, past_w = (
+                    past_key_values.ttt_states[self.layer_idx]
+                    if isinstance(past_key_values, TTTDynamicCache)
+                    else (None, None, None)
+                )
+                if past_h is None:
+                    present_h = hidden_states
+                    present_t = target_states
+                else:
+                    present_h = torch.cat([past_h, hidden_states], dim=1)
+                    present_t = torch.cat([past_t, target_states], dim=1)
+
+                if present_h.shape[1] < self.ttt_chunk:
+                    hidden_states, present_down_proj_w = self.mlp(hidden_states, None, past_w)
+                else:
+                    all_hidden_states, present_down_proj_w = self.mlp(present_h, present_t, past_w)
+                    hidden_states = all_hidden_states[:, -hidden_states.shape[1]:]
+
+                # Keep the remainder of the last incomplete chunk for the next step
+                present_h_tail = present_h[:, -(present_h.shape[1] % self.ttt_chunk):]
+                present_t_tail = present_t[:, -(present_t.shape[1] % self.ttt_chunk):]
+                if present_h_tail.shape[1] % self.ttt_chunk == 0:
+                    present_h_tail, present_t_tail = None, None
+                if isinstance(past_key_values, TTTDynamicCache):
+                    past_key_values.TTT_update((present_h_tail, present_t_tail, present_down_proj_w), self.layer_idx)
+        else:
+            hidden_states = self.mlp(hidden_states)
+
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -434,44 +566,48 @@ class Qwen3PreTrainedModel(PreTrainedModel):
         "attentions": Qwen3Attention,
     }
 
-    # TTT: custom weight init for continual pretraining.
-    # Non-TTT weights are loaded from pretrained checkpoint; only TTT modules need init.
-    # Handles DTensor for FSDP2 distributed training.
     def _init_weights(self, module):
+        """Custom weight initialisation.
+
+        During training (continual pre-training):
+          - Non-TTT weights use standard normal init.
+          - ``ttt_proj`` gets a diagonal init (DTensor-aware for FSDP2).
+          - ``ttt_conv`` is zero-initialised.
+
+        During inference (model loaded from checkpoint):
+          - Standard linear/embedding init applies; Conv1d is zero-initialised.
+          - The diagonal init for ``ttt_proj`` is skipped because the weights
+            will be overwritten by ``load_state_dict``.
+        """
         std = getattr(self.config, "initializer_range", 0.02)
 
         if isinstance(module, nn.Linear):
             if module.weight.device.type == "meta":
                 return
-            # Use standard Qwen init for normal model weights. Only the TTT projection
-            # gets the custom diagonal init below.
             module.weight.data.normal_(mean=0.0, std=std)
+            # TTT projection: apply diagonal init (training only — for continual pretraining)
             if getattr(module, "_is_ttt_proj", False):
                 diag_size = module.weight.shape[0]
-
                 weight_data = module.weight.data
-                if hasattr(weight_data, '_local_tensor'):
-                    # DTensor: operate on local shard
+                if hasattr(weight_data, "_local_tensor"):
+                    # DTensor path (FSDP2 distributed training)
                     import torch.distributed as dist
                     local_tensor = weight_data._local_tensor
                     local_tensor.zero_()
-
                     local_rows = local_tensor.shape[0]
                     num_cols = local_tensor.shape[1]
                     rank = dist.get_rank()
                     start_row = rank * local_rows
-
                     g = torch.Generator(device=local_tensor.device)
                     g.manual_seed(42)
-                    all_diag_values = torch.randn(diag_size, generator=g, device=local_tensor.device, dtype=local_tensor.dtype) * std
-
+                    all_diag_values = torch.randn(
+                        diag_size, generator=g, device=local_tensor.device, dtype=local_tensor.dtype
+                    ) * std
                     local_row_indices = torch.arange(local_rows, device=local_tensor.device)
                     global_col_indices = start_row + local_row_indices
-
                     valid_mask = global_col_indices < num_cols
                     local_row_indices = local_row_indices[valid_mask]
                     global_col_indices = global_col_indices[valid_mask]
-
                     if len(local_row_indices) > 0:
                         local_tensor[local_row_indices, global_col_indices] = all_diag_values[global_col_indices]
                 else:
@@ -482,6 +618,7 @@ class Qwen3PreTrainedModel(PreTrainedModel):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Conv1d):
+            # ttt_conv is always zero-initialised; other Conv1d use normal init
             if getattr(module, "_is_ttt_conv", False):
                 module.weight.data.zero_()
             else:
@@ -497,27 +634,6 @@ class Qwen3PreTrainedModel(PreTrainedModel):
                 module.weight.data.fill_(1.0)
         elif hasattr(module, "reset_parameters"):
             module.reset_parameters()
-
-    # def state_dict(self, *args, **kwargs):
-    #     state_dict = super().state_dict(*args, **kwargs)
-    #     return _canonicalize_state_dict_keys(state_dict)
-
-    # def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-    #     current_state_dict = super().state_dict()
-    #     canonical_to_current = OrderedDict()
-    #     for key in current_state_dict.keys():
-    #         canonical_key = _canonical_state_dict_key(key)
-    #         if canonical_key not in canonical_to_current:
-    #             canonical_to_current[canonical_key] = key
-
-    #     remapped_state_dict = state_dict.__class__()
-    #     for key, value in state_dict.items():
-    #         canonical_key = _canonical_state_dict_key(key)
-    #         target_key = canonical_to_current.get(canonical_key, key)
-    #         if target_key not in remapped_state_dict:
-    #             remapped_state_dict[target_key] = value
-
-    #     return super().load_state_dict(remapped_state_dict, strict=strict, assign=assign)
 
 
 class Qwen3RotaryEmbedding(nn.Module):
@@ -554,26 +670,10 @@ class Qwen3RotaryEmbedding(nn.Module):
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-    
+
     def reset_parameters(self):
-        # pass
         with torch.no_grad():
-            # self.inv_freq.copy_(self._compute_inv_freq(device=self.inv_freq.device))
-            # if self.config.rope_scaling is not None:
-            #     self.attention_scaling.copy_(self._compute_scale(device=self.attention_scaling.device))
-            # else:
-            #     self.attention_scaling = 1.0
             self.inv_freq, self.attention_scaling = self.rope_init_fn(self.config, self.inv_freq.device)
-
-    # def _compute_inv_freq(self, device=None):
-    #     base = self.config.rope_theta
-    #     return 1.0 / (
-    #         base
-    #         ** (torch.arange(0, self.config.head_dim, 2, device=device, dtype=torch.float32) / self.config.head_dim)
-    #     )
-
-    # def _compute_scale(self, device=None):
-    #     return (torch.arange(0, self.config.hidden_size, 2, device=device, dtype=torch.float32) + 0.4 * self.config.hidden_size) / (1.4 * self.config.hidden_size)
 
 
 @auto_docstring
@@ -597,12 +697,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    # def get_input_embeddings(self):
-    #     return self.embed_tokens
-
-    # def set_input_embeddings(self, value):
-    #     self.embed_tokens = value
 
     def _resolve_ttt_target_states(
         self,
@@ -639,7 +733,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            # Use TTTDynamicCache during inference when TTT mode is active so that
+            # per-layer adapted weights survive across generation steps.
+            past_key_values = (
+                TTTDynamicCache(config=self.config)
+                if self.ttt_mode and not self.training
+                else DynamicCache(config=self.config)
+            )
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -673,17 +773,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        # breakpoint()
+
         should_log_debug = _should_log_debug(self)
-        # if should_log_debug:
-        #     print(
-        #         "[QWEN3-TTT-DEBUG][MODEL pre] %s | %s | use_cache=%s ttt_target=%s ttt_layers=%s",
-        #         _tensor_stats("inputs_embeds", inputs_embeds),
-        #         _tensor_stats("position_ids", position_ids),
-        #         bool(use_cache),
-        #         self.ttt_target,
-        #         self.ttt_layers,
-        #     )
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             target_states = self._resolve_ttt_target_states(decoder_layer, inputs_embeds)
@@ -698,19 +789,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 target_states=target_states,
                 **kwargs,
             )
-            # if should_log_debug and (
-            #     decoder_layer.is_ttt_layer
-            #     or decoder_layer.layer_idx == 0
-            #     or decoder_layer.layer_idx == (self.config.num_hidden_layers - 1)
-            # ):
-            #     print(
-            #         "[QWEN3-TTT-DEBUG][MODEL layer=%s type=%s ttt=%s] \n %s".format(
-            #             decoder_layer.layer_idx,
-            #             decoder_layer.attention_type,
-            #             decoder_layer.is_ttt_layer,
-            #             _tensor_stats("hidden_states", hidden_states)
-            #         )
-            #     )
 
         hidden_states = self.norm(hidden_states)
         if should_log_debug:
@@ -736,17 +814,19 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    # def get_input_embeddings(self):
-    #     return self.model.get_input_embeddings()
-
-    # def set_input_embeddings(self, value):
-    #     self.model.set_input_embeddings(value)
-
-    # def get_output_embeddings(self):
-    #     return self.lm_head
-
-    # def set_output_embeddings(self, new_embeddings):
-    #     self.lm_head = new_embeddings
+    def generate(self, **kwargs):
+        """Override to enforce TTT-aware cache and batch-size-1 constraint during inference."""
+        if getattr(self.model, "ttt_mode", False):
+            if "past_key_values" in kwargs:
+                assert isinstance(kwargs["past_key_values"], TTTDynamicCache), (
+                    "past_key_values must be TTTDynamicCache when ttt_mode is active"
+                )
+            else:
+                kwargs["past_key_values"] = TTTDynamicCache()
+            input_ids = kwargs.get("input_ids", None)
+            if input_ids is not None:
+                assert len(input_ids) == 1, "TTT inference only supports batch size 1"
+        return super().generate(**kwargs)
 
     @can_return_tuple
     @auto_docstring
@@ -833,4 +913,5 @@ __all__ = [
     "Qwen3Model",
     "Qwen3ForSequenceClassification",
     "Qwen3ForTokenClassification",
+    "TTTDynamicCache",
 ]

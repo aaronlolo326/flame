@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 #0,1,3,4,5,6,7
 
 export USERNAME=$(whoami)
 
@@ -11,7 +11,7 @@ RUN_NAME=$(basename "$(dirname "$0")")
 cd ${flame_dir}
 
 MODEL_CONFIGS_DIR=configs
-MODEL_NAME=qwen3_notttip_4B
+MODEL_NAME=qwen3_tttip_4B_cz1024
 MODEL_CONFIG_PATH=${MODEL_CONFIGS_DIR}/${MODEL_NAME}.json
 MODEL_TYPE="tttip"
 
