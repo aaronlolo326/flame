@@ -85,8 +85,12 @@ if $train; then
     cp -r configs $path
     cp -r flame   $path
     cp -r custom_models   $path
-    cp -r 3rdparty/flash-linear-attention/fla $path
-    cp -r 3rdparty/torchtitan/torchtitan $path
+    if [ -d 3rdparty/flash-linear-attention/fla ]; then
+      cp -r 3rdparty/flash-linear-attention/fla $path
+    fi
+    if [ -d 3rdparty/torchtitan/torchtitan ]; then
+      cp -r 3rdparty/torchtitan/torchtitan $path
+    fi
   fi
 
   # for offline systems
