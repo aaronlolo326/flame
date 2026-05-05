@@ -38,6 +38,7 @@ __pycache__
 *.pkl
 *.pt
 checkpoints/
+lm-evaluation-harness/
 
 # hidden files
 .*

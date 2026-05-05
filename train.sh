@@ -94,7 +94,7 @@ if $train; then
   # export HF_DATASETS_OFFLINE=1
   # export HF_HUB_OFFLINE=1
   if [ "$date" == "" ]; then
-    date=$(date +%Y%m%d%H%M)
+    date=$(date +%Y-%m-%d_%H-%M)
   fi
   RUN_NAME="$model-$(basename $path)"
   # RUN_ID="$RUN_NAME-$date"
@@ -103,11 +103,14 @@ if $train; then
   if [[ -z "${WANDB_PROJECT}" ]]; then
     export WANDB_PROJECT="fla"
   fi
+  if [[ -z "${WANDB_INIT_TIMEOUT}" ]]; then
+    export WANDB_INIT_TIMEOUT=300
+  fi
   if [[ -z "${WANDB_NAME}" ]]; then
-    export WANDB_NAME="$RUN_NAME"
+    export WANDB_NAME="$RUN_NAME-$date"
   fi
   if [[ -z "${WANDB_RUN_ID}" ]]; then
-    export WANDB_RUN_ID="$RUN_NAME"
+    export WANDB_RUN_ID="$RUN_NAME-$date"
   fi
 
   PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \

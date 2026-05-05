@@ -4,12 +4,25 @@ debug=false
 profile=false
 
 available_nodes=(15) # first is master node
-# based on env var $THIS_NODE, set local rank according to the order, e.g., THIS_NODE is 0 means local_rank = 0
+# Based on $THIS_NODE, set node rank according to the order in available_nodes.
+# If THIS_NODE is not provided, infer it from hostnames like lux-2-node-15.
+if [ -z "${THIS_NODE:-}" ]; then
+  THIS_NODE=$(hostname -s | grep -oE '[0-9]+$' || true)
+fi
+if [ -z "${THIS_NODE:-}" ] && [ ${#available_nodes[@]} -eq 1 ]; then
+  THIS_NODE=${available_nodes[0]}
+fi
+
 local_rank=$(echo ${available_nodes[@]} | tr ' ' '\n' | grep -n "^${THIS_NODE}$" | cut -d: -f1)
+if [ -z "${local_rank}" ]; then
+  echo "ERROR: THIS_NODE=${THIS_NODE:-unset} is not in available_nodes=(${available_nodes[*]})." >&2
+  echo "Set THIS_NODE to one of: ${available_nodes[*]}" >&2
+  exit 1
+fi
 local_rank=$((local_rank - 1))
 echo "THIS_NODE=${THIS_NODE}; local_rank=$local_rank"
 
-MASTER_ADDR=127.0.0.1 # 192.168.240.149 for node 12; 192.168.240.169  for node 1
+MASTER_ADDR=192.168.241.41 # 192.168.240.149 for node 12; 192.168.240.169  for node 1
 MASTER_PORT=29500
 
 NNODE=${#available_nodes[@]}
@@ -22,18 +35,29 @@ fi
 echo $RUN_NAME
 
 
-batch_size=4
-grad_accum=1
-no_tokens=$(( 5 * 10**9 ))
-seed=42
+batch_size=${batch_size:-8}
+grad_accum=${grad_accum:-1}
+no_tokens=${no_tokens:-$(( 5 * 10**9 ))}
+seed=${seed:-42}
+lr=${lr:-1e-5}
+weight_decay=${weight_decay:-0.1}
 
 if [[ $local_rank == 0 ]]; then
   if [ -z "${seed_checkpoint_dir}" ]; then
     echo "seed_checkpoint_dir is not set. Training from scratch ..."
   elif [ ! -d "${seed_checkpoint_dir}" ]; then
-    echo "Warning: seed_checkpoint_dir is not set or does not exist: ${seed_checkpoint_dir}"
-    echo "Proceeding with training from scratch ..."
+    echo "ERROR: seed_checkpoint_dir does not exist: ${seed_checkpoint_dir}" >&2
+    echo "Run scripts/20260428_tttp_cont/convert_hf_to_dcp.sh or update seed_checkpoint_dir before training." >&2
+    exit 1
   else
+    if [ -d "${checkpoint_folder}" ] && find "${checkpoint_folder}" -mindepth 1 -maxdepth 1 -type d -name 'step-*' ! -name 'step-0' | grep -q .; then
+      echo "ERROR: ${checkpoint_folder} already contains non-seed checkpoints." >&2
+      echo "This run is configured for continual pretraining from ${seed_checkpoint_dir}, but --checkpoint.load_step -1 would resume the latest existing checkpoint." >&2
+      echo "Move the old experiment aside or set ALLOW_RESUME_FROM_EXISTING=1 if resuming is intentional." >&2
+      if [ "${ALLOW_RESUME_FROM_EXISTING:-0}" != "1" ]; then
+        exit 1
+      fi
+    fi
     mkdir -p "${checkpoint_folder}"
     chmod 777 "${checkpoint_folder}" || true
     step0_checkpoint_dir="${checkpoint_folder}/step-0"
@@ -67,7 +91,7 @@ fi
 
 steps=$(( no_tokens / NNODE / NGPU / seq_len / batch_size / grad_accum ))
 warmup_steps=$(( steps / 20 )) # 1024
-interval=$(( steps / 4 ))
+interval=${checkpoint_interval:-$(( steps / 4 ))}
 echo steps=$steps
 if $profile; then
   steps=10
@@ -102,8 +126,8 @@ NNODE=${NNODE} NGPU=${NGPU} LOG_RANK=${local_rank} bash train.sh \
   --model.tokenizer_path ${TOKENIZER_PATH} \
   --optimizer.name AdamW \
   --optimizer.eps 1e-15 \
-  --optimizer.lr 1e-5 \
-  --optimizer.weight_decay 0.1 \
+  --optimizer.lr ${lr} \
+  --optimizer.weight_decay ${weight_decay} \
   --lr_scheduler.warmup_steps ${warmup_steps} \
   --lr_scheduler.decay_ratio 0.90 \
   --training.batch_size ${batch_size} \
@@ -141,7 +165,7 @@ NNODE=${NNODE} NGPU=${NGPU} LOG_RANK=${local_rank} bash train.sh \
   --activation_checkpoint.mode selective \
   --activation_checkpoint.selective_ac_option 1
 
-  
+
 
   # --job.config_file flame/models/fla_20260212.toml \
 

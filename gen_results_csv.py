@@ -14,8 +14,8 @@ import numpy as np
 from pprint import pprint
 import pandas as pd
 
-RESULTS_ROOT = "/storage/backup/hei/ttt/flame/results/"
-OUT_DIR = "/home/hei/ttt/flame/results"
+RESULTS_ROOT = "/storage/backup/yufei/ttt/flame/results/"
+OUT_DIR = "/home/yufei/ttt/flame/results"
 
 unsupported_tasks = []
 selected_tasks = "hellaswag,lambada_openai,mmlu".split(",")
